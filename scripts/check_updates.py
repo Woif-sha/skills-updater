@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import sys
 from dataclasses import dataclass
@@ -12,16 +11,16 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
 
 from agent_skill_updater import OPENSPEC_REPO, fetch_remote_commit_sha, fetch_remote_package_version  # noqa: E402
 from i18n import get_i18n, t  # noqa: E402
 from skills_registry import save_registry, sync_registry  # noqa: E402
+from stdio_utils import configure_windows_utf8_stdio  # noqa: E402
+
+
+configure_windows_utf8_stdio()
 
 
 class UpdateStatus(Enum):

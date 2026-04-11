@@ -21,13 +21,8 @@ import json
 import sys
 import argparse
 import re
-import io
 from pathlib import Path
 
-# Fix Windows console encoding
-if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
 import urllib.request
@@ -37,6 +32,10 @@ from html.parser import HTMLParser
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
 from i18n import get_i18n, t  # noqa: E402
+from stdio_utils import configure_windows_utf8_stdio  # noqa: E402
+
+
+configure_windows_utf8_stdio()
 
 
 @dataclass

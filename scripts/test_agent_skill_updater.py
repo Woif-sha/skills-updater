@@ -5,6 +5,7 @@ import unittest
 import zipfile
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -146,6 +147,106 @@ class AgentSkillUpdaterTests(unittest.TestCase):
             payload[0]["error_message"],
             "Auto-update disabled for this locally customized skill.",
         )
+
+    def test_update_agent_skills_updates_only_requested_registry_entry(self):
+        import scripts.update_agent_skills as updater
+
+        registry = {
+            "version": 1,
+            "generatedAt": "2026-04-11T00:00:00+00:00",
+            "skillsRoot": r"C:\Users\sha\.agents\skills",
+            "entries": {
+                "demo-skill": {
+                    "name": "demo-skill",
+                    "entryType": "single-skill",
+                    "path": r"C:\Users\sha\.agents\skills\demo-skill",
+                    "repoUrl": "https://github.com/example/demo-skill",
+                    "source": "example/demo-skill",
+                    "sourceType": "git",
+                    "subpath": ".",
+                    "localVersion": "old123456789",
+                    "managed": True,
+                    "autoUpdate": True,
+                },
+                "other-skill": {
+                    "name": "other-skill",
+                    "entryType": "single-skill",
+                    "path": r"C:\Users\sha\.agents\skills\other-skill",
+                    "repoUrl": "https://github.com/example/other-skill",
+                    "source": "example/other-skill",
+                    "sourceType": "git",
+                    "subpath": ".",
+                    "localVersion": "same12345678",
+                    "managed": True,
+                    "autoUpdate": True,
+                },
+            },
+        }
+
+        stdout = io.StringIO()
+        resolved = SimpleNamespace(status="update_available", error_message=None)
+        with mock.patch.object(updater.sys, "argv", ["update_agent_skills.py", "--skill", "demo-skill", "--json"]):
+            with mock.patch("scripts.update_agent_skills.sync_registry", side_effect=[registry, registry]):
+                with mock.patch("scripts.update_agent_skills.save_registry"):
+                    with mock.patch("scripts.update_agent_skills._probe_entry", return_value=("update_available", "new123456789", None)):
+                        with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
+                            with mock.patch("scripts.update_agent_skills.make_backup_root", return_value=Path(r"C:\backup-root")):
+                                with mock.patch("scripts.update_agent_skills.update_skill_from_staged") as update_from_staged:
+                                    with self.assertRaises(SystemExit) as exit_info:
+                                        with redirect_stdout(stdout):
+                                            updater.main()
+
+        self.assertEqual(exit_info.exception.code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["name"], "demo-skill")
+        self.assertTrue(payload[0]["applied"])
+        update_from_staged.assert_called_once()
+
+    def test_install_agent_skill_uses_agent_skills_root_and_rewrites_registry(self):
+        import scripts.install_agent_skill as installer
+        from scripts.skills_registry import sync_registry as real_sync_registry
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / ".agents" / "skills"
+            skills_root.mkdir(parents=True)
+
+            def fake_stage_remote_skill(source, stage_dir):
+                stage_dir.mkdir(parents=True, exist_ok=True)
+                (stage_dir / "SKILL.md").write_text("---\nname: demo-skill\n---\n", encoding="utf-8")
+                return stage_dir
+
+            stdout = io.StringIO()
+            with mock.patch.object(
+                installer.sys,
+                "argv",
+                ["install_agent_skill.py", "--repo", "example/demo-skill", "--name", "demo-skill", "--json"],
+            ):
+                with mock.patch("scripts.install_agent_skill.get_agent_skills_dir", return_value=skills_root):
+                    with mock.patch("scripts.install_agent_skill.stage_remote_skill", side_effect=fake_stage_remote_skill):
+                        with mock.patch("scripts.install_agent_skill.fetch_remote_commit_sha", return_value="abc123def456"):
+                            with mock.patch(
+                                "scripts.install_agent_skill.sync_registry",
+                                side_effect=lambda: real_sync_registry(skills_root),
+                            ):
+                                with redirect_stdout(stdout):
+                                    installer.main()
+
+            destination = skills_root / "demo-skill"
+            self.assertTrue(destination.exists())
+            self.assertTrue((destination / "SKILL.md").exists())
+
+            metadata = json.loads((destination / ".openskills.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["repoUrl"], "https://github.com/example/demo-skill")
+            self.assertEqual(metadata["sourceCommitSha"], "abc123def456")
+
+            registry = json.loads((skills_root / ".skills-list.json").read_text(encoding="utf-8"))
+            self.assertIn("demo-skill", registry["entries"])
+            self.assertEqual(registry["entries"]["demo-skill"]["path"], str(destination))
+
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["path"], str(destination))
+            self.assertEqual(payload["registry"], str(skills_root / ".skills-list.json"))
 
 
 if __name__ == "__main__":

@@ -15,13 +15,8 @@ import json
 import sys
 import argparse
 import subprocess
-import io
 from pathlib import Path
 
-# Fix Windows console encoding
-if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -29,6 +24,10 @@ from dataclasses import dataclass
 script_dir = Path(__file__).parent
 sys.path.insert(0, str(script_dir))
 from i18n import get_i18n, t  # noqa: E402
+from stdio_utils import configure_windows_utf8_stdio  # noqa: E402
+
+
+configure_windows_utf8_stdio()
 
 
 @dataclass

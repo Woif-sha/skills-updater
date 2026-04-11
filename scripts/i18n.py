@@ -216,12 +216,10 @@ def t(key: str, **kwargs) -> str:
 
 
 if __name__ == "__main__":
-    import io
     import sys
-    # Fix Windows console encoding for test
-    if sys.platform == 'win32':
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    from stdio_utils import configure_windows_utf8_stdio
+
+    configure_windows_utf8_stdio()
 
     # Test locale detection
     print(f"Detected locale: {detect_locale()}")
