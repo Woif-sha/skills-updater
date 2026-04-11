@@ -1,345 +1,160 @@
 # Skills Updater
 
-Manage updates, installs, and registry sync for all skills stored in `~/.agents/skills`.
+Manage installs, updates, registry sync, and auxiliary discovery tools for skills stored in `~/.agents/skills`.
 
 [中文](README.md)
 
-## Origin
+## Current Structure
 
-This project is based on:
-
-`https://github.com/yizhiyanhua-ai/skills-updater`
-
-The original project focused more on Claude Code multi-source skill updates and recommendations. This repository has been heavily reworked for a different operating model:
-
-- manage only `~/.agents/skills`
-- keep a single registry file: `.skills-list.json`
-- compare versions first, then update only changed skills
-- support regular single-skill installs, `skill-pack` repos, and OpenSpec-generated skills
-- prevent the local customized `skills-updater` from overwriting itself
-
-## Design Goal
-
-`~/.agents/skills` is the single source of truth.
-
-You can symlink `~/.claude/skills`, `~/.codex/skills`, or `~/.cursor/skills` to that folder if you want, but the updater itself only reads and writes the unified directory.
-
-The registry file is always:
-
-```text
-~/.agents/skills/.skills-list.json
-```
-
-## Core Features
-
-### 1. Unified scanning and registry rebuild
-
-- scans top-level directories under `~/.agents/skills`
-- detects regular single skills and `skill-pack` repos
-- refreshes source metadata
-- rewrites `.skills-list.json`
-
-### 2. Version-first update checks
-
-- reads `localVersion` from the local registry
-- fetches `remoteVersion` from upstream
-- updates only when versions differ
-- avoids downloading every skill just to compare contents
-
-### 3. Selective updates
-
-- update all installed skills
-- update one named skill
-- create backups before replacement
-- sync the registry again after changes are applied
-
-## Default Request Semantics
-
-- if the user invokes `skills-updater` with no extra text, treat it as an operational request: run `python scripts/check_updates.py`, then run `python scripts/update_agent_skills.py` if updates are available, and leave `.skills-list.json` refreshed
-- if the user asks to install a skill, use `skills-updater` by default so the install and registry refresh happen together
-- if the user says a skill was deleted manually, use `skills-updater` by default to resync `.skills-list.json` with the filesystem
-
-### 4. New skill installation
-
-- installs directly into `~/.agents/skills/<skill-name>`
-- refreshes `.skills-list.json` immediately after install
-- writes `.openskills.json` for managed single skills
-- preserves full repo layout for `skill-pack` installs
-
-### 5. Sync after manual deletes or additions
-
-If a skill folder is deleted or added manually, the sync step rebuilds `.skills-list.json` from the actual filesystem state. Removed folders disappear from the registry and new folders are added.
-
-### 6. Special handling for `superpowers`
-
-- treated as one `skill-pack`
-- only the repo-level entry is recorded in the registry
-- child skills are not tracked individually
-- updates happen at the whole-repo level
-
-### 7. Special handling for OpenSpec
-
-OpenSpec skills are generated, not copied as static folders:
-
-- upstream repo: `https://github.com/Fission-AI/OpenSpec`
-- type: `git-generated`
-- update checks compare the upstream package version
-- when the version changes, the workflow skill is regenerated
-
-### 8. Self-update protection
-
-This repository contains a locally customized `skills-updater`, so its registry entry is forced to:
-
-```json
-{
-  "autoUpdate": false
-}
-```
-
-That prevents batch updates from overwriting the customized local copy.
-
-## Repository Layout
+This repository now follows a skill-based-architecture layout:
 
 ```text
 skills-updater/
-├─ README.md
-├─ README.en.md
-├─ SKILL.md
-├─ references/
-│  └─ marketplaces.md
-└─ scripts/
-   ├─ agent_skill_updater.py
-   ├─ check_updates.py
-   ├─ i18n.py
-   ├─ install_agent_skill.py
-   ├─ recommend_skills.py
-   ├─ recommendations.json
-   ├─ skills_registry.py
-   ├─ stdio_utils.py
-   ├─ sync_skills_registry.py
-   ├─ test_agent_skill_updater.py
-   ├─ test_skills_registry.py
-   ├─ update_agent_skills.py
-   └─ update_marketplace.py
+|-- SKILL.md
+|-- README.md
+|-- README.en.md
+|-- rules/
+|   |-- scope-and-registry.md
+|   `-- update-policies.md
+|-- workflows/
+|   |-- default-invocation.md
+|   |-- check-updates.md
+|   |-- update-skills.md
+|   |-- install-skill.md
+|   |-- sync-registry.md
+|   |-- recommend-skills.md
+|   `-- update-marketplace.md
+|-- references/
+|   |-- gotchas.md
+|   |-- script-map.md
+|   `-- marketplaces.md
+`-- scripts/
 ```
 
-## Script Guide
+## What Each Part Contains
 
-### `scripts/agent_skill_updater.py`
+### `SKILL.md`
 
-Low-level update utilities.
+This is the entry file.
 
-Responsibilities:
+- Defines trigger conditions so the skill activates on requests like `"skills-updater"`, `"check skill updates"`, or `"install a skill from GitHub"`
+- Lists always-read files
+- Routes common tasks to the right rules and workflows
+- Surfaces the highest-value gotchas
 
-- download GitHub repo archives
-- stage remote skill content
-- compute directory signatures
-- compare local and staged content
-- replace local skill content
-- create backups
-- handle OpenSpec generation
-- support repo clone / pull helpers for `skill-pack` workflows
+It should stay short and act as a router, not a full manual.
 
-### `scripts/skills_registry.py`
+### `rules/`
 
-Registry core.
+Long-lived constraints.
 
-Responsibilities:
+- [rules/scope-and-registry.md](rules/scope-and-registry.md)
+  Covers the source of truth, `.skills-list.json`, `.openskills.json`, and the boundaries for `single-skill` and `skill-pack` entries.
+- [rules/update-policies.md](rules/update-policies.md)
+  Covers version-first checks, per-type update behavior, backups, OpenSpec generation rules, `superpowers` handling, and the self-update guard for `skills-updater`.
 
-- resolve `~/.agents/skills`
-- read and write `.skills-list.json`
-- detect regular skills and `skill-pack` repos
-- infer known upstream sources
-- refresh `localVersion`
-- force `autoUpdate: false` for `skills-updater`
+If something is supposed to stay true across tasks, it belongs here.
 
-### `scripts/check_updates.py`
+### `workflows/`
 
-Read-only update inspection entry point.
+Task-specific operating procedures.
 
-Responsibilities:
+- [workflows/default-invocation.md](workflows/default-invocation.md)
+  What to do when the user only says `skills-updater`.
+- [workflows/check-updates.md](workflows/check-updates.md)
+  How to inspect update status for all skills or one named skill.
+- [workflows/update-skills.md](workflows/update-skills.md)
+  How to apply updates, including backup and skip behavior.
+- [workflows/install-skill.md](workflows/install-skill.md)
+  How to install a regular skill, a `skill-pack`, or an OpenSpec-generated skill.
+- [workflows/sync-registry.md](workflows/sync-registry.md)
+  How to rebuild `.skills-list.json` after manual filesystem changes.
+- [workflows/recommend-skills.md](workflows/recommend-skills.md)
+  How to handle recommendation and discovery requests.
+- [workflows/update-marketplace.md](workflows/update-marketplace.md)
+  How to handle explicit marketplace maintenance requests under `~/.claude/plugins/marketplaces`.
 
-- sync the registry first
-- fetch remote versions
-- report `up_to_date`, `update_available`, `unknown_version`, or `error`
-- support `--skill` and `--json`
+If the content answers "what should happen for this request type?", it belongs here.
 
-### `scripts/update_agent_skills.py`
+### `references/`
 
-Main update entry point.
+Supporting material that provides context but does not define policy.
 
-Responsibilities:
+- [references/gotchas.md](references/gotchas.md)
+  Captures easy-to-miss edge cases, such as `check_updates.py` using exit code `1` to signal available updates.
+- [references/script-map.md](references/script-map.md)
+  Maps scripts to responsibilities.
+- [references/marketplaces.md](references/marketplaces.md)
+  Keeps marketplace compatibility notes and source references.
 
-- walk the registry entries
-- skip skills with `autoUpdate: false`
-- update only changed entries
-- pull full repos for `skill-pack`
-- regenerate OpenSpec skills when needed
-- resync the registry after updates
+These files support decisions; they do not replace `rules/` or `workflows/`.
 
-### `scripts/install_agent_skill.py`
+### `scripts/`
 
-New skill installation entry point.
+Implementation entry points.
 
-Responsibilities:
+- `check_updates.py`: probe remote versions from the registry
+- `update_agent_skills.py`: apply updates
+- `install_agent_skill.py`: install a new skill
+- `sync_skills_registry.py`: rebuild the registry
+- `skills_registry.py`: detect local entries and maintain `.skills-list.json`
+- `agent_skill_updater.py`: staging, signatures, backups, replacement, and OpenSpec generation helpers
+- `recommend_skills.py`: recommendation helper
+- `update_marketplace.py`: marketplace compatibility helper
 
-- parse GitHub repo locations
-- determine install directory names
-- enforce installation into `~/.agents/skills/<name>`
-- install single skills or full `skill-pack` repos
-- write `.openskills.json`
-- refresh `.skills-list.json`
+The README explains what each script is for; the behavioral rules live in `rules/` and `workflows/`.
 
-### `scripts/sync_skills_registry.py`
+## Core Behavior
 
-Registry rescan entry point.
-
-Responsibilities:
-
-- rescan `~/.agents/skills`
-- rebuild `.skills-list.json`
-- remove entries whose folders no longer exist
-- add entries for newly discovered skills
-
-### `scripts/stdio_utils.py`
-
-Windows stdio helper.
-
-Responsibilities:
-
-- configure UTF-8 stdout/stderr safely
-- avoid repeated wrapper stacking that can break tests or CLI output
-
-### `scripts/i18n.py`
-
-Localization module.
-
-Responsibilities:
-
-- detect locale
-- provide English and Chinese UI strings
-- centralize CLI text output
-
-### `scripts/recommend_skills.py`
-
-Skill recommendation helper.
-
-Responsibilities:
-
-- fetch trending skills from `skills.sh`
-- load local recommendation config
-- print recommendation lists
-
-Note: this is preserved as an auxiliary feature, not the center of the unified registry workflow.
-
-### `scripts/update_marketplace.py`
-
-Legacy marketplace compatibility helper.
-
-Responsibilities:
-
-- inspect traditional Claude marketplace repos
-- pull marketplace changes
-- report affected skills
-
-Note: it remains in the repo, but the main workflow in this customized version is centered on `~/.agents/skills` and `.skills-list.json`.
-
-### `scripts/test_agent_skill_updater.py`
-
-Tests for update and install behavior, including:
-
-- OpenSpec metadata parsing
-- directory signature comparison
-- staging logic
-- self-update protection
-- targeted update behavior
-- install path and registry rewrite checks
-
-### `scripts/test_skills_registry.py`
-
-Tests for registry behavior, including:
-
-- `superpowers` detection as a `skill-pack`
-- known source inference
-- registry cleanup after skill deletion
-- automatic self-update disable for `skills-updater`
-
-### `scripts/recommendations.json`
-
-Static recommendation data used by the recommendation script.
-
-### `references/marketplaces.md`
-
-Reference material kept for marketplace-related compatibility logic.
+- Treat `~/.agents/skills` as the only source of truth
+- Maintain one registry in `.skills-list.json`
+- Compare versions before deciding to update
+- Treat `superpowers` as one `skill-pack`
+- Treat OpenSpec skills as `git-generated`
+- Keep the local customized `skills-updater` on `autoUpdate: false`
 
 ## Common Commands
 
-Default empty invocation behavior:
+Check for updates:
 
 ```bash
 python scripts/check_updates.py
-python scripts/update_agent_skills.py
+python scripts/check_updates.py --skill <name>
 ```
 
-Run the update command only when the check step reports available updates.
-
-Check all skills:
-
-```bash
-python scripts/check_updates.py
-```
-
-Check one skill:
-
-```bash
-python scripts/check_updates.py --skill superpowers --json
-```
-
-Update all installed skills:
+Apply updates:
 
 ```bash
 python scripts/update_agent_skills.py
+python scripts/update_agent_skills.py --skill <name>
 ```
 
-Update one skill:
-
-```bash
-python scripts/update_agent_skills.py --skill openspec-explore
-```
-
-Install a regular skill:
+Install a new skill:
 
 ```bash
 python scripts/install_agent_skill.py --repo anthropics/skills --path skills/docx --name docx
-```
-
-Install a `skill-pack`:
-
-```bash
 python scripts/install_agent_skill.py --repo https://github.com/obra/superpowers --type skill-pack --name superpowers
-```
-
-Install an OpenSpec-generated skill:
-
-```bash
 python scripts/install_agent_skill.py --repo https://github.com/Fission-AI/OpenSpec --type single-skill --source-type git-generated --name openspec-explore --workflow-id explore
 ```
 
-Rebuild the registry after manual folder changes:
+Sync the registry:
 
 ```bash
 python scripts/sync_skills_registry.py
 ```
 
-## Verified Behavior
+## Maintenance Rules
 
-This repository currently covers and verifies these key behaviors:
+- Add stable constraints in `rules/`
+- Add task procedures in `workflows/`
+- Add script notes, compatibility notes, or pitfalls in `references/`
+- Change activation and task routing in `SKILL.md`
 
-- `skills-updater` does not self-update
-- updates are driven by `.skills-list.json`
-- deleted skills are removed from the registry
-- installs always target `~/.agents/skills`
-- registry contents are refreshed immediately after install
+Do not turn `SKILL.md` back into a long-form manual.
+
+## Origin
+
+This repository is derived from `https://github.com/yizhiyanhua-ai/skills-updater`, but the current implementation is centered on maintaining a unified local skill store at `~/.agents/skills`.
 
 ## License
 

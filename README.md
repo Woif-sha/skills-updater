@@ -1,343 +1,160 @@
 # Skills Updater
 
-统一管理 `~/.agents/skills` 下所有 skills 的更新、安装和注册表同步。
+统一管理 `~/.agents/skills` 下的 skill 安装、更新、注册表同步与附属推荐工具。
 
 [English](README.en.md)
 
-## 项目来源
+## 当前结构
 
-本项目基于 `https://github.com/yizhiyanhua-ai/skills-updater` 进行二次改造。
-
-原项目的重点更偏向 Claude Code 多来源技能更新与推荐；当前版本已经按本仓库的使用方式做了重构，核心目标变成：
-
-- 只管理 `~/.agents/skills`
-- 维护统一注册表 `.skills-list.json`
-- 先比对版本，再决定是否下载和替换
-- 支持 `skill-pack`、普通单 skill、以及 OpenSpec 生成型 skill
-- 保证本地定制版 `skills-updater` 不会被它自己覆盖
-
-## 当前设计
-
-`~/.agents/skills` 是唯一的技能源目录。
-
-你可以把 `~/.claude/skills`、`~/.codex/skills`、`~/.cursor/skills` 软链接到这里，但 updater 本身不会直接管理那些目录。所有检查、安装、更新、删除同步，最终都只围绕这一处展开。
-
-注册表文件固定为：
-
-```text
-~/.agents/skills/.skills-list.json
-```
-
-## 主要功能
-
-### 1. 统一扫描和注册
-
-- 扫描 `~/.agents/skills` 下的顶层目录
-- 自动识别普通单 skill 和 `skill-pack`
-- 为每个受管 skill 写入或刷新来源信息
-- 重建 `.skills-list.json`
-
-### 2. 基于版本的更新检查
-
-- 先读取本地注册表中的 `localVersion`
-- 再向上游仓库查询 `remoteVersion`
-- 仅当版本不同才进入实际更新流程
-- 避免“全部下载下来再做目录 diff”这种高成本方式
-
-### 3. 选择性更新 skill
-
-- 支持更新全部 skill
-- 支持只更新指定 skill
-- 更新前自动生成备份目录
-- 更新后自动同步注册表
-
-## 默认请求语义
-
-- 如果用户只调用 `skills-updater` 而没有附加语句，默认把它当成执行请求：先运行 `python scripts/check_updates.py`，如果发现有可更新项，再运行 `python scripts/update_agent_skills.py`，并确保 `.skills-list.json` 处于最新状态
-- 如果用户表示要安装某个 skill，默认使用 `skills-updater` 执行安装，并在安装后刷新注册表
-- 如果用户表示手动删除了某个 skill，默认使用 `skills-updater` 执行注册表同步，让 `.skills-list.json` 与文件系统一致
-
-### 4. 安装新 skill
-
-- 直接安装到 `~/.agents/skills/<skill-name>`
-- 安装完成后自动刷新 `.skills-list.json`
-- 普通 skill 会写入 `.openskills.json`
-- `skill-pack` 会保留整仓结构
-
-### 5. 同步手动删除或新增
-
-如果你手动删除了某个 skill 目录，或者手动新增了一个 skill 目录，运行同步脚本后，`.skills-list.json` 会按当前文件系统状态重建，旧条目会被移除，新条目会被纳入。
-
-### 6. 特殊处理 `superpowers`
-
-- `superpowers` 视为一个整体 `skill-pack`
-- 注册表只记录整仓信息
-- 不展开记录其中每个子 skill
-- 上游更新时，直接更新整仓即可
-
-### 7. 特殊处理 OpenSpec
-
-OpenSpec 技能不是静态目录复制，而是生成型 skill：
-
-- 上游仓库：`https://github.com/Fission-AI/OpenSpec`
-- 类型：`git-generated`
-- 检查更新时读取上游包版本
-- 版本变化后，重新拉取并生成对应 workflow skill
-
-### 8. 阻止 `skills-updater` 自更新
-
-这个仓库里的 `skills-updater` 是本地定制版，所以它在注册表里会被标记为：
-
-```json
-{
-  "autoUpdate": false
-}
-```
-
-这样在批量更新时，它不会把自己从上游覆盖掉。
-
-## 目录结构
+这个仓库现在按 skill-based-architecture 组织：
 
 ```text
 skills-updater/
-├─ README.md
-├─ README.en.md
-├─ SKILL.md
-├─ references/
-│  └─ marketplaces.md
-└─ scripts/
-   ├─ agent_skill_updater.py
-   ├─ check_updates.py
-   ├─ i18n.py
-   ├─ install_agent_skill.py
-   ├─ recommend_skills.py
-   ├─ recommendations.json
-   ├─ skills_registry.py
-   ├─ stdio_utils.py
-   ├─ sync_skills_registry.py
-   ├─ test_agent_skill_updater.py
-   ├─ test_skills_registry.py
-   ├─ update_agent_skills.py
-   └─ update_marketplace.py
+|-- SKILL.md
+|-- README.md
+|-- README.en.md
+|-- rules/
+|   |-- scope-and-registry.md
+|   `-- update-policies.md
+|-- workflows/
+|   |-- default-invocation.md
+|   |-- check-updates.md
+|   |-- update-skills.md
+|   |-- install-skill.md
+|   |-- sync-registry.md
+|   |-- recommend-skills.md
+|   `-- update-marketplace.md
+|-- references/
+|   |-- gotchas.md
+|   |-- script-map.md
+|   `-- marketplaces.md
+`-- scripts/
 ```
 
-## 脚本说明
+## 各部分职责
 
-### `scripts/agent_skill_updater.py`
+### `SKILL.md`
 
-底层更新工具模块。
+入口文件。
 
-负责：
+- 定义触发条件，确保 agent 在 `"skills-updater"`、`"check skill updates"`、`"install a skill from GitHub"` 这类请求下正确启用
+- 规定常读文件
+- 提供常见任务路由表
+- 提醒几个最关键的 gotchas
 
-- 下载 GitHub 仓库归档
-- 暂存远端 skill 内容
-- 计算目录签名
-- 比较本地与暂存内容
-- 执行替换
-- 创建备份
-- 处理 OpenSpec 生成流程
-- 执行 `skill-pack` 的 git clone / git pull 相关辅助逻辑
+它应该保持短小，只负责导航，不承载完整规则手册。
 
-### `scripts/skills_registry.py`
+### `rules/`
 
-注册表核心模块。
+长期稳定约束。
 
-负责：
+- [rules/scope-and-registry.md](rules/scope-and-registry.md)
+  说明 source of truth 是 `~/.agents/skills`，以及 `.skills-list.json`、`.openskills.json`、`single-skill`、`skill-pack` 的边界和识别规则。
+- [rules/update-policies.md](rules/update-policies.md)
+  说明版本优先、按类型更新、备份策略、OpenSpec 生成逻辑、`superpowers` 特判，以及 `skills-updater` 自更新保护。
 
-- 获取 `~/.agents/skills`
-- 读取和写入 `.skills-list.json`
-- 识别普通单 skill 和 `skill-pack`
-- 推断已知 skill 的上游仓库来源
-- 刷新 `localVersion`
-- 对 `skills-updater` 强制写入 `autoUpdate: false`
+如果某条规则是“总是成立”的，就应该放在这里，而不是写进 workflow。
 
-### `scripts/check_updates.py`
+### `workflows/`
 
-只做检查，不做替换。
+按任务拆分的执行流程。
 
-负责：
+- [workflows/default-invocation.md](workflows/default-invocation.md)
+  用户只说 `skills-updater` 时的默认执行语义。
+- [workflows/check-updates.md](workflows/check-updates.md)
+  检查全部或指定 skill 的更新状态。
+- [workflows/update-skills.md](workflows/update-skills.md)
+  执行全量或单项更新，并说明备份与跳过逻辑。
+- [workflows/install-skill.md](workflows/install-skill.md)
+  从 GitHub 安装普通 skill、`skill-pack` 或 OpenSpec 生成型 skill。
+- [workflows/sync-registry.md](workflows/sync-registry.md)
+  手动增删目录后重建 `.skills-list.json`。
+- [workflows/recommend-skills.md](workflows/recommend-skills.md)
+  推荐与发现 skill，不混同于安装和更新。
+- [workflows/update-marketplace.md](workflows/update-marketplace.md)
+  显式处理 `~/.claude/plugins/marketplaces` 下的 marketplace 更新。
 
-- 先同步注册表
-- 查询每个 skill 的远端版本
-- 输出 `up_to_date`、`update_available`、`unknown_version`、`error`
-- 支持 `--skill` 和 `--json`
+如果某条内容描述的是“遇到某类请求时怎么做”，就放在这里。
 
-### `scripts/update_agent_skills.py`
+### `references/`
 
-真正执行更新的主入口。
+补充性资料，不直接定义行为。
 
-负责：
+- [references/gotchas.md](references/gotchas.md)
+  记录最容易误判的坑，例如 `check_updates.py` 用退出码 `1` 表示“有更新可用”。
+- [references/script-map.md](references/script-map.md)
+  对应仓库脚本和职责的索引，方便从用户请求映射到脚本。
+- [references/marketplaces.md](references/marketplaces.md)
+  marketplace 兼容信息和来源说明。
 
-- 按注册表逐项检查更新
-- 跳过 `autoUpdate: false` 的 skill
-- 对有版本变化的 skill 执行更新
-- 对 `skill-pack` 执行整仓拉取
-- 对 OpenSpec 执行重新生成
-- 更新完成后重写注册表
+这些文件用来补上下文，不应替代 `rules/` 或 `workflows/`。
 
-### `scripts/install_agent_skill.py`
+### `scripts/`
 
-安装新 skill 的入口。
+实际执行逻辑。
 
-负责：
+- `check_updates.py`: 读取注册表并探测远端版本
+- `update_agent_skills.py`: 应用更新
+- `install_agent_skill.py`: 安装新 skill
+- `sync_skills_registry.py`: 重建注册表
+- `skills_registry.py`: 识别本地目录并维护 `.skills-list.json`
+- `agent_skill_updater.py`: 远端拉取、暂存、目录签名、备份与替换
+- `recommend_skills.py`: 推荐技能
+- `update_marketplace.py`: marketplace 兼容脚本
 
-- 解析 GitHub 仓库地址
-- 计算安装目录名
-- 确保安装目标是 `~/.agents/skills/<name>`
-- 安装普通单 skill 或整仓 `skill-pack`
-- 写入 `.openskills.json`
-- 安装完成后同步 `.skills-list.json`
+README 只说明这些脚本分别做什么；具体执行规则以 `rules/` 和 `workflows/` 为准。
 
-### `scripts/sync_skills_registry.py`
+## 核心行为
 
-纯同步入口。
+- 只把 `~/.agents/skills` 当成 source of truth
+- 通过 `.skills-list.json` 维护统一注册表
+- 先比较版本，再决定是否更新
+- `superpowers` 视为一个整体 `skill-pack`
+- OpenSpec skill 视为 `git-generated`
+- 本地定制版 `skills-updater` 保持 `autoUpdate: false`
 
-负责：
+## 常见命令
 
-- 重新扫描 `~/.agents/skills`
-- 重建 `.skills-list.json`
-- 删除已经不存在的条目
-- 纳入新出现的条目
-
-### `scripts/stdio_utils.py`
-
-Windows 终端输出辅助模块。
-
-负责：
-
-- 安全配置 UTF-8 标准输出和错误输出
-- 避免重复包裹 `stdout/stderr` 导致测试或 CLI 异常
-
-### `scripts/i18n.py`
-
-国际化模块。
-
-负责：
-
-- 检测系统语言
-- 提供中英文输出文本
-- 为 CLI 脚本统一输出文案
-
-### `scripts/recommend_skills.py`
-
-技能推荐脚本。
-
-负责：
-
-- 从 `skills.sh` 获取推荐或热门 skill
-- 加载本地推荐配置
-- 输出推荐列表
-
-说明：这是保留的辅助能力，不是当前统一技能目录管理流程的核心。
-
-### `scripts/update_marketplace.py`
-
-旧 marketplace 兼容脚本。
-
-负责：
-
-- 检查传统 Claude marketplace 仓库更新
-- 拉取 marketplace
-- 标记受影响的 skill
-
-说明：这个脚本保留在仓库中，但当前主流程已经转向 `~/.agents/skills` 和 `.skills-list.json`。
-
-### `scripts/test_agent_skill_updater.py`
-
-更新和安装相关测试，覆盖：
-
-- OpenSpec 元数据解析
-- 目录签名比较
-- 远端暂存逻辑
-- `skills-updater` 自更新保护
-- 指定条目更新
-- 安装路径与注册表回写
-
-### `scripts/test_skills_registry.py`
-
-注册表测试，覆盖：
-
-- `superpowers` 识别为 `skill-pack`
-- 已知来源推断
-- 删除 skill 后注册表条目清理
-- `skills-updater` 自动禁用自更新
-
-### `scripts/recommendations.json`
-
-推荐 skill 的静态配置文件，供推荐脚本读取。
-
-### `references/marketplaces.md`
-
-保留的参考资料文件，主要服务于 marketplace 相关兼容逻辑。
-
-## 常用命令
-
-空调用 `skills-updater` 的默认执行流程：
+检查更新：
 
 ```bash
 python scripts/check_updates.py
-python scripts/update_agent_skills.py
+python scripts/check_updates.py --skill <name>
 ```
 
-只有在检查结果显示存在可更新项时，才执行第二条更新命令。
-
-检查全部 skill 的更新状态：
-
-```bash
-python scripts/check_updates.py
-```
-
-检查单个 skill：
-
-```bash
-python scripts/check_updates.py --skill superpowers --json
-```
-
-更新全部已安装 skill：
+应用更新：
 
 ```bash
 python scripts/update_agent_skills.py
+python scripts/update_agent_skills.py --skill <name>
 ```
 
-更新指定 skill：
-
-```bash
-python scripts/update_agent_skills.py --skill openspec-explore
-```
-
-安装普通 skill：
+安装新 skill：
 
 ```bash
 python scripts/install_agent_skill.py --repo anthropics/skills --path skills/docx --name docx
-```
-
-安装 `skill-pack`：
-
-```bash
 python scripts/install_agent_skill.py --repo https://github.com/obra/superpowers --type skill-pack --name superpowers
-```
-
-安装 OpenSpec 生成型 skill：
-
-```bash
 python scripts/install_agent_skill.py --repo https://github.com/Fission-AI/OpenSpec --type single-skill --source-type git-generated --name openspec-explore --workflow-id explore
 ```
 
-手动改动目录后重建注册表：
+同步注册表：
 
 ```bash
 python scripts/sync_skills_registry.py
 ```
 
-## 当前验证状态
+## 维护约定
 
-当前仓库已经覆盖并验证的关键行为包括：
+- 想加稳定规则，改 `rules/`
+- 想加某类请求的处理流程，改 `workflows/`
+- 想补充脚本说明、兼容信息或坑点，改 `references/`
+- 想改 skill 触发和任务路由，改 `SKILL.md`
 
-- `skills-updater` 不会自更新
-- 更新按 `.skills-list.json` 驱动
-- 删除 skill 后注册表会清理对应条目
-- 安装 skill 时目标目录固定在 `~/.agents/skills`
-- 安装完成后注册表会同步刷新
+不要把新的长篇说明再塞回 `SKILL.md`。
+
+## 来源
+
+本仓库基于 `https://github.com/yizhiyanhua-ai/skills-updater` 二次改造，当前实现更偏向本地统一 skill 目录 `~/.agents/skills` 的维护，而不是多套目录并行管理。
 
 ## License
 
