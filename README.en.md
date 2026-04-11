@@ -53,6 +53,12 @@ The registry file is always:
 - create backups before replacement
 - sync the registry again after changes are applied
 
+## Default Request Semantics
+
+- if the user invokes `skills-updater` with no extra text, treat it as an operational request: run `python scripts/check_updates.py`, then run `python scripts/update_agent_skills.py` if updates are available, and leave `.skills-list.json` refreshed
+- if the user asks to install a skill, use `skills-updater` by default so the install and registry refresh happen together
+- if the user says a skill was deleted manually, use `skills-updater` by default to resync `.skills-list.json` with the filesystem
+
 ### 4. New skill installation
 
 - installs directly into `~/.agents/skills/<skill-name>`
@@ -267,6 +273,15 @@ Static recommendation data used by the recommendation script.
 Reference material kept for marketplace-related compatibility logic.
 
 ## Common Commands
+
+Default empty invocation behavior:
+
+```bash
+python scripts/check_updates.py
+python scripts/update_agent_skills.py
+```
+
+Run the update command only when the check step reports available updates.
 
 Check all skills:
 

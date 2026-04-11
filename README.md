@@ -51,6 +51,12 @@
 - 更新前自动生成备份目录
 - 更新后自动同步注册表
 
+## 默认请求语义
+
+- 如果用户只调用 `skills-updater` 而没有附加语句，默认把它当成执行请求：先运行 `python scripts/check_updates.py`，如果发现有可更新项，再运行 `python scripts/update_agent_skills.py`，并确保 `.skills-list.json` 处于最新状态
+- 如果用户表示要安装某个 skill，默认使用 `skills-updater` 执行安装，并在安装后刷新注册表
+- 如果用户表示手动删除了某个 skill，默认使用 `skills-updater` 执行注册表同步，让 `.skills-list.json` 与文件系统一致
+
 ### 4. 安装新 skill
 
 - 直接安装到 `~/.agents/skills/<skill-name>`
@@ -265,6 +271,15 @@ Windows 终端输出辅助模块。
 保留的参考资料文件，主要服务于 marketplace 相关兼容逻辑。
 
 ## 常用命令
+
+空调用 `skills-updater` 的默认执行流程：
+
+```bash
+python scripts/check_updates.py
+python scripts/update_agent_skills.py
+```
+
+只有在检查结果显示存在可更新项时，才执行第二条更新命令。
 
 检查全部 skill 的更新状态：
 

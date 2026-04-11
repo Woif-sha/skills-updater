@@ -63,6 +63,17 @@ Rules:
 
 ## Required Workflow
 
+### Default invocation
+
+If the user invokes `skills-updater` without any additional instruction, treat that as:
+
+1. Sync `~/.agents/skills/.skills-list.json`
+2. Run `python scripts/check_updates.py`
+3. If any managed entry shows `update_available`, run `python scripts/update_agent_skills.py`
+4. Report both the check result and any applied updates
+
+This default behavior is operational. It is not a request to explain how the skill works.
+
 ### Check updates
 
 Run:
@@ -137,6 +148,10 @@ Use this when the user manually adds or deletes folders in `~/.agents/skills`.
 
 Run `python scripts/check_updates.py` and report version status from `.skills-list.json`.
 
+### "skills-updater" with no extra text
+
+Treat this as the default invocation flow: run `python scripts/check_updates.py`, then run `python scripts/update_agent_skills.py` if updates are available, and report the resulting registry state.
+
 ### "Update all skills"
 
 Run `python scripts/update_agent_skills.py`, then report which entries changed and any backup path created.
@@ -147,11 +162,11 @@ Treat `superpowers` as a single `skill-pack`. Compare its repo commit first, the
 
 ### "Install a new skill from GitHub"
 
-Run `python scripts/install_agent_skill.py ...` into `~/.agents/skills`, then resync the registry.
+Use `skills-updater` by default. Run `python scripts/install_agent_skill.py ...` into `~/.agents/skills`, then resync the registry.
 
 ### "I deleted a skill manually"
 
-Run `python scripts/sync_skills_registry.py` so `.skills-list.json` matches the filesystem again.
+Use `skills-updater` by default. Run `python scripts/sync_skills_registry.py` so `.skills-list.json` matches the filesystem again.
 
 ## Scripts
 
