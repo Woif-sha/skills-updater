@@ -113,6 +113,11 @@ def main() -> None:
                 item["status"] = resolved.status
                 item["remote_version"] = remote_version
                 item["applied"] = True
+            elif status == "update_available" and resolved.status == "up_to_date" and remote_version:
+                refresh_skill_metadata_version(source, remote_version)
+                item["status"] = resolved.status
+                item["remote_version"] = remote_version
+                item["applied"] = True
             else:
                 item["status"] = resolved.status
                 item["error_message"] = resolved.error_message

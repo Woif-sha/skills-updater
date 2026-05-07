@@ -324,6 +324,48 @@ class AgentSkillUpdaterTests(unittest.TestCase):
         self.assertTrue(payload[0]["applied"])
         update_from_staged.assert_called_once()
 
+    def test_update_agent_skills_refreshes_metadata_when_staged_content_matches(self):
+        import scripts.update_agent_skills as updater
+
+        registry = {
+            "version": 1,
+            "generatedAt": "2026-04-11T00:00:00+00:00",
+            "skillsRoot": r"C:\Users\sha\.agents\skills",
+            "entries": {
+                "demo-skill": {
+                    "name": "demo-skill",
+                    "entryType": "single-skill",
+                    "path": r"C:\Users\sha\.agents\skills\demo-skill",
+                    "repoUrl": "https://github.com/example/demo-skill",
+                    "source": "example/demo-skill",
+                    "sourceType": "git",
+                    "subpath": ".",
+                    "localVersion": "old123456789",
+                    "managed": True,
+                    "autoUpdate": True,
+                },
+            },
+        }
+
+        source = SimpleNamespace(name="demo-skill")
+        resolved = SimpleNamespace(status="up_to_date", error_message=None, source=source)
+        stdout = io.StringIO()
+        with mock.patch.object(updater.sys, "argv", ["update_agent_skills.py", "--skill", "demo-skill", "--json"]):
+            with mock.patch("scripts.update_agent_skills.sync_registry", side_effect=[registry, registry]):
+                with mock.patch("scripts.update_agent_skills.save_registry"):
+                    with mock.patch("scripts.update_agent_skills._probe_entry", return_value=("update_available", "new123456789", None)):
+                        with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
+                            with mock.patch("scripts.update_agent_skills.refresh_skill_metadata_version") as refresh_metadata:
+                                with self.assertRaises(SystemExit) as exit_info:
+                                    with redirect_stdout(stdout):
+                                        updater.main()
+
+        self.assertEqual(exit_info.exception.code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload[0]["status"], "up_to_date")
+        self.assertTrue(payload[0]["applied"])
+        refresh_metadata.assert_called_once()
+
     def test_install_agent_skill_uses_agent_skills_root_and_rewrites_registry(self):
         import scripts.install_agent_skill as installer
         from scripts.skills_registry import sync_registry as real_sync_registry
