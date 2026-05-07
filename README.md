@@ -51,7 +51,7 @@ skills-updater/
 - [rules/scope-and-registry.md](rules/scope-and-registry.md)
   说明 source of truth 是 `~/.agents/skills`，以及 `.skills-list.json`、`.openskills.json`、`single-skill`、`skill-pack` 的边界和识别规则。
 - [rules/update-policies.md](rules/update-policies.md)
-  说明版本优先、按类型更新、备份策略、OpenSpec 生成逻辑、`superpowers` 特判，以及 `skills-updater` 自更新保护。
+  说明版本优先、按类型更新、本地修改三方合并、备份策略、OpenSpec 生成逻辑、`superpowers` 特判，以及 `skills-updater` 自更新保护。
 
 如果某条规则是“总是成立”的，就应该放在这里，而不是写进 workflow。
 
@@ -64,7 +64,7 @@ skills-updater/
 - [workflows/check-updates.md](workflows/check-updates.md)
   检查全部或指定 skill 的更新状态。
 - [workflows/update-skills.md](workflows/update-skills.md)
-  执行全量或单项更新，并说明备份与跳过逻辑。
+  执行全量或单项更新，并说明本地修改合并、备份、冲突与跳过逻辑。
 - [workflows/install-skill.md](workflows/install-skill.md)
   从 GitHub 安装普通 skill、`skill-pack` 或 OpenSpec 生成型 skill。
 - [workflows/sync-registry.md](workflows/sync-registry.md)
@@ -94,11 +94,11 @@ skills-updater/
 实际执行逻辑。
 
 - `check_updates.py`: 读取注册表并探测远端版本
-- `update_agent_skills.py`: 应用更新
+- `update_agent_skills.py`: 应用更新，遇到本地/远端冲突时报告错误而不覆盖本地 skill
 - `install_agent_skill.py`: 安装新 skill
 - `sync_skills_registry.py`: 重建注册表
 - `skills_registry.py`: 识别本地目录并维护 `.skills-list.json`
-- `agent_skill_updater.py`: 远端拉取、暂存、目录签名、备份与替换
+- `agent_skill_updater.py`: 远端拉取、暂存、目录签名、备份、三方合并与元数据刷新
 - `recommend_skills.py`: 推荐技能
 - `update_marketplace.py`: marketplace 兼容脚本
 
@@ -109,6 +109,7 @@ README 只说明这些脚本分别做什么；具体执行规则以 `rules/` 和
 - 只把 `~/.agents/skills` 当成 source of truth
 - 通过 `.skills-list.json` 维护统一注册表
 - 先比较版本，再决定是否更新
+- git-backed `single-skill` 更新时保留本地修改：用 `sourceCommitSha` 还原安装基准，三方合并本地与远端变更；冲突时阻止覆盖并输出冲突文件
 - `superpowers` 视为一个整体 `skill-pack`
 - OpenSpec skill 视为 `git-generated`
 - 本地定制版 `skills-updater` 保持 `autoUpdate: false`

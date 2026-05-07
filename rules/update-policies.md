@@ -11,7 +11,10 @@ These rules govern how version checks and updates must behave.
 
 ## Update Strategy By Entry Type
 
-- `single-skill`: stage the remote skill, compare content, then replace the local folder only when the staged copy is different.
+- `single-skill`: stage the remote skill, compare content, then apply the update only when the staged copy is different.
+- Git-backed `single-skill` updates must preserve local edits. Reconstruct the installed base from `.openskills.json` / `sourceCommitSha`, then three-way merge `base + current local + staged remote`.
+- If the local skill contains custom additions such as user-specific `SKILL.md` rules and the remote also changed the same file in a non-conflicting area, keep both changes in the final skill.
+- If local and remote changed the same lines or a safe base cannot be reconstructed, do not overwrite the local skill. Leave the current local folder unchanged, keep a backup, write conflict artifacts, and report an `error` status for that entry.
 - `skill-pack`: compare remote commit first, then `git pull --ff-only` the whole repo if it is behind.
 - `git-generated` OpenSpec skill: compare upstream package version first, then regenerate the skill from upstream when the version changes.
 
@@ -19,6 +22,7 @@ These rules govern how version checks and updates must behave.
 
 - Backups are created only when a staged single-skill replacement is actually applied.
 - Backup roots live under `~/.agents/skills/.backup-YYYYMMDD-HHMMSS`.
+- Merge conflict artifacts live beside the backup as `~/.agents/skills/.backup-YYYYMMDD-HHMMSS/<skill>.merge-conflicts/` and contain `.base`, `.local`, and `.remote` versions of conflicted files when available.
 - Refresh `.openskills.json` metadata after installs or applied updates when the script does so.
 - For OpenSpec entries, track `generatedByVersion`; for git-backed single skills, track `sourceCommitSha`.
 

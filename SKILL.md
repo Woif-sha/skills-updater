@@ -28,6 +28,7 @@ Manage the unified skill store at `~/.agents/skills`.
 
 - `check_updates.py` exits with code `1` when updates exist. That is a status signal, not necessarily a script failure.
 - `skills-updater` is intentionally registered with `autoUpdate: false`; batch updates must not overwrite this local customized copy.
+- Updating a git-backed `single-skill` must preserve local edits. The updater reconstructs the installed base from `sourceCommitSha`, merges local changes with the staged remote update, and blocks the update with conflict files instead of discarding local edits.
 - `superpowers` is one `skill-pack`, not dozens of child registry entries.
 - OpenSpec skills are generated from upstream versioned templates, not copied as static folders.
 

@@ -22,6 +22,7 @@ from typing import Optional
 DEFAULT_USER_AGENT = "skills-updater/1.0"
 OPENSPEC_REPO = "https://github.com/Fission-AI/OpenSpec"
 IGNORED_SIGNATURE_FILES = {".openskills.json"}
+DELETE_MERGED_FILE = object()
 
 
 class AgentSkillUpdaterError(Exception):
@@ -147,13 +148,21 @@ def update_skill_from_staged(
         shutil.rmtree(backup_dir)
     shutil.copytree(update.source.local_dir, backup_dir)
 
-    _clear_skill_directory(update.source.local_dir)
-    for child in update.staged_dir.iterdir():
-        destination = update.source.local_dir / child.name
-        if child.is_dir():
-            shutil.copytree(child, destination)
-        else:
-            shutil.copy2(child, destination)
+    with tempfile.TemporaryDirectory(prefix=f"{update.source.name}-merge-") as temp_dir:
+        temp_root = Path(temp_dir)
+        base_dir = _stage_update_base(update, temp_root / "base")
+        merged_dir = temp_root / "merged"
+        conflict_root = backup_root / f"{update.source.name}.merge-conflicts"
+        _merge_skill_directories(
+            base_dir=base_dir,
+            local_dir=update.source.local_dir,
+            remote_dir=update.staged_dir,
+            merged_dir=merged_dir,
+            conflict_root=conflict_root,
+        )
+
+        _clear_skill_directory(update.source.local_dir)
+        _copy_directory_contents(merged_dir, update.source.local_dir)
 
     _refresh_metadata(update)
 
@@ -240,7 +249,15 @@ def git_default_branch(repo_dir: Path) -> str:
 
 
 def _stage_git_skill(source: AgentSkillSource, stage_root: Path) -> Path:
-    repo_root, _ = _download_repo_root(source.repo_url, stage_root)
+    return _stage_git_skill_at_ref(source, stage_root, ref=None)
+
+
+def _stage_git_skill_at_ref(source: AgentSkillSource, stage_root: Path, ref: Optional[str]) -> Path:
+    if ref:
+        owner, repo = _parse_github_repo(source.repo_url or "")
+        repo_root = _download_repo_archive(owner, repo, ref, stage_root)
+    else:
+        repo_root, _ = _download_repo_root(source.repo_url or "", stage_root)
     skill_path = repo_root
     if source.subpath and source.subpath not in {".", ""}:
         skill_path = repo_root / Path(source.subpath.replace("\\", "/"))
@@ -252,6 +269,161 @@ def _stage_git_skill(source: AgentSkillSource, stage_root: Path) -> Path:
     destination = stage_root / source.name
     shutil.copytree(skill_path, destination)
     return destination
+
+
+def _stage_update_base(update: AgentSkillUpdate, stage_root: Path) -> Optional[Path]:
+    if _is_openspec_source(update.source):
+        return None
+    if not update.source.repo_url or not update.local_version or update.local_version == "unknown":
+        return None
+    try:
+        return _stage_git_skill_at_ref(update.source, stage_root, update.local_version)
+    except Exception as exc:  # noqa: BLE001
+        raise AgentSkillUpdaterError(
+            f"Unable to reconstruct installed base for '{update.source.name}' at "
+            f"{update.local_version}; refusing to overwrite possible local edits. "
+            "Re-run after resolving the base version or reinstall intentionally."
+        ) from exc
+
+
+def _merge_skill_directories(
+    *,
+    base_dir: Optional[Path],
+    local_dir: Path,
+    remote_dir: Path,
+    merged_dir: Path,
+    conflict_root: Path,
+) -> None:
+    conflicts: list[str] = []
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    paths = sorted(
+        _relative_file_paths(base_dir)
+        | _relative_file_paths(local_dir)
+        | _relative_file_paths(remote_dir),
+        key=lambda item: item.as_posix(),
+    )
+
+    for relative_path in paths:
+        base_file = base_dir / relative_path if base_dir else None
+        local_file = local_dir / relative_path
+        remote_file = remote_dir / relative_path
+        destination = merged_dir / relative_path
+        merged_file = _merge_skill_file(base_file, local_file, remote_file, relative_path, conflict_root)
+        if merged_file is None:
+            conflicts.append(relative_path.as_posix())
+            continue
+        if merged_file is DELETE_MERGED_FILE:
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(merged_file)
+
+    if conflicts:
+        conflict_list = "\n".join(f"- {item}" for item in conflicts)
+        raise AgentSkillUpdaterError(
+            "Local skill changes conflict with the remote update. "
+            f"No files were overwritten. Review {conflict_root} and resolve:\n{conflict_list}"
+        )
+
+
+def _merge_skill_file(
+    base_file: Optional[Path],
+    local_file: Path,
+    remote_file: Path,
+    relative_path: Path,
+    conflict_root: Path,
+):
+    base_exists = bool(base_file and base_file.exists())
+    local_exists = local_file.exists()
+    remote_exists = remote_file.exists()
+    base_bytes = base_file.read_bytes() if base_exists and base_file else None
+    local_bytes = local_file.read_bytes() if local_exists else None
+    remote_bytes = remote_file.read_bytes() if remote_exists else None
+
+    if local_exists and remote_exists:
+        if local_bytes == remote_bytes:
+            return remote_bytes
+        if base_exists and local_bytes == base_bytes:
+            return remote_bytes
+        if base_exists and remote_bytes == base_bytes:
+            return local_bytes
+        if base_exists and base_file:
+            merged = _merge_text_file(base_file, local_file, remote_file)
+            if merged is not None:
+                return merged
+        _write_conflict_files(conflict_root, relative_path, base_file, local_file, remote_file)
+        return None
+
+    if remote_exists:
+        if base_exists and remote_bytes == base_bytes:
+            return DELETE_MERGED_FILE
+        if base_exists:
+            _write_conflict_files(conflict_root, relative_path, base_file, local_file, remote_file)
+            return None
+        return remote_bytes
+
+    if local_exists:
+        if base_exists and local_bytes == base_bytes:
+            return DELETE_MERGED_FILE
+        if base_exists:
+            _write_conflict_files(conflict_root, relative_path, base_file, local_file, remote_file)
+            return None
+        return local_bytes
+
+    return DELETE_MERGED_FILE
+
+
+def _merge_text_file(base_file: Path, local_file: Path, remote_file: Path) -> Optional[bytes]:
+    try:
+        base_file.read_text(encoding="utf-8")
+        local_file.read_text(encoding="utf-8")
+        remote_file.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
+
+    result = subprocess.run(
+        _resolve_command(["git", "merge-file", "-p", str(local_file), str(base_file), str(remote_file)]),
+        capture_output=True,
+        text=False,
+    )
+    if result.returncode == 0:
+        return result.stdout
+    return None
+
+
+def _relative_file_paths(root: Optional[Path]) -> set[Path]:
+    if root is None or not root.exists():
+        return set()
+    return {
+        file_path.relative_to(root)
+        for file_path in root.rglob("*")
+        if file_path.is_file() and file_path.name not in IGNORED_SIGNATURE_FILES
+    }
+
+
+def _write_conflict_files(
+    conflict_root: Path,
+    relative_path: Path,
+    base_file: Optional[Path],
+    local_file: Path,
+    remote_file: Path,
+) -> None:
+    destination = conflict_root / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if base_file and base_file.exists():
+        shutil.copy2(base_file, destination.with_suffix(destination.suffix + ".base"))
+    if local_file.exists():
+        shutil.copy2(local_file, destination.with_suffix(destination.suffix + ".local"))
+    if remote_file.exists():
+        shutil.copy2(remote_file, destination.with_suffix(destination.suffix + ".remote"))
+
+
+def _copy_directory_contents(source_dir: Path, destination_dir: Path) -> None:
+    for child in source_dir.iterdir():
+        destination = destination_dir / child.name
+        if child.is_dir():
+            shutil.copytree(child, destination)
+        else:
+            shutil.copy2(child, destination)
 
 
 def _stage_openspec_generated_skill(source: AgentSkillSource, stage_root: Path) -> Path:

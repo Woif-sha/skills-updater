@@ -51,7 +51,7 @@ Long-lived constraints.
 - [rules/scope-and-registry.md](rules/scope-and-registry.md)
   Covers the source of truth, `.skills-list.json`, `.openskills.json`, and the boundaries for `single-skill` and `skill-pack` entries.
 - [rules/update-policies.md](rules/update-policies.md)
-  Covers version-first checks, per-type update behavior, backups, OpenSpec generation rules, `superpowers` handling, and the self-update guard for `skills-updater`.
+  Covers version-first checks, per-type update behavior, local-edit three-way merges, backups, OpenSpec generation rules, `superpowers` handling, and the self-update guard for `skills-updater`.
 
 If something is supposed to stay true across tasks, it belongs here.
 
@@ -64,7 +64,7 @@ Task-specific operating procedures.
 - [workflows/check-updates.md](workflows/check-updates.md)
   How to inspect update status for all skills or one named skill.
 - [workflows/update-skills.md](workflows/update-skills.md)
-  How to apply updates, including backup and skip behavior.
+  How to apply updates, including local-edit merges, backups, conflicts, and skip behavior.
 - [workflows/install-skill.md](workflows/install-skill.md)
   How to install a regular skill, a `skill-pack`, or an OpenSpec-generated skill.
 - [workflows/sync-registry.md](workflows/sync-registry.md)
@@ -94,11 +94,11 @@ These files support decisions; they do not replace `rules/` or `workflows/`.
 Implementation entry points.
 
 - `check_updates.py`: probe remote versions from the registry
-- `update_agent_skills.py`: apply updates
+- `update_agent_skills.py`: apply updates and report local/remote merge conflicts without overwriting local skills
 - `install_agent_skill.py`: install a new skill
 - `sync_skills_registry.py`: rebuild the registry
 - `skills_registry.py`: detect local entries and maintain `.skills-list.json`
-- `agent_skill_updater.py`: staging, signatures, backups, replacement, and OpenSpec generation helpers
+- `agent_skill_updater.py`: staging, signatures, backups, three-way merges, metadata refresh, and OpenSpec generation helpers
 - `recommend_skills.py`: recommendation helper
 - `update_marketplace.py`: marketplace compatibility helper
 
@@ -109,6 +109,7 @@ The README explains what each script is for; the behavioral rules live in `rules
 - Treat `~/.agents/skills` as the only source of truth
 - Maintain one registry in `.skills-list.json`
 - Compare versions before deciding to update
+- Preserve local edits for git-backed `single-skill` updates: reconstruct the installed base from `sourceCommitSha`, three-way merge local and remote changes, and block overwrites when conflicts remain
 - Treat `superpowers` as one `skill-pack`
 - Treat OpenSpec skills as `git-generated`
 - Keep the local customized `skills-updater` on `autoUpdate: false`

@@ -15,6 +15,7 @@ sys.path.insert(0, str(script_dir))
 
 from agent_skill_updater import (  # noqa: E402
     OPENSPEC_REPO,
+    AgentSkillUpdaterError,
     AgentSkillSource,
     fetch_remote_commit_sha,
     fetch_remote_package_version,
@@ -96,7 +97,14 @@ def main() -> None:
             if resolved.status == "update_available":
                 if backup_root is None:
                     backup_root = make_backup_root()
-                update_skill_from_staged(resolved, backup_root)
+                try:
+                    update_skill_from_staged(resolved, backup_root)
+                except AgentSkillUpdaterError as exc:
+                    item["status"] = "error"
+                    item["error_message"] = str(exc)
+                    item["backup_root"] = str(backup_root)
+                    payload.append(item)
+                    continue
                 item["applied"] = True
                 item["backup_root"] = str(backup_root)
                 updated_names.append(name)

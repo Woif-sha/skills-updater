@@ -6,13 +6,13 @@ This file maps the repository scripts to their responsibilities.
 
 - `scripts/skills_registry.py`: detects skill folders, infers registry entries, and writes `.skills-list.json`
 - `scripts/check_updates.py`: syncs the registry, probes remote versions, stores status fields, and prints human or JSON output
-- `scripts/update_agent_skills.py`: applies selective updates based on registry entries and remote version checks
+- `scripts/update_agent_skills.py`: applies selective updates based on registry entries and remote version checks; reports merge conflicts without overwriting local skills
 - `scripts/install_agent_skill.py`: installs a new single skill or skill-pack into `~/.agents/skills`
 - `scripts/sync_skills_registry.py`: rescans the filesystem and rewrites `.skills-list.json`
 
 ## Shared Helpers
 
-- `scripts/agent_skill_updater.py`: staging, backup, content comparison, metadata refresh, git helpers, and OpenSpec generation support
+- `scripts/agent_skill_updater.py`: staging, backup, content comparison, three-way merge for git-backed single skills, metadata refresh, git helpers, and OpenSpec generation support
 - `scripts/stdio_utils.py`: Windows UTF-8 console handling
 - `scripts/i18n.py`: localized status text
 
