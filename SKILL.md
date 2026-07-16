@@ -1,44 +1,37 @@
 ---
 name: skills-updater
-description: Use when the user says "skills-updater", "check skill updates", "update installed skills", "install a skill from GitHub", or "sync .skills-list.json" for ~/.agents/skills.
+description: >
+  This skill should be used when the user says "skills-updater", "检查 skill 更新",
+  "更新已安装的 skill", "从 GitHub 安装 skill", "同步 .skills-list.json",
+  "这个 skill 是我自己写的，不要联网更新", or "修复 skills-updater".
+  Activate only for the install, update, and registry lifecycle under
+  ~/.agents/skills or this updater's own implementation.
 ---
 
 # Skills Updater
 
-Manage the unified skill store at `~/.agents/skills`.
+Manage the canonical Skill store at `~/.agents/skills`.
 
-## Always Read
+## Route Every Request
 
-- `rules/scope-and-registry.md`
-- `rules/update-policies.md`
+1. Read `routing.yaml`.
+2. Apply its `routing_rules` and select the matching route or routes.
+3. Read only `always_read`, each selected route's `required_reads`, and its `workflow`.
+4. If no route matches, stop and state that the request is outside this Skill; do not guess a command.
 
-## Common Tasks
+Do not reuse the previous route after the user changes tasks.
 
-| Task | Read This | Then Do This |
-| --- | --- | --- |
-| User only says `skills-updater` | `rules/scope-and-registry.md`, `rules/update-policies.md`, `workflows/default-invocation.md` | Run the operational default flow, not an explanation |
-| "Check skill updates" or "is anything outdated?" | `rules/update-policies.md`, `workflows/check-updates.md`, `references/gotchas.md` | Run `check_updates.py`, interpret statuses and exit codes correctly |
-| "Update all skills" or "update <name>" | `rules/update-policies.md`, `workflows/update-skills.md`, `references/gotchas.md` | Run `update_agent_skills.py`, report changed entries and backups |
-| "Install a skill from GitHub" | `rules/scope-and-registry.md`, `workflows/install-skill.md`, `references/script-map.md` | Install into `~/.agents/skills/<name>` and confirm registry refresh |
-| "I added/deleted a skill manually" | `rules/scope-and-registry.md`, `workflows/sync-registry.md` | Rebuild `.skills-list.json` from the filesystem |
-| "Recommend skills" or "what should I install?" | `rules/scope-and-registry.md`, `workflows/recommend-skills.md`, `references/marketplaces.md` | Use the recommender flow; do not confuse it with install/update |
-| "Update marketplace <name>" | `rules/scope-and-registry.md`, `workflows/update-marketplace.md`, `references/marketplaces.md` | Treat marketplace maintenance as an explicit side task |
+## Non-Negotiable Boundaries
 
-## Known Gotchas
-
-- `check_updates.py` exits with code `1` when updates exist. That is a status signal, not necessarily a script failure.
-- `skills-updater` is intentionally registered with `autoUpdate: false`; batch updates must not overwrite this local customized copy.
-- Updating a git-backed `single-skill` must preserve local edits. The updater reconstructs the installed base from `sourceCommitSha`, merges local changes with the staged remote update, and blocks the update with conflict files instead of discarding local edits.
-- `superpowers` is one `skill-pack`, not dozens of child registry entries.
-- OpenSpec skills are generated from upstream versioned templates, not copied as static folders.
-
-See `references/gotchas.md` for the full failure modes.
+- `.git` and `.openskills.json` are control data, never Skill payload.
+- `updatePolicy: "local-only"` forbids every remote probe, stage, fetch, and update.
+- Local-only validates the policy and metadata file safety only; every remotely managed entry requires explicit, consistent provenance with no fallback.
+- JSON mode must remain valid JSON on both success and failure.
 
 ## Rule Priority
 
-Follow `SKILL.md`, then `rules/`, then `workflows/`, then `references/`.
+`SKILL.md` → `rules/` → `workflows/` → `references/` → `README.md`.
 
-## Boundaries
+## Scope
 
-- This skill manages `~/.agents/skills` as the source of truth. It does not directly manage `~/.claude/skills`, `~/.codex/skills`, or `~/.cursor/skills`.
-- Marketplace utilities are optional adjunct tools. Use them only when the user explicitly asks for marketplace discovery or marketplace maintenance.
+This Skill owns `~/.agents/skills` only. It does not manage Claude marketplaces, recommend third-party Skills, or maintain tool-specific mirror directories.

@@ -3,24 +3,33 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 
 from pathlib import Path
 
-script_dir = Path(__file__).parent
-sys.path.insert(0, str(script_dir))
-
-from skills_registry import get_registry_path, sync_registry  # noqa: E402
-from stdio_utils import configure_windows_utf8_stdio  # noqa: E402
+if __package__:
+    from .agent_skill_updater import AgentSkillUpdaterError
+    from .skills_registry import get_registry_path, sync_registry
+    from .stdio_utils import JsonArgumentParser, configure_windows_utf8_stdio
+else:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from agent_skill_updater import AgentSkillUpdaterError  # noqa: E402
+    from skills_registry import get_registry_path, sync_registry  # noqa: E402
+    from stdio_utils import JsonArgumentParser, configure_windows_utf8_stdio  # noqa: E402
 
 
 configure_windows_utf8_stdio()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Refresh ~/.agents/skills/.skills-list.json")
+    parser = JsonArgumentParser(
+        description="Refresh ~/.agents/skills/.skills-list.json",
+        json_error_factory=lambda message: {
+            "status": "error",
+            "error_message": message,
+        },
+    )
     parser.add_argument("--json", action="store_true", help="Output JSON")
     args = parser.parse_args()
 
@@ -32,5 +41,25 @@ def main() -> None:
         print(f"Entries: {len(registry['entries'])}")
 
 
+def _run_cli() -> None:
+    try:
+        main()
+    except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+        if "--json" in sys.argv[1:]:
+            print(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "error_message": str(exc),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
 if __name__ == "__main__":
-    main()
+    _run_cli()

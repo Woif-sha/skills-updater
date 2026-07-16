@@ -3,38 +3,81 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-script_dir = Path(__file__).parent
-sys.path.insert(0, str(script_dir))
-
-from agent_skill_updater import (  # noqa: E402
-    OPENSPEC_REPO,
-    AgentSkillUpdaterError,
-    AgentSkillSource,
-    fetch_remote_commit_sha,
-    fetch_remote_package_version,
-    git_pull_repo,
-    make_backup_root,
-    refresh_skill_metadata_version,
-    resolve_skill_update,
-    update_skill_from_staged,
-)
-from i18n import get_i18n, t  # noqa: E402
-from skills_registry import save_registry, sync_registry  # noqa: E402
-from stdio_utils import configure_windows_utf8_stdio  # noqa: E402
+if __package__:
+    from .agent_skill_updater import (
+        LOCAL_ONLY_UPDATE_POLICY,
+        AgentSkillUpdateCommittedError,
+        AgentSkillUpdaterError,
+        agent_skill_source_from_registry_entry,
+        fetch_source_remote_version,
+        make_backup_root,
+        probe_git_worktree,
+        refresh_skill_metadata_version,
+        registry_entry_uses_git_worktree,
+        resolve_skill_update,
+        update_git_worktree_skill,
+        update_skill_from_staged,
+        versions_match,
+    )
+    from .i18n import get_i18n, t
+    from .skills_registry import sync_registry, update_registry_entries
+    from .stdio_utils import JsonArgumentParser, configure_windows_utf8_stdio
+else:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from agent_skill_updater import (  # noqa: E402
+        LOCAL_ONLY_UPDATE_POLICY,
+        AgentSkillUpdateCommittedError,
+        AgentSkillUpdaterError,
+        agent_skill_source_from_registry_entry,
+        fetch_source_remote_version,
+        make_backup_root,
+        probe_git_worktree,
+        refresh_skill_metadata_version,
+        registry_entry_uses_git_worktree,
+        resolve_skill_update,
+        update_git_worktree_skill,
+        update_skill_from_staged,
+        versions_match,
+    )
+    from i18n import get_i18n, t  # noqa: E402
+    from skills_registry import sync_registry, update_registry_entries  # noqa: E402
+    from stdio_utils import JsonArgumentParser, configure_windows_utf8_stdio  # noqa: E402
 
 
 configure_windows_utf8_stdio()
 
 
+@dataclass
+class EntryProbe:
+    status: str
+    local_version: str
+    remote_version: Optional[str]
+    error_message: Optional[str] = None
+    git_relation: Optional[str] = None
+    working_tree_dirty: Optional[bool] = None
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Update skills tracked in ~/.agents/skills/.skills-list.json")
+    parser = JsonArgumentParser(
+        description="Update skills tracked in ~/.agents/skills/.skills-list.json",
+        json_error_factory=lambda message: [
+            {
+                "name": "__arguments__",
+                "entry_type": "arguments",
+                "status": "error",
+                "error_message": message,
+                "applied": False,
+                "action": "none",
+            }
+        ],
+    )
     parser.add_argument("--skill", help="Update one skill or skill-pack")
     parser.add_argument("--check-only", action="store_true", help="Do not apply updates")
     parser.add_argument("--json", action="store_true", help="Output JSON")
@@ -55,81 +98,205 @@ def main() -> None:
             if args.skill and name != args.skill:
                 continue
 
-            status, remote_version, error_message = _probe_entry(entry)
+            probe = _probe_entry(entry)
             item = {
                 "name": name,
                 "entry_type": entry.get("entryType"),
-                "status": status,
-                "local_version": entry.get("localVersion", "unknown"),
-                "remote_version": remote_version,
-                "error_message": error_message,
+                "update_mode": entry.get("updateMode"),
+                "status": probe.status,
+                "installed_base_version": entry.get("installedBaseVersion", "unknown"),
+                "local_version": probe.local_version,
+                "remote_version": probe.remote_version,
+                "git_relation": probe.git_relation,
+                "working_tree_dirty": probe.working_tree_dirty,
+                "action": "none",
+                "error_message": probe.error_message,
                 "applied": False,
             }
 
-            entry["remoteVersion"] = remote_version
-            entry["lastStatus"] = status
+            entry["localVersion"] = probe.local_version
+            entry["remoteVersion"] = probe.remote_version
+            entry["lastStatus"] = probe.status
+            if probe.git_relation is not None:
+                entry["gitRelation"] = probe.git_relation
+            if probe.working_tree_dirty is not None:
+                entry["workingTreeDirty"] = probe.working_tree_dirty
 
-            if not args.check_only and entry.get("autoUpdate") is False:
-                item["error_message"] = "Auto-update disabled for this locally customized skill."
-                payload.append(item)
-                continue
-
-            if args.check_only or (status not in {"update_available", "unknown_version"}) or entry["entryType"] == "skill-pack":
-                if not args.check_only and status == "update_available" and entry["entryType"] == "skill-pack":
-                    git_pull_repo(Path(entry["path"]))
-                    item["applied"] = True
-                    updated_names.append(name)
-                payload.append(item)
-                continue
-
-            source = AgentSkillSource(
-                name=entry["name"],
-                local_dir=Path(entry["path"]),
-                source=entry.get("source"),
-                source_type=entry.get("sourceType"),
-                repo_url=entry.get("repoUrl"),
-                subpath=entry.get("subpath"),
-                generator=entry.get("generator"),
-                workflow_id=entry.get("workflowId"),
-                metadata_path=(Path(entry["path"]) / ".openskills.json"),
-            )
-            resolved = resolve_skill_update(source, stage_root / name)
-            if resolved.status == "update_available":
-                if backup_root is None:
-                    backup_root = make_backup_root()
-                try:
-                    update_skill_from_staged(resolved, backup_root)
-                except AgentSkillUpdaterError as exc:
-                    item["status"] = "error"
-                    item["error_message"] = str(exc)
-                    item["backup_root"] = str(backup_root)
+            try:
+                if entry.get("updatePolicy") == LOCAL_ONLY_UPDATE_POLICY:
+                    item["action"] = "skipped_local"
                     payload.append(item)
                     continue
+
+                if args.check_only or probe.status == "error":
+                    payload.append(item)
+                    continue
+
+                if probe.status == "unknown_version":
+                    payload.append(item)
+                    continue
+
+                source = agent_skill_source_from_registry_entry(entry)
+                if registry_entry_uses_git_worktree(entry):
+                    result = update_git_worktree_skill(source)
+                    item["status"] = result.status
+                    item["local_version"] = result.local_version
+                    item["remote_version"] = result.remote_version
+                    item["git_relation"] = result.relation
+                    item["working_tree_dirty"] = result.working_tree_dirty
+                    item["error_message"] = result.error_message
+                    item["applied"] = result.applied
+                    item["action"] = result.action
+                    if result.action in {"metadata_refreshed", "fast_forwarded"}:
+                        item["installed_base_version"] = result.remote_version
+                    if result.applied:
+                        updated_names.append(name)
+                    payload.append(item)
+                    continue
+
+                if (
+                    probe.status == "up_to_date"
+                    and probe.remote_version
+                    and probe.local_version != probe.remote_version
+                    and versions_match(probe.local_version, probe.remote_version)
+                ):
+                    refreshed = refresh_skill_metadata_version(
+                        source,
+                        str(entry["installedBaseVersion"]),
+                        probe.remote_version,
+                    )
+                    item["installed_base_version"] = probe.remote_version
+                    item["local_version"] = probe.remote_version
+                    item["applied"] = refreshed
+                    item["action"] = "metadata_refreshed" if refreshed else "none"
+                    if refreshed:
+                        updated_names.append(name)
+                    payload.append(item)
+                    continue
+
+                if probe.status != "update_available":
+                    payload.append(item)
+                    continue
+
+                resolved = resolve_skill_update(source, stage_root / name)
+                item["installed_base_version"] = resolved.installed_base_version
+                item["local_version"] = resolved.local_version
+                resolved_remote_version = resolved.remote_version or probe.remote_version
+                if resolved.status == "update_available":
+                    if backup_root is None:
+                        backup_root = make_backup_root(Path(registry["skillsRoot"]))
+                    update_skill_from_staged(resolved, backup_root)
+                    item["status"] = "up_to_date"
+                    item["remote_version"] = resolved.remote_version
+                    item["installed_base_version"] = resolved.remote_version
+                    item["local_version"] = resolved.remote_version
+                    item["applied"] = True
+                    item["action"] = "payload_merged"
+                    item["backup_root"] = str(backup_root)
+                    updated_names.append(name)
+                elif resolved.status == "up_to_date" and resolved_remote_version:
+                    refreshed = refresh_skill_metadata_version(
+                        source,
+                        resolved.installed_base_version,
+                        resolved_remote_version,
+                    )
+                    item["status"] = "up_to_date"
+                    item["remote_version"] = resolved_remote_version
+                    item["installed_base_version"] = resolved_remote_version
+                    item["local_version"] = resolved_remote_version
+                    item["applied"] = refreshed
+                    item["action"] = "metadata_refreshed" if refreshed else "none"
+                    if refreshed:
+                        updated_names.append(name)
+                else:
+                    item["status"] = resolved.status
+                    item["error_message"] = resolved.error_message
+            except AgentSkillUpdateCommittedError as exc:
+                item["status"] = "error"
+                item["error_message"] = str(exc)
                 item["applied"] = True
-                item["backup_root"] = str(backup_root)
-                updated_names.append(name)
-            elif status == "unknown_version" and remote_version:
-                refresh_skill_metadata_version(source, remote_version)
-                item["status"] = resolved.status
-                item["remote_version"] = remote_version
-                item["applied"] = True
-            elif status == "update_available" and resolved.status == "up_to_date" and remote_version:
-                refresh_skill_metadata_version(source, remote_version)
-                item["status"] = resolved.status
-                item["remote_version"] = remote_version
-                item["applied"] = True
-            else:
-                item["status"] = resolved.status
-                item["error_message"] = resolved.error_message
+                item["action"] = exc.action
+                if exc.version is not None:
+                    item["installed_base_version"] = exc.version
+                    item["local_version"] = exc.version
+                    item["remote_version"] = exc.version
+                if name not in updated_names:
+                    updated_names.append(name)
+                if backup_root is not None:
+                    item["backup_root"] = str(backup_root)
+            except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+                item["status"] = "error"
+                item["error_message"] = str(exc)
+                item["applied"] = False
+                if backup_root is not None:
+                    try:
+                        removed = _remove_empty_backup_root(backup_root)
+                    except OSError as cleanup_exc:
+                        item["error_message"] = (
+                            f"{exc}. Empty backup-root cleanup failed at "
+                            f"{backup_root}: {cleanup_exc}"
+                        )
+                        item["backup_root"] = str(backup_root)
+                    else:
+                        if removed:
+                            backup_root = None
+                        else:
+                            item["backup_root"] = str(backup_root)
 
             payload.append(item)
 
-    refreshed_registry = sync_registry()
-    save_registry(refreshed_registry)
+    try:
+        refreshed_registry = sync_registry()
+        registry_updates: dict[str, dict[str, object]] = {}
+        for item in payload:
+            refreshed_entry = refreshed_registry["entries"].get(item["name"])
+            if refreshed_entry is None:
+                continue
+            fields: dict[str, object] = {
+                "remoteVersion": item.get("remote_version"),
+                "lastStatus": item["status"],
+                "lastCheckedAt": refreshed_registry["generatedAt"],
+            }
+            if item.get("git_relation") is not None:
+                fields["gitRelation"] = item["git_relation"]
+            if item.get("working_tree_dirty") is not None:
+                fields["workingTreeDirty"] = item["working_tree_dirty"]
+            registry_updates[str(item["name"])] = fields
+        update_registry_entries(
+            registry_updates,
+            Path(refreshed_registry["skillsRoot"]),
+        )
+    except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+        payload.append(
+            {
+                "name": "__registry__",
+                "entry_type": "registry",
+                "status": "error",
+                "error_message": str(exc),
+                "applied": False,
+                "action": "none",
+            }
+        )
 
     if args.json:
+        if not payload:
+            payload.append(
+                {
+                    "name": args.skill or "__selection__",
+                    "entry_type": "selection",
+                    "status": "error",
+                    "error_message": (
+                        f"Skill '{args.skill}' was not found."
+                        if args.skill
+                        else "No installed skills were found."
+                    ),
+                    "applied": False,
+                    "action": "none",
+                }
+            )
         print(json.dumps(payload, indent=2, ensure_ascii=False))
-        raise SystemExit(0)
+        has_errors = any(item["status"] == "error" for item in payload)
+        raise SystemExit(1 if has_errors or not payload else 0)
 
     if not payload:
         if args.skill:
@@ -141,12 +308,19 @@ def main() -> None:
     if args.check_only:
         print("Check completed. Use update_agent_skills.py without --check-only to apply updates.")
     else:
+        local_only_names = [
+            str(item["name"])
+            for item in payload
+            if item.get("action") == "skipped_local"
+        ]
         if updated_names:
             print(f"Updated {len(updated_names)} item(s): {', '.join(updated_names)}")
             if backup_root is not None:
                 print(f"Backup: {backup_root}")
         else:
             print("No skill updates were applied.")
+        if local_only_names:
+            print(f"Skipped local-only item(s): {', '.join(local_only_names)}")
 
     errors = [item for item in payload if item["status"] == "error"]
     if errors:
@@ -156,28 +330,80 @@ def main() -> None:
     raise SystemExit(0)
 
 
-def _probe_entry(entry: dict) -> tuple[str, Optional[str], Optional[str]]:
+def _remove_empty_backup_root(backup_root: Path) -> bool:
+    if any(backup_root.iterdir()):
+        return False
+    backup_root.rmdir()
+    return True
+
+
+def _probe_entry(entry: dict) -> EntryProbe:
     repo_url = entry.get("repoUrl")
     local_version = entry.get("localVersion") or "unknown"
+    metadata_error = entry.get("metadataError")
+    if metadata_error:
+        return EntryProbe("error", local_version, None, str(metadata_error))
+    if entry.get("updatePolicy") == LOCAL_ONLY_UPDATE_POLICY:
+        return EntryProbe("local_only", local_version, None)
     if not repo_url or not entry.get("managed"):
-        return "unknown_version", None, None
+        return EntryProbe("unknown_version", local_version, None)
+    try:
+        git_worktree_mode = registry_entry_uses_git_worktree(entry)
+        source = agent_skill_source_from_registry_entry(entry)
+    except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+        return EntryProbe("error", local_version, None, str(exc))
+
+    if git_worktree_mode:
+        try:
+            result = probe_git_worktree(source)
+        except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+            return EntryProbe("error", local_version, None, str(exc))
+        return EntryProbe(
+            status=result.status,
+            local_version=result.local_version,
+            remote_version=result.remote_version,
+            error_message=result.error_message,
+            git_relation=result.relation,
+            working_tree_dirty=result.working_tree_dirty,
+        )
 
     try:
-        if entry.get("entryType") == "skill-pack":
-            remote_version = fetch_remote_commit_sha(repo_url)
-        elif entry.get("sourceType") == "git-generated" and repo_url == OPENSPEC_REPO:
-            remote_version = fetch_remote_package_version(repo_url)
-        else:
-            remote_version = fetch_remote_commit_sha(repo_url)
-    except Exception as exc:  # noqa: BLE001
-        return "error", None, str(exc)
+        remote_version = fetch_source_remote_version(source)
+    except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+        return EntryProbe("error", local_version, None, str(exc))
 
     if not remote_version or local_version == "unknown":
-        return "unknown_version", remote_version, None
-    if remote_version == local_version:
-        return "up_to_date", remote_version, None
-    return "update_available", remote_version, None
+        return EntryProbe("unknown_version", local_version, remote_version)
+    if versions_match(remote_version, local_version):
+        return EntryProbe("up_to_date", local_version, remote_version)
+    return EntryProbe("update_available", local_version, remote_version)
+
+
+def _run_cli() -> None:
+    try:
+        main()
+    except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+        if "--json" in sys.argv[1:]:
+            print(
+                json.dumps(
+                    [
+                        {
+                            "name": "__runtime__",
+                            "entry_type": "runtime",
+                            "status": "error",
+                            "error_message": str(exc),
+                            "applied": False,
+                            "action": "none",
+                        }
+                    ],
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
-    main()
+    _run_cli()

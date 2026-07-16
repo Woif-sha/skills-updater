@@ -1,39 +1,20 @@
 # Install A Skill
 
-Use this workflow when the user wants to add a new skill or skill-pack into `~/.agents/skills`.
+Use this route for an explicit GitHub installation request.
 
-## Commands
+## Run
 
-Typical commands:
-
-```bash
-python scripts/install_agent_skill.py --repo anthropics/skills --path skills/docx --name docx
-python scripts/install_agent_skill.py --repo https://github.com/obra/superpowers --type skill-pack --name superpowers
-python scripts/install_agent_skill.py --repo https://github.com/Fission-AI/OpenSpec --type single-skill --source-type git-generated --name openspec-explore --workflow-id explore
+```powershell
+python scripts/install_agent_skill.py --repo <owner/repo-or-url> --path <repo/subpath> --name <name>
+python scripts/install_agent_skill.py --repo <owner/repo-or-url> --type skill-pack --name <name>
 ```
 
-## Steps
+For a generated Skill, require `--repo Fission-AI/OpenSpec --path . --source-type git-generated --workflow-id <id>`; the workflow id selects the generated template and defaults the installed name to `openspec-<id>`.
 
-1. Normalize the repo argument to a GitHub URL or `owner/repo` form.
-2. Decide the install name:
-   - explicit `--name` wins
-   - otherwise derive from the repo subpath or repo name
-3. Choose the correct install type:
-   - `single-skill` for a specific skill path
-   - `skill-pack` for a whole bundled repository
-   - `git-generated` only for generated OpenSpec installs
-4. Run the installer.
-5. Confirm the destination path and refreshed registry path in the result.
+1. Require an explicit GitHub repository; never infer one from the Skill name.
+2. Select `single-skill` for one payload path or `skill-pack` for a repository root containing `skills/`.
+3. Validate the destination name and require the destination to be absent.
+4. Stage and validate the exact remote payload before publishing it.
+5. Report the installed path, resolved full commit, entry type, and refreshed registry path.
 
-## Important Behaviors
-
-- The destination directory must not already exist.
-- Single-skill installs stage remote content and then write `.openskills.json`.
-- Skill-pack installs clone the whole repo directly.
-- The installer refreshes `.skills-list.json` at the end.
-
-## Completion Checklist
-
-- The installed path is reported.
-- The registry refresh is confirmed.
-- The chosen install type matches the requested source.
+The installer publishes atomically on the destination volume. An install error must leave no partial destination.

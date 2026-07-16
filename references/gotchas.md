@@ -1,38 +1,34 @@
 # Known Gotchas
 
-These are the failure modes most likely to cause wrong behavior.
+Read this for default, mutation, or updater repair/review routes.
 
-## Exit Codes
+## Status And Output
 
-- `check_updates.py` exits with `1` when updates are available.
-- `check_updates.py` also exits with `1` when the requested skill is missing.
-- Treat the output and scope together before deciding whether the script actually failed.
+- `check_updates.py` exits `1` for `update_available`, `error`, or an empty selection. Inspect JSON status instead of treating every `1` as the same failure.
+- `local_only` is distinct from `unknown_version`: the former is an explicit no-network policy; the latter means provenance is insufficient.
+- `unknown_version` applies to unmanaged non-Git folders. A remotely managed root Git worktree with missing provenance is an error, not an unmanaged fallback.
+- Operational failures must stay structured in JSON mode. A traceback indicates a bug, not an acceptable error response.
 
-## Self-Update Guard
+## Control Data
 
-- `skills-updater` is intentionally detected as a managed source but forced to `autoUpdate: false`.
-- Batch update runs must report the self-update guard instead of overwriting the local customized copy.
+- Never recurse into `.git`; Git objects, refs, locks, and index files are not payload.
+- `.openskills.json` is mutable control metadata even when Git ignores it. It never participates in payload dirty checks or merges.
+- A root `.git` directory or gitfile selects Git worktree mode. Do not route that Skill through snapshot replacement.
 
-## Skill-Pack Detection
+## Version Semantics
 
-- `superpowers` must remain a single `skill-pack` registry entry.
-- Do not register each child skill inside that repo as its own top-level managed entry.
-- Skill-pack updates are git pulls, not staged folder replacements.
+- `installedBaseVersion` is the incorporated upstream base; Git HEAD is the current local commit. They may differ.
+- `sourceCommitSha` is invalid for remote management, not a compatibility alias. It may remain inert under `local-only` because provenance is not interpreted there.
+- An ahead worktree is not an update target. A diverged or dirty-behind worktree must remain unchanged.
 
-## Local Skill Edits During Updates
+## Transactions
 
-- Do not treat the backup as permission to overwrite local customizations. Backups are recovery material; the normal update path must preserve non-conflicting local edits.
-- Git-backed `single-skill` updates depend on `sourceCommitSha` in `.openskills.json` to reconstruct the installed base. If that base cannot be fetched, the safe behavior is to block the update rather than discard possible local edits.
-- If a user has added local instructions to a skill file, such as extra formatting rules in `SKILL.md`, and the remote skill also updates that file, the desired result is a merged file containing both non-conflicting changes.
-- When the same lines are changed locally and remotely, report the merge conflict and point to `<backup-root>/<skill>.merge-conflicts/`; do not silently choose either side.
+- Backups exclude control data and are recovery evidence, not permission to overwrite local edits.
+- Snapshot conflicts leave the installed payload unchanged and keep `.base`, `.local`, and `.remote` artifacts.
+- Metadata publication requires same-volume hard-link support. If unavailable, fail explicitly; do not switch to a weaker copy/replace path.
+- A retained `.skill-update-*`, `.git-update-*`, or `.metadata-update-*` journal means recovery was not proven safe. Preserve it and report the error.
 
-## OpenSpec
+## Generated And Packed Skills
 
-- OpenSpec skills use generated content and compare upstream package versions, not repo commit SHAs.
-- Treat them as `sourceType: "git-generated"` with `workflowId` and generator metadata.
-
-## Registry Assumptions
-
-- `check_updates.py`, `update_agent_skills.py`, and `install_agent_skill.py` already refresh registry state as part of their flow.
-- Running `sync_skills_registry.py` before every command is redundant and can hide the real task boundary.
-- Unmanaged or local-only skills can legitimately stay at `unknown_version`.
+- A Git repository with a root `skills/` payload is one `skill-pack`; do not register each child as an independent top-level install.
+- OpenSpec entries are `git-generated` and compare the package version at the exact resolved revision.

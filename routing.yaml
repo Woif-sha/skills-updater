@@ -1,0 +1,82 @@
+{
+  "always_read": [
+    "rules/scope-and-registry.md"
+  ],
+  "routing_rules": [
+    "repair-updater takes precedence when the request changes or reviews this repository's implementation",
+    "An explicit operation route takes precedence over default-invocation",
+    "default-invocation matches only a bare invocation with no requested operation",
+    "Multiple independent explicit operations are processed in the user's stated order",
+    "mark-local-only already includes its same-target sync and check; do not select duplicate sync-registry or check-updates routes unless repetition is explicit"
+  ],
+  "tasks": [
+    {
+      "id": "default-invocation",
+      "labels": {"en": "Bare skills-updater invocation", "zh": "无具体操作的 skills-updater 裸调用"},
+      "route": "Follow workflows/default-invocation.md",
+      "required_reads": ["rules/update-policies.md", "references/gotchas.md"],
+      "workflow": "workflows/default-invocation.md",
+      "trigger_examples": ["skills-updater"],
+      "positive_signals": ["The request contains no check, update, install, sync, policy, or repair operation"],
+      "negative_signals": ["检查", "更新", "安装", "同步", "local-only", "修复"]
+    },
+    {
+      "id": "check-updates",
+      "labels": {"en": "Check installed Skill updates", "zh": "检查已安装 Skill 更新"},
+      "route": "Follow workflows/check-updates.md",
+      "required_reads": ["rules/update-policies.md"],
+      "workflow": "workflows/check-updates.md",
+      "trigger_examples": ["检查 skill 更新", "哪些 skill 过期了", "check skill updates"]
+    },
+    {
+      "id": "update-skills",
+      "labels": {"en": "Update installed Skills", "zh": "更新已安装的 Skill"},
+      "route": "Follow workflows/update-skills.md",
+      "required_reads": ["rules/update-policies.md", "references/gotchas.md"],
+      "workflow": "workflows/update-skills.md",
+      "trigger_examples": ["更新所有 skill", "更新这个 skill", "update installed skills"]
+    },
+    {
+      "id": "install-skill",
+      "labels": {"en": "Install from GitHub", "zh": "从 GitHub 安装 Skill"},
+      "route": "Follow workflows/install-skill.md",
+      "required_reads": ["rules/update-policies.md"],
+      "workflow": "workflows/install-skill.md",
+      "trigger_examples": ["从 GitHub 安装 skill", "安装这个 skill 仓库", "install a skill from GitHub"]
+    },
+    {
+      "id": "sync-registry",
+      "labels": {"en": "Reconcile the registry", "zh": "同步 Skill 注册表"},
+      "route": "Follow workflows/sync-registry.md",
+      "required_reads": [],
+      "workflow": "workflows/sync-registry.md",
+      "trigger_examples": ["同步 .skills-list.json", "我手动增删了 skill", "sync the skills registry"]
+    },
+    {
+      "id": "mark-local-only",
+      "labels": {"en": "Mark a Skill local-only", "zh": "标记自编 Skill 为仅本地"},
+      "route": "Follow workflows/mark-local-only.md",
+      "required_reads": ["rules/update-policies.md"],
+      "workflow": "workflows/mark-local-only.md",
+      "trigger_examples": ["这个 skill 是我自己写的", "永远不要搜索这个 skill 的远端分支", "以后不要尝试更新这个 skill", "mark this skill local-only"],
+      "positive_signals": ["self-authored", "永久禁用远端更新", "updatePolicy local-only"],
+      "negative_signals": ["这次只检查", "暂时不要更新", "只执行 check-only"]
+    },
+    {
+      "id": "repair-updater",
+      "labels": {"en": "Repair or review the updater", "zh": "修复或审查更新器"},
+      "route": "Follow workflows/repair-updater.md",
+      "required_reads": ["rules/update-policies.md", "references/gotchas.md", "references/script-map.md", "workflows/task-closure.md", "workflows/update-rules.md"],
+      "workflow": "workflows/repair-updater.md",
+      "trigger_examples": ["修复 skills-updater 的 bug", "审查更新器数据完整性", "修改 updater 脚本", "repair the updater"]
+    },
+    {
+      "id": "unsupported",
+      "labels": {"en": "Outside this Skill", "zh": "超出本 Skill 范围"},
+      "route": "Stop and state the supported scope",
+      "required_reads": [],
+      "workflow": null,
+      "trigger_examples": ["推荐一些 skill", "更新 Claude marketplace", "管理 .codex/skills"]
+    }
+  ]
+}

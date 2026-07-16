@@ -1,161 +1,232 @@
 # Skills Updater
 
-统一管理 `~/.agents/skills` 下的 skill 安装、更新、注册表同步与附属推荐工具。
+为 `~/.agents/skills` 提供 Skill 安装、更新检查、事务化更新和注册表同步。
 
 [English](README.en.md)
 
-## 当前结构
+## 功能
 
-这个仓库现在按 skill-based-architecture 组织：
+- 从 GitHub 安装单个 Skill、Skill Pack 或 OpenSpec 生成型 Skill。
+- 检查全部或指定 Skill 的远端版本。
+- 区分普通目录和根目录本身就是 Git 工作树的 Skill。
+- 在保留本地修改的前提下执行三方合并或 Git fast-forward。
+- 用 `updatePolicy: "local-only"` 永久禁止自编 Skill 的远端探测和更新。
+- 始终以结构化 JSON 报告自动化调用结果。
+
+## 环境要求
+
+- Python 3.10 或更高版本。
+- Git。
+- 能访问待安装或更新的 GitHub 仓库。
+- 只有安装或更新 OpenSpec 生成型 Skill 时才需要 Node.js 和 npm。
+
+运行时代码只使用 Python 标准库，不需要执行 `pip install`。
+
+## 安装 Skills Updater
+
+推荐把仓库直接克隆到统一 Skill 目录，并为这个根 Git 工作树写入完整来源元数据。以下 PowerShell 命令适用于全新安装：
+
+```powershell
+$skillDir = Join-Path $HOME ".agents\skills\skills-updater"
+New-Item -ItemType Directory -Force (Split-Path $skillDir) | Out-Null
+git clone https://github.com/Woif-sha/skills-updater.git $skillDir
+Set-Location $skillDir
+
+$sha = git rev-parse HEAD
+@'
+import json
+import sys
+from pathlib import Path
+
+metadata = {
+    "source": "Woif-sha/skills-updater",
+    "sourceType": "git",
+    "repoUrl": "https://github.com/Woif-sha/skills-updater",
+    "subpath": ".",
+    "installedBaseVersion": sys.argv[1],
+}
+Path(".openskills.json").write_text(
+    json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+'@ | python - $sha
+
+python scripts/sync_skills_registry.py --json
+```
+
+`.openskills.json` 是本地控制数据，已被 Git 忽略，不会提交到仓库。已有安装不要再次执行 `git clone`；进入原目录，确认元数据和 Git upstream 正确后运行注册表同步即可。
+
+## 快速使用
+
+可以从任意目录调用脚本：
+
+```powershell
+$updater = Join-Path $HOME ".agents\skills\skills-updater\scripts"
+
+# 同步本地注册表
+python "$updater\sync_skills_registry.py" --json
+
+# 检查全部或单个 Skill
+python "$updater\check_updates.py" --json
+python "$updater\check_updates.py" --skill zotero-paper-updater --json
+
+# 只检查更新流程，不应用更改
+python "$updater\update_agent_skills.py" --check-only --json
+
+# 更新全部或单个 Skill
+python "$updater\update_agent_skills.py" --json
+python "$updater\update_agent_skills.py" --skill zotero-paper-updater --json
+```
+
+检查和更新命令可使用 `--lang zh` 或 `--lang en` 强制指定人类可读输出语言；JSON 字段名保持稳定。
+
+所有运行入口都以 `~/.agents/skills` 为唯一安装源，并维护 `~/.agents/skills/.skills-list.json`。不要手工编辑注册表；修改 Skill 目录或 `.openskills.json` 后重新运行同步命令。
+
+### 从 GitHub 安装
+
+```powershell
+# 仓库根目录就是一个 Skill
+python "$updater\install_agent_skill.py" `
+  --repo owner/repo --path . --name my-skill --json
+
+# Skill 位于仓库子目录
+python "$updater\install_agent_skill.py" `
+  --repo owner/repo --path skills/my-skill --name my-skill --json
+
+# 根仓库是包含 skills/ 的 Skill Pack
+python "$updater\install_agent_skill.py" `
+  --repo owner/repo --type skill-pack --path . --json
+
+# 从 OpenSpec 生成指定 workflow Skill
+python "$updater\install_agent_skill.py" `
+  --repo Fission-AI/OpenSpec --source-type git-generated `
+  --workflow-id explore --json
+```
+
+安装目标已存在、来源不是 GitHub、路径越界或来源契约不完整时，安装会明确失败，不会覆盖已有目录或猜测替代来源。
+
+## 自编 Skill：永久禁止远端更新
+
+在该 Skill 根目录的 `.openskills.json` 中显式写入：
+
+```json
+{
+  "source": "my-skill",
+  "sourceType": "local",
+  "updatePolicy": "local-only"
+}
+```
+
+已有 Git provenance 可以保留，只需增加：
+
+```json
+{
+  "updatePolicy": "local-only"
+}
+```
+
+实际文件应保留原有字段，而不是用上面的单字段示例覆盖整个文件。该策略会在锁内以及网络、备份和变更边界前重新读取：
+
+- 检查结果为 `status: "local_only"`；
+- 更新结果为 `action: "skipped_local"`、`applied: false`；
+- `remote_version` 始终为 `null`；
+- 不解析远端分支，不 fetch，不暂存，不备份，也不尝试更新。
+
+## 远端管理元数据
+
+远端管理项必须使用明确且相互一致的来源契约。普通 Git single-skill 的 `subpath` 应填写它在仓库内的实际相对路径：
+
+```json
+{
+  "source": "owner/repo",
+  "sourceType": "git",
+  "repoUrl": "https://github.com/owner/repo",
+  "subpath": "skills/my-skill",
+  "installedBaseVersion": "完整的 40 位 Git commit SHA"
+}
+```
+
+根仓库是 Skill Pack 时，`sourceType` 必须为 `git-pack`：
+
+```json
+{
+  "source": "owner/repo",
+  "sourceType": "git-pack",
+  "repoUrl": "https://github.com/owner/repo",
+  "subpath": ".",
+  "installedBaseVersion": "完整的 40 位 Git commit SHA"
+}
+```
+
+OpenSpec 生成型 Skill 使用生成器和 workflow 标识，版本来自生成后的 `SKILL.md`：
+
+```json
+{
+  "source": "Fission-AI/OpenSpec",
+  "sourceType": "git-generated",
+  "repoUrl": "https://github.com/Fission-AI/OpenSpec",
+  "subpath": ".",
+  "generator": "dist/core/shared/skill-generation.js",
+  "workflowId": "explore"
+}
+```
+
+- `installedBaseVersion` 是上次纳入本地内容的上游基线。
+- 仓库根目录就是 single-skill 时，`subpath` 使用 `.`；根 Git 工作树必须使用 `.`。
+- 根 Git 工作树的当前版本来自本地 `HEAD`，并要求当前分支有显式 `origin` upstream。
+- `sourceCommitSha` 已停止支持；不会把它当作兼容字段兜底。
+- 不含 `.git` 且缺少来源信息的目录保持 `unmanaged / unknown_version`，不会被猜测成远端 Skill。
+
+## 更新模式
+
+| 本地形态 | 更新方式 | 安全约束 |
+| --- | --- | --- |
+| 根目录含 `.git` | Git 工作树事务 | 只允许显式 upstream；干净且 behind 时 fast-forward；dirty、detached 或 diverged 时停止 |
+| 普通 Skill 目录 | Snapshot 三方合并 | 使用精确安装基线合并 `base + local + remote`；冲突不覆盖本地内容 |
+| 根目录含 `skills/` 的仓库 | Skill Pack Git 事务 | 整个仓库作为一个注册项，不拆分子 Skill |
+| OpenSpec 生成型 Skill | 精确 revision 重新生成 | 只接受规定的仓库、generator 和 `workflowId` |
+
+`.git` 和 `.openskills.json` 始终是控制数据，不参与签名、合并、备份、复制或删除。载荷、Git 和元数据变更都有持久化 journal；失败时回滚，无法证明安全时保留恢复数据并返回 `error`。
+
+## JSON 状态和退出码
+
+常见 `status`：
+
+- `up_to_date`：本地已包含远端版本。
+- `update_available`：存在可应用更新。
+- `local_only`：明确禁止远端访问。
+- `unknown_version`：本地目录没有足够 provenance。
+- `error`：状态不安全、来源矛盾或操作失败。
+
+常见 `action`：`none`、`payload_merged`、`fast_forwarded`、`metadata_refreshed`、`skipped_local`。
+
+- `check_updates.py`：无更新且无错误时退出 `0`；存在更新、错误或空选择时退出 `1`。
+- 更新、安装和同步脚本：成功退出 `0`，操作错误退出 `1`。
+- 所有脚本的参数解析错误退出 `2`；使用 `--json` 时 stdout 仍是合法 JSON，不输出 argparse usage 或 traceback。
+
+## 项目结构
 
 ```text
-skills-updater/
-|-- SKILL.md
-|-- README.md
-|-- README.en.md
-|-- rules/
-|   |-- scope-and-registry.md
-|   `-- update-policies.md
-|-- workflows/
-|   |-- default-invocation.md
-|   |-- check-updates.md
-|   |-- update-skills.md
-|   |-- install-skill.md
-|   |-- sync-registry.md
-|   |-- recommend-skills.md
-|   `-- update-marketplace.md
-|-- references/
-|   |-- gotchas.md
-|   |-- script-map.md
-|   `-- marketplaces.md
-`-- scripts/
+SKILL.md          # 轻量入口
+routing.yaml      # 唯一任务路由表
+rules/            # 稳定不变量
+workflows/        # 按用户意图拆分的步骤
+references/       # gotchas 与代码索引
+scripts/          # 运行时代码
+tests/            # 回归规范，不参与 Skill 运行时加载
 ```
 
-## 各部分职责
+详细执行约束由 [SKILL.md](SKILL.md) 路由到 `rules/`、`workflows/` 和 `references/`。README 负责面向使用者的完整说明，不属于常驻路由。
 
-### `SKILL.md`
+## 开发验证
 
-入口文件。
-
-- 定义触发条件，确保 agent 在 `"skills-updater"`、`"check skill updates"`、`"install a skill from GitHub"` 这类请求下正确启用
-- 规定常读文件
-- 提供常见任务路由表
-- 提醒几个最关键的 gotchas
-
-它应该保持短小，只负责导航，不承载完整规则手册。
-
-### `rules/`
-
-长期稳定约束。
-
-- [rules/scope-and-registry.md](rules/scope-and-registry.md)
-  说明 source of truth 是 `~/.agents/skills`，以及 `.skills-list.json`、`.openskills.json`、`single-skill`、`skill-pack` 的边界和识别规则。
-- [rules/update-policies.md](rules/update-policies.md)
-  说明版本优先、按类型更新、本地修改三方合并、备份策略、OpenSpec 生成逻辑、`superpowers` 特判，以及 `skills-updater` 自更新保护。
-
-如果某条规则是“总是成立”的，就应该放在这里，而不是写进 workflow。
-
-### `workflows/`
-
-按任务拆分的执行流程。
-
-- [workflows/default-invocation.md](workflows/default-invocation.md)
-  用户只说 `skills-updater` 时的默认执行语义。
-- [workflows/check-updates.md](workflows/check-updates.md)
-  检查全部或指定 skill 的更新状态。
-- [workflows/update-skills.md](workflows/update-skills.md)
-  执行全量或单项更新，并说明本地修改合并、备份、冲突与跳过逻辑。
-- [workflows/install-skill.md](workflows/install-skill.md)
-  从 GitHub 安装普通 skill、`skill-pack` 或 OpenSpec 生成型 skill。
-- [workflows/sync-registry.md](workflows/sync-registry.md)
-  手动增删目录后重建 `.skills-list.json`。
-- [workflows/recommend-skills.md](workflows/recommend-skills.md)
-  推荐与发现 skill，不混同于安装和更新。
-- [workflows/update-marketplace.md](workflows/update-marketplace.md)
-  显式处理 `~/.claude/plugins/marketplaces` 下的 marketplace 更新。
-
-如果某条内容描述的是“遇到某类请求时怎么做”，就放在这里。
-
-### `references/`
-
-补充性资料，不直接定义行为。
-
-- [references/gotchas.md](references/gotchas.md)
-  记录最容易误判的坑，例如 `check_updates.py` 用退出码 `1` 表示“有更新可用”。
-- [references/script-map.md](references/script-map.md)
-  对应仓库脚本和职责的索引，方便从用户请求映射到脚本。
-- [references/marketplaces.md](references/marketplaces.md)
-  marketplace 兼容信息和来源说明。
-
-这些文件用来补上下文，不应替代 `rules/` 或 `workflows/`。
-
-### `scripts/`
-
-实际执行逻辑。
-
-- `check_updates.py`: 读取注册表并探测远端版本
-- `update_agent_skills.py`: 应用更新，遇到本地/远端冲突时报告错误而不覆盖本地 skill
-- `install_agent_skill.py`: 安装新 skill
-- `sync_skills_registry.py`: 重建注册表
-- `skills_registry.py`: 识别本地目录并维护 `.skills-list.json`
-- `agent_skill_updater.py`: 远端拉取、暂存、目录签名、备份、三方合并与元数据刷新
-- `recommend_skills.py`: 推荐技能
-- `update_marketplace.py`: marketplace 兼容脚本
-
-README 只说明这些脚本分别做什么；具体执行规则以 `rules/` 和 `workflows/` 为准。
-
-## 核心行为
-
-- 只把 `~/.agents/skills` 当成 source of truth
-- 通过 `.skills-list.json` 维护统一注册表
-- 先比较版本，再决定是否更新
-- git-backed `single-skill` 更新时保留本地修改：用 `sourceCommitSha` 还原安装基准，三方合并本地与远端变更；冲突时阻止覆盖并输出冲突文件
-- `superpowers` 视为一个整体 `skill-pack`
-- OpenSpec skill 视为 `git-generated`
-- 本地定制版 `skills-updater` 保持 `autoUpdate: false`
-
-## 常见命令
-
-检查更新：
-
-```bash
-python scripts/check_updates.py
-python scripts/check_updates.py --skill <name>
+```powershell
+python -m unittest discover -s tests
+python -m compileall -q scripts tests
+git diff --check
 ```
 
-应用更新：
-
-```bash
-python scripts/update_agent_skills.py
-python scripts/update_agent_skills.py --skill <name>
-```
-
-安装新 skill：
-
-```bash
-python scripts/install_agent_skill.py --repo anthropics/skills --path skills/docx --name docx
-python scripts/install_agent_skill.py --repo https://github.com/obra/superpowers --type skill-pack --name superpowers
-python scripts/install_agent_skill.py --repo https://github.com/Fission-AI/OpenSpec --type single-skill --source-type git-generated --name openspec-explore --workflow-id explore
-```
-
-同步注册表：
-
-```bash
-python scripts/sync_skills_registry.py
-```
-
-## 维护约定
-
-- 想加稳定规则，改 `rules/`
-- 想加某类请求的处理流程，改 `workflows/`
-- 想补充脚本说明、兼容信息或坑点，改 `references/`
-- 想改 skill 触发和任务路由，改 `SKILL.md`
-
-不要把新的长篇说明再塞回 `SKILL.md`。
-
-## 来源
-
-本仓库基于 `https://github.com/yizhiyanhua-ai/skills-updater` 二次改造，当前实现更偏向本地统一 skill 目录 `~/.agents/skills` 的维护，而不是多套目录并行管理。
+`tests/` 必须纳入版本控制，用来防止 `.git` 误删、部分更新、并发元数据覆盖、ZIP 路径逃逸和 local-only 联网等缺陷再次出现。只有缓存、覆盖率和临时产物会被忽略。
 
 ## License
 

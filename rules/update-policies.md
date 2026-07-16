@@ -1,41 +1,41 @@
 # Update Policies
 
-These rules govern how version checks and updates must behave.
+Read this file for check, update, install, local-only, or updater repair/review routes.
 
-## Version-First Policy
+## No Fallback
 
-- Probe upstream version information first.
-- Do not download and diff every skill just to decide whether an update exists.
-- Status values are `up_to_date`, `update_available`, `unknown_version`, or `error`.
-- `unknown_version` means the entry lacks enough comparable metadata, not that an update definitely exists.
+- Snapshot updates resolve the exact configured GitHub repository HEAD; Git worktrees fetch only their explicit upstream branch from the exact metadata repo URL.
+- Do not guess `main`, `master`, another source, an older metadata field, or a cached value when required data is missing.
+- Remotely managed entries reject `sourceCommitSha`; `installedBaseVersion` is their only installed-base field. Local-only provenance is inert and is not migrated or interpreted.
+- Store full 40-character Git SHAs. A validated 12–39 character SHA may only be compared as a prefix of the same commit.
+- Any missing, invalid, or contradictory state required for a remote operation returns `error` without mutation.
 
-## Update Strategy By Entry Type
+## Local-Only
 
-- `single-skill`: stage the remote skill, compare content, then apply the update only when the staged copy is different.
-- Git-backed `single-skill` updates must preserve local edits. Reconstruct the installed base from `.openskills.json` / `sourceCommitSha`, then three-way merge `base + current local + staged remote`.
-- If the local skill contains custom additions such as user-specific `SKILL.md` rules and the remote also changed the same file in a non-conflicting area, keep both changes in the final skill.
-- If local and remote changed the same lines or a safe base cannot be reconstructed, do not overwrite the local skill. Leave the current local folder unchanged, keep a backup, write conflict artifacts, and report an `error` status for that entry.
-- `skill-pack`: compare remote commit first, then `git pull --ff-only` the whole repo if it is behind.
-- `git-generated` OpenSpec skill: compare upstream package version first, then regenerate the skill from upstream when the version changes.
+- `updatePolicy: "local-only"` is checked from disk inside the Skill lock and again immediately before network or mutation boundaries.
+- Local-only entries never resolve a remote branch, fetch, stage, back up, merge, refresh upstream metadata, or update.
+- Check returns `status: "local_only"`; update returns `action: "skipped_local"`, `applied: false`, and `remote_version: null`.
 
-## Backup And Metadata Rules
+## Root Git Worktrees
 
-- Backups are created only when a staged single-skill replacement is actually applied.
-- Backup roots live under `~/.agents/skills/.backup-YYYYMMDD-HHMMSS`.
-- Merge conflict artifacts live beside the backup as `~/.agents/skills/.backup-YYYYMMDD-HHMMSS/<skill>.merge-conflicts/` and contain `.base`, `.local`, and `.remote` versions of conflicted files when available.
-- Refresh `.openskills.json` metadata after installs or applied updates when the script does so.
-- For OpenSpec entries, track `generatedByVersion`; for git-backed single skills, track `sourceCommitSha`.
+- Root `.git` selects the dedicated Git transaction path; file-level replacement is forbidden.
+- Require `branch.<name>.remote=origin` and an explicit `branch.<name>.merge`; do not infer the remote default branch.
+- Clean `equal`: refresh only stale installed-base metadata.
+- Clean `behind`: fetch the configured branch and fast-forward transactionally.
+- `ahead`: keep local HEAD and refresh metadata only when the remote commit is already incorporated.
+- Dirty, detached, mismatched-origin, invalid, or diverged state returns a structured error without changing the worktree.
+- `skill-pack` uses this same Git state machine; no raw `git pull` path exists.
 
-## Special Cases
+## Snapshot Skills
 
-- `skills-updater` is a locally customized copy and must remain registered with `autoUpdate: false`.
-- When `update_agent_skills.py` reaches an entry with `autoUpdate: false`, report that self-update is disabled instead of overwriting it.
-- `superpowers` remains one `skill-pack` even when it contains many child skills.
-- OpenSpec entries come from `https://github.com/Fission-AI/OpenSpec` with `sourceType: "git-generated"`.
+- Stage the exact remote revision before comparing payload signatures.
+- Reconstruct the exact `installedBaseVersion`, then merge `base + local + remote`.
+- Conflicts leave the installed payload unchanged and write explicit conflict artifacts beside the backup.
+- Build and validate the complete result before touching the installed payload.
+- Application and metadata publication are journaled transactions. Any apply failure restores the exact original payload; ambiguous metadata recovery retains the journal and fails visibly.
 
-## Reporting Rules
+## Generated Skills And Output
 
-- Distinguish "updates available" from "command failed".
-- Report the backup path when an update created one.
-- When the user targets a single skill, scope both the command and the report to that entry.
-- If a command uses JSON mode, preserve the machine-readable payload instead of paraphrasing it away.
+- OpenSpec `git-generated` entries require the exact OpenSpec repository, subpath `.`, generator, and `workflowId`; they read `package.json` at the exact resolved revision and regenerate that workflow only.
+- JSON mode emits a structured result for argument and operational errors; it must not leak argparse usage or a traceback into stdout.
+- A committed update whose cleanup fails reports `applied: true` with its committed action and version.

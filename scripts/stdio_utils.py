@@ -3,8 +3,36 @@
 
 from __future__ import annotations
 
+import argparse
 import io
+import json
 import sys
+from collections.abc import Callable
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    """Emit the CLI's declared JSON error shape when --json parsing fails."""
+
+    def __init__(
+        self,
+        *args,
+        json_error_factory: Callable[[str], object],
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._json_error_factory = json_error_factory
+
+    def error(self, message: str) -> None:
+        if "--json" not in sys.argv[1:]:
+            super().error(message)
+        print(
+            json.dumps(
+                self._json_error_factory(message),
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        self.exit(2)
 
 
 def configure_windows_utf8_stdio() -> None:

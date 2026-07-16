@@ -1,35 +1,19 @@
 # Check Updates
 
-Use this workflow for "check updates", "what is outdated?", or "is skill X current?" requests.
+Use this route for read-only update status.
 
-## Command
+## Run
 
-Run one of:
-
-```bash
-python scripts/check_updates.py
-python scripts/check_updates.py --skill <name>
+```powershell
 python scripts/check_updates.py --json
+python scripts/check_updates.py --skill <name> --json
 ```
 
-## Steps
+1. Match the user's scope exactly.
+2. Run the JSON command once; it already refreshes the registry.
+3. Report `up_to_date`, `update_available`, `local_only`, `unknown_version`, and `error` separately.
+4. Stop after reporting. A check request does not authorize an update.
 
-1. Run the command that matches the user's scope.
-2. Read the registry-backed status for each returned entry.
-3. Classify each entry as `up_to_date`, `update_available`, `unknown_version`, or `error`.
-4. Explain ambiguous cases:
-   - `unknown_version` means comparison metadata is missing or incomplete
-   - `error` means the remote probe failed
-5. If the user asked only to check, stop here. Do not auto-update unless they invoked bare `skills-updater`.
+Exit code `1` means at least one update or error exists, or the selection was empty. Classify it from the JSON payload, never from the exit code alone.
 
-## Important Behaviors
-
-- The script syncs `.skills-list.json` before probing and writes `remoteVersion`, `lastStatus`, and `lastCheckedAt` back into the registry.
-- The script exits `1` when updates are available, and also exits `1` when no matching entry was found.
-- JSON mode is preferable when another tool or script will consume the result.
-
-## Completion Checklist
-
-- The report matches the requested scope.
-- Exit code handling did not misclassify "updates available" as a broken script.
-- Follow-up action is suggested only if the user asked for it.
+For `local_only`, verify `remote_version` is `null`; no remote probe is permitted.

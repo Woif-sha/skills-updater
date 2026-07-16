@@ -1,37 +1,31 @@
 # Scope And Registry Rules
 
-These rules apply to every `skills-updater` task.
+These constraints apply to every route.
 
-## Source Of Truth
+## Ownership
 
-- Installed skills live under `~/.agents/skills/`.
-- The registry file is `~/.agents/skills/.skills-list.json`.
-- Managed single-skill installs keep upstream metadata in `.openskills.json`.
-- The updater treats `~/.agents/skills` as canonical even if other tool-specific directories are symlinked elsewhere.
+- `~/.agents/skills` is the only installed-Skill source of truth.
+- `.skills-list.json` is generated state. Change Skill folders or `.openskills.json`, then run the registry script; do not hand-maintain registry entries.
+- A root with `SKILL.md` is a `single-skill`. A root Git worktree containing `skills/` is a `skill-pack`.
+- Hidden directories and directories without a valid Skill contract are not registry entries.
 
-## What Counts As A Managed Entry
+## Payload Boundary
 
-- `single-skill`: a folder with `SKILL.md`.
-- `skill-pack`: a git repository that also contains a child `skills/` directory.
-- `managed: true`: the registry knows the upstream repo and can probe versions.
-- `managed: false`: the skill is local-only or missing repo metadata; status should stay `unknown_version`.
+- `.git` and `.openskills.json` are control-plane entries.
+- Signatures, merge inputs, backups, copies, validation, deletion, and rollback all use the same payload boundary.
+- Symlinks, junctions, path traversal, and case-colliding payload names are rejected.
 
-## Registry Discipline
+## Provenance
 
-- Let the scripts sync the registry when their implementation already does so.
-- Use `sync_skills_registry.py` only when the user made manual filesystem changes or explicitly asks for a rescan.
-- Do not hand-edit `.skills-list.json` unless the user explicitly asks for manual JSON surgery.
-- Report registry-backed status from the current generated registry, not from stale assumptions.
+- Remotely managed entries require explicit `source`, `sourceType`, `repoUrl`, `subpath`, and the version fields required by their mode.
+- Do not infer a repository, branch, source type, or installed base from a directory name or a hard-coded source table.
+- A non-Git folder with missing provenance remains unmanaged and `unknown_version`; it is not silently treated as a remote Skill.
+- A remotely managed root Git worktree or skill pack without complete canonical provenance is `error`, because its origin and update branch must never be inferred.
+- A self-authored or intentionally frozen Skill must declare `updatePolicy: "local-only"` in `.openskills.json`.
 
-## Detection Rules
+## Registry Contract
 
-- `superpowers` is a single `skill-pack` entry when the repo root contains `.git` and `skills/`.
-- Do not expand a `skill-pack` into per-child registry records.
-- Known single-skill sources can be inferred from `skills_registry.py` even when `.openskills.json` is incomplete.
-- Hidden directories and non-skill folders are ignored during sync.
-
-## Scope Limits
-
-- Do not claim this skill manages downstream symlink targets directly.
-- Do not mix marketplace state in `~/.claude/plugins` into the core `~/.agents/skills` registry model.
-- Keep explanations and reports centered on the agent skill store unless the user explicitly pivots to marketplaces.
+- `managed` and `updateMode` are derived from validated on-disk state.
+- `local-only` is a first-class status with `managed: false` and `remoteVersion: null`.
+- A present registry must use the current schema and contain an `entries` object; malformed or obsolete files fail visibly.
+- Registry writes are locked and atomic. Reports must come from the refreshed registry, not a stale in-memory copy.

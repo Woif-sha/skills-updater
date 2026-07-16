@@ -1,161 +1,232 @@
 # Skills Updater
 
-Manage installs, updates, registry sync, and auxiliary discovery tools for skills stored in `~/.agents/skills`.
+Install, inspect, transactionally update, and register Skills under `~/.agents/skills`.
 
 [中文](README.md)
 
-## Current Structure
+## Features
 
-This repository now follows a skill-based-architecture layout:
+- Install a single Skill, a Skill Pack, or an OpenSpec-generated Skill from GitHub.
+- Check every installed Skill or one named Skill for updates.
+- Distinguish ordinary folders from Skills whose root is itself a Git worktree.
+- Preserve local changes through a three-way merge or a transactional Git fast-forward.
+- Permanently disable remote probing for self-authored Skills with `updatePolicy: "local-only"`.
+- Keep automation output machine-readable with structured JSON.
+
+## Requirements
+
+- Python 3.10 or newer.
+- Git.
+- Network access to the GitHub repositories being installed or updated.
+- Node.js and npm only when installing or updating an OpenSpec-generated Skill.
+
+The runtime uses only the Python standard library; no `pip install` step is required.
+
+## Install Skills Updater
+
+The recommended layout is a clone under the canonical Skill directory with explicit metadata for the root Git worktree. The following PowerShell commands are for a new installation:
+
+```powershell
+$skillDir = Join-Path $HOME ".agents\skills\skills-updater"
+New-Item -ItemType Directory -Force (Split-Path $skillDir) | Out-Null
+git clone https://github.com/Woif-sha/skills-updater.git $skillDir
+Set-Location $skillDir
+
+$sha = git rev-parse HEAD
+@'
+import json
+import sys
+from pathlib import Path
+
+metadata = {
+    "source": "Woif-sha/skills-updater",
+    "sourceType": "git",
+    "repoUrl": "https://github.com/Woif-sha/skills-updater",
+    "subpath": ".",
+    "installedBaseVersion": sys.argv[1],
+}
+Path(".openskills.json").write_text(
+    json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+'@ | python - $sha
+
+python scripts/sync_skills_registry.py --json
+```
+
+`.openskills.json` is local control data and is ignored by Git. Do not clone again over an existing installation. Enter the existing directory, verify its metadata and Git upstream, and sync the registry instead.
+
+## Quick Start
+
+The commands can be called from any directory:
+
+```powershell
+$updater = Join-Path $HOME ".agents\skills\skills-updater\scripts"
+
+# Rebuild the local registry
+python "$updater\sync_skills_registry.py" --json
+
+# Check every Skill or one named Skill
+python "$updater\check_updates.py" --json
+python "$updater\check_updates.py" --skill zotero-paper-updater --json
+
+# Run the update probe without applying changes
+python "$updater\update_agent_skills.py" --check-only --json
+
+# Update every Skill or one named Skill
+python "$updater\update_agent_skills.py" --json
+python "$updater\update_agent_skills.py" --skill zotero-paper-updater --json
+```
+
+Check and update commands accept `--lang zh` or `--lang en` for human-readable output. JSON field names remain stable.
+
+Every entry point treats `~/.agents/skills` as the canonical installation source and maintains `~/.agents/skills/.skills-list.json`. Do not edit the registry by hand; sync it after changing a Skill directory or `.openskills.json`.
+
+### Install From GitHub
+
+```powershell
+# The repository root is one Skill
+python "$updater\install_agent_skill.py" `
+  --repo owner/repo --path . --name my-skill --json
+
+# The Skill is in a repository subdirectory
+python "$updater\install_agent_skill.py" `
+  --repo owner/repo --path skills/my-skill --name my-skill --json
+
+# The root repository is a Skill Pack containing skills/
+python "$updater\install_agent_skill.py" `
+  --repo owner/repo --type skill-pack --path . --json
+
+# Generate one OpenSpec workflow Skill
+python "$updater\install_agent_skill.py" `
+  --repo Fission-AI/OpenSpec --source-type git-generated `
+  --workflow-id explore --json
+```
+
+An existing destination, a non-GitHub source, an escaping path, or an incomplete source contract fails explicitly. The installer never overwrites the destination or guesses an alternative source.
+
+## Self-Authored Skills: Disable Remote Updates
+
+Declare the policy in the Skill root `.openskills.json`:
+
+```json
+{
+  "source": "my-skill",
+  "sourceType": "local",
+  "updatePolicy": "local-only"
+}
+```
+
+Existing Git provenance may remain; add only this field:
+
+```json
+{
+  "updatePolicy": "local-only"
+}
+```
+
+Keep the existing fields in the real file instead of replacing the whole file with the one-field example. The policy is reread inside the lock and before network, backup, and mutation boundaries:
+
+- checks return `status: "local_only"`;
+- updates return `action: "skipped_local"` and `applied: false`;
+- `remote_version` remains `null`;
+- no branch resolution, fetch, staging, backup, or update is attempted.
+
+## Remote-Managed Metadata
+
+A remotely managed entry requires an explicit, internally consistent source contract. An ordinary Git single-skill uses its actual repository-relative path as `subpath`:
+
+```json
+{
+  "source": "owner/repo",
+  "sourceType": "git",
+  "repoUrl": "https://github.com/owner/repo",
+  "subpath": "skills/my-skill",
+  "installedBaseVersion": "the full 40-character Git commit SHA"
+}
+```
+
+A root Skill Pack must use `sourceType: "git-pack"`:
+
+```json
+{
+  "source": "owner/repo",
+  "sourceType": "git-pack",
+  "repoUrl": "https://github.com/owner/repo",
+  "subpath": ".",
+  "installedBaseVersion": "the full 40-character Git commit SHA"
+}
+```
+
+An OpenSpec-generated Skill identifies its generator and workflow; its version comes from the generated `SKILL.md`:
+
+```json
+{
+  "source": "Fission-AI/OpenSpec",
+  "sourceType": "git-generated",
+  "repoUrl": "https://github.com/Fission-AI/OpenSpec",
+  "subpath": ".",
+  "generator": "dist/core/shared/skill-generation.js",
+  "workflowId": "explore"
+}
+```
+
+- `installedBaseVersion` is the upstream base incorporated into the installed payload.
+- Use `subpath: "."` when the repository root is the single-skill; a root Git worktree must use `.`.
+- A root Git worktree gets its current version from local `HEAD` and requires an explicit `origin` upstream for the current branch.
+- `sourceCommitSha` is no longer supported and is never used as a compatibility fallback.
+- A non-Git folder without provenance stays `unmanaged / unknown_version`; it is never mapped to a guessed remote.
+
+## Update Modes
+
+| Local shape | Update path | Safety contract |
+| --- | --- | --- |
+| Root contains `.git` | Git worktree transaction | Requires an explicit upstream; clean behind branches may fast-forward; dirty, detached, or diverged states stop |
+| Ordinary Skill folder | Snapshot three-way merge | Merges `base + local + remote` from the exact installed base; conflicts never overwrite local payload |
+| Root repository contains `skills/` | Skill Pack Git transaction | Registers the repository once instead of splitting its child Skills |
+| OpenSpec-generated Skill | Regenerate at an exact revision | Accepts only the configured repository, generator, and `workflowId` |
+
+`.git` and `.openskills.json` are always control data and never enter signatures, merges, backups, copies, or deletion. Payload, Git, and metadata mutations use durable journals. Failures roll back; ambiguous recovery retains evidence and returns `error`.
+
+## JSON Statuses And Exit Codes
+
+Common `status` values:
+
+- `up_to_date`: the installed Skill already incorporates the remote version.
+- `update_available`: an applicable update exists.
+- `local_only`: remote access is explicitly disabled.
+- `unknown_version`: the local directory has insufficient provenance.
+- `error`: state is unsafe, provenance conflicts, or an operation failed.
+
+Common `action` values are `none`, `payload_merged`, `fast_forwarded`, `metadata_refreshed`, and `skipped_local`.
+
+- `check_updates.py` exits `0` when no update or error exists, and `1` for an available update, an error, or an empty selection.
+- Update, install, and sync commands exit `0` on success and `1` on operational failure.
+- Argument errors exit `2`. With `--json`, stdout remains valid JSON and never includes argparse usage or a traceback.
+
+## Project Layout
 
 ```text
-skills-updater/
-|-- SKILL.md
-|-- README.md
-|-- README.en.md
-|-- rules/
-|   |-- scope-and-registry.md
-|   `-- update-policies.md
-|-- workflows/
-|   |-- default-invocation.md
-|   |-- check-updates.md
-|   |-- update-skills.md
-|   |-- install-skill.md
-|   |-- sync-registry.md
-|   |-- recommend-skills.md
-|   `-- update-marketplace.md
-|-- references/
-|   |-- gotchas.md
-|   |-- script-map.md
-|   `-- marketplaces.md
-`-- scripts/
+SKILL.md          # compact entry point
+routing.yaml      # canonical task-routing manifest
+rules/            # stable invariants
+workflows/        # intent-specific procedures
+references/       # gotchas and code index
+scripts/          # runtime implementation
+tests/            # regression contract, never loaded at Skill runtime
 ```
 
-## What Each Part Contains
+[SKILL.md](SKILL.md) routes operational detail into `rules/`, `workflows/`, and `references/`. README contains the complete user-facing guide and is not part of the always-read route.
 
-### `SKILL.md`
+## Development Validation
 
-This is the entry file.
-
-- Defines trigger conditions so the skill activates on requests like `"skills-updater"`, `"check skill updates"`, or `"install a skill from GitHub"`
-- Lists always-read files
-- Routes common tasks to the right rules and workflows
-- Surfaces the highest-value gotchas
-
-It should stay short and act as a router, not a full manual.
-
-### `rules/`
-
-Long-lived constraints.
-
-- [rules/scope-and-registry.md](rules/scope-and-registry.md)
-  Covers the source of truth, `.skills-list.json`, `.openskills.json`, and the boundaries for `single-skill` and `skill-pack` entries.
-- [rules/update-policies.md](rules/update-policies.md)
-  Covers version-first checks, per-type update behavior, local-edit three-way merges, backups, OpenSpec generation rules, `superpowers` handling, and the self-update guard for `skills-updater`.
-
-If something is supposed to stay true across tasks, it belongs here.
-
-### `workflows/`
-
-Task-specific operating procedures.
-
-- [workflows/default-invocation.md](workflows/default-invocation.md)
-  What to do when the user only says `skills-updater`.
-- [workflows/check-updates.md](workflows/check-updates.md)
-  How to inspect update status for all skills or one named skill.
-- [workflows/update-skills.md](workflows/update-skills.md)
-  How to apply updates, including local-edit merges, backups, conflicts, and skip behavior.
-- [workflows/install-skill.md](workflows/install-skill.md)
-  How to install a regular skill, a `skill-pack`, or an OpenSpec-generated skill.
-- [workflows/sync-registry.md](workflows/sync-registry.md)
-  How to rebuild `.skills-list.json` after manual filesystem changes.
-- [workflows/recommend-skills.md](workflows/recommend-skills.md)
-  How to handle recommendation and discovery requests.
-- [workflows/update-marketplace.md](workflows/update-marketplace.md)
-  How to handle explicit marketplace maintenance requests under `~/.claude/plugins/marketplaces`.
-
-If the content answers "what should happen for this request type?", it belongs here.
-
-### `references/`
-
-Supporting material that provides context but does not define policy.
-
-- [references/gotchas.md](references/gotchas.md)
-  Captures easy-to-miss edge cases, such as `check_updates.py` using exit code `1` to signal available updates.
-- [references/script-map.md](references/script-map.md)
-  Maps scripts to responsibilities.
-- [references/marketplaces.md](references/marketplaces.md)
-  Keeps marketplace compatibility notes and source references.
-
-These files support decisions; they do not replace `rules/` or `workflows/`.
-
-### `scripts/`
-
-Implementation entry points.
-
-- `check_updates.py`: probe remote versions from the registry
-- `update_agent_skills.py`: apply updates and report local/remote merge conflicts without overwriting local skills
-- `install_agent_skill.py`: install a new skill
-- `sync_skills_registry.py`: rebuild the registry
-- `skills_registry.py`: detect local entries and maintain `.skills-list.json`
-- `agent_skill_updater.py`: staging, signatures, backups, three-way merges, metadata refresh, and OpenSpec generation helpers
-- `recommend_skills.py`: recommendation helper
-- `update_marketplace.py`: marketplace compatibility helper
-
-The README explains what each script is for; the behavioral rules live in `rules/` and `workflows/`.
-
-## Core Behavior
-
-- Treat `~/.agents/skills` as the only source of truth
-- Maintain one registry in `.skills-list.json`
-- Compare versions before deciding to update
-- Preserve local edits for git-backed `single-skill` updates: reconstruct the installed base from `sourceCommitSha`, three-way merge local and remote changes, and block overwrites when conflicts remain
-- Treat `superpowers` as one `skill-pack`
-- Treat OpenSpec skills as `git-generated`
-- Keep the local customized `skills-updater` on `autoUpdate: false`
-
-## Common Commands
-
-Check for updates:
-
-```bash
-python scripts/check_updates.py
-python scripts/check_updates.py --skill <name>
+```powershell
+python -m unittest discover -s tests
+python -m compileall -q scripts tests
+git diff --check
 ```
 
-Apply updates:
-
-```bash
-python scripts/update_agent_skills.py
-python scripts/update_agent_skills.py --skill <name>
-```
-
-Install a new skill:
-
-```bash
-python scripts/install_agent_skill.py --repo anthropics/skills --path skills/docx --name docx
-python scripts/install_agent_skill.py --repo https://github.com/obra/superpowers --type skill-pack --name superpowers
-python scripts/install_agent_skill.py --repo https://github.com/Fission-AI/OpenSpec --type single-skill --source-type git-generated --name openspec-explore --workflow-id explore
-```
-
-Sync the registry:
-
-```bash
-python scripts/sync_skills_registry.py
-```
-
-## Maintenance Rules
-
-- Add stable constraints in `rules/`
-- Add task procedures in `workflows/`
-- Add script notes, compatibility notes, or pitfalls in `references/`
-- Change activation and task routing in `SKILL.md`
-
-Do not turn `SKILL.md` back into a long-form manual.
-
-## Origin
-
-This repository is derived from `https://github.com/yizhiyanhua-ai/skills-updater`, but the current implementation is centered on maintaining a unified local skill store at `~/.agents/skills`.
+`tests/` must remain version-controlled to prevent regressions involving `.git` deletion, partial updates, concurrent metadata loss, ZIP path escape, and local-only network access. Only caches, coverage data, and temporary artifacts are ignored.
 
 ## License
 
