@@ -1,29 +1,25 @@
-# Known Gotchas
+# Repair/Review Gotchas
 
-Read this for default, mutation, or updater repair/review routes.
+Read this only when changing or reviewing updater implementation. The canonical boundaries remain in [SKILL.md](../SKILL.md#canonical-safety-boundaries); these are failure patterns that explain why the implementation checks exist.
 
 ## Status And Output
 
 - `check_updates.py` exits `1` for `update_available`, `error`, or an empty selection. Inspect JSON status instead of treating every `1` as the same failure.
-- `local_only` is distinct from `unknown_version`: the former is an explicit no-network policy; the latter means provenance is insufficient.
 - `unknown_version` applies to unmanaged non-Git folders. A remotely managed root Git worktree with missing provenance is an error, not an unmanaged fallback.
-- Operational failures must stay structured in JSON mode. A traceback indicates a bug, not an acceptable error response.
 
 ## Control Data
 
-- Never recurse into `.git`; Git objects, refs, locks, and index files are not payload.
-- `.openskills.json` is mutable control metadata even when Git ignores it. It never participates in payload dirty checks or merges.
-- A root `.git` directory or gitfile selects Git worktree mode. Do not route that Skill through snapshot replacement.
+- `.openskills.json` is commonly Git-ignored but still participates in Committed Update verification as control metadata; treating it as payload corrupts dirty checks and merge inputs.
+- Detect a root `.git` directory or gitfile before choosing a payload mode; snapshot replacement over a worktree damages repository state.
 
 ## Version Semantics
 
 - `installedBaseVersion` is the incorporated upstream base; Git HEAD is the current local commit. They may differ.
-- `sourceCommitSha` is invalid for remote management, not a compatibility alias. It may remain inert under `local-only` because provenance is not interpreted there.
 - An ahead worktree is not an update target. A diverged or dirty-behind worktree must remain unchanged.
 
 ## Transactions
 
-- Backups exclude control data and are recovery evidence, not permission to overwrite local edits.
+- Transaction Evidence preserves recovery inputs; it is not permission to overwrite local edits.
 - Snapshot conflicts leave the installed payload unchanged and keep `.base`, `.local`, and `.remote` artifacts.
 - Metadata publication requires same-volume hard-link support. If unavailable, fail explicitly; do not switch to a weaker copy/replace path.
 - A retained `.skill-update-*`, `.git-update-*`, or `.metadata-update-*` journal means recovery was not proven safe. Preserve it and report the error.

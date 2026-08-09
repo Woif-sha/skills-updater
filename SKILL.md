@@ -21,12 +21,14 @@ Manage the canonical Skill store at `~/.agents/skills`.
 
 Do not reuse the previous route after the user changes tasks.
 
-## Non-Negotiable Boundaries
+## Canonical Safety Boundaries
 
-- `.git` and `.openskills.json` are control data, never Skill payload.
-- `updatePolicy: "local-only"` forbids every remote probe, stage, fetch, and update.
-- Local-only validates the policy and metadata file safety only; every remotely managed entry requires explicit, consistent provenance with no fallback.
-- JSON mode must remain valid JSON on both success and failure.
+These are the single normative definitions for every route. Operation workflows apply them; repair/review material explains implementation consequences without replacing them.
+
+- **Payload and control data** — `.git` and `.openskills.json` are control data, never Skill payload. Payload signatures, validation, copies, merges, deletion, and rollback exclude them and reject links, traversal, and case-colliding names.
+- **Local-only** — `updatePolicy: "local-only"` forbids every remote probe, stage, fetch, and update. Validate only the policy and metadata file safety; provenance fields are inert.
+- **Provenance and no fallback** — every remotely managed entry requires explicit, consistent source, repository, subpath, mode, and version identity. Missing or contradictory identity is an error; never infer a repository, source type, branch, origin, installed base, or cached substitute.
+- **JSON** — JSON mode emits valid structured JSON for argument errors, operational failures, and success. Classify the structured result instead of treating an exit code as the result.
 
 ## Rule Priority
 

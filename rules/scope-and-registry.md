@@ -1,6 +1,6 @@
-# Scope And Registry Rules
+# Repair/Review Scope And Registry Invariants
 
-These constraints apply to every route.
+Read this only when repairing or reviewing the updater. [SKILL.md](../SKILL.md#canonical-safety-boundaries) owns the canonical cross-route safety boundaries; this file records their implementation consequences for registry and payload code.
 
 ## Ownership
 
@@ -9,23 +9,20 @@ These constraints apply to every route.
 - A root with `SKILL.md` is a `single-skill`. A root Git worktree containing `skills/` is a `skill-pack`.
 - Hidden directories and directories without a valid Skill contract are not registry entries.
 
-## Payload Boundary
+## Boundary Enforcement
 
-- `.git` and `.openskills.json` are control-plane entries.
-- Signatures, merge inputs, backups, copies, validation, deletion, and rollback all use the same payload boundary.
-- Symlinks, junctions, path traversal, and case-colliding payload names are rejected.
+- One shared payload classifier drives signatures, merge inputs, transaction evidence, copies, validation, deletion, and rollback.
+- Validate portable child names and filesystem object types before material enters a Transaction; a later stage must not reinterpret the boundary.
 
-## Provenance
+## Provenance State Reduction
 
-- Remotely managed entries require explicit `source`, `sourceType`, `repoUrl`, `subpath`, and the version fields required by their mode.
-- Do not infer a repository, branch, source type, or installed base from a directory name or a hard-coded source table.
 - A non-Git folder with missing provenance remains unmanaged and `unknown_version`; it is not silently treated as a remote Skill.
 - A remotely managed root Git worktree or skill pack without complete canonical provenance is `error`, because its origin and update branch must never be inferred.
-- A self-authored or intentionally frozen Skill must declare `updatePolicy: "local-only"` in `.openskills.json`.
+- Derive management and mode from validated on-disk metadata once, then pass that result forward instead of reconstructing identity in callers.
 
 ## Registry Contract
 
 - `managed` and `updateMode` are derived from validated on-disk state.
-- `local-only` is a first-class status with `managed: false` and `remoteVersion: null`.
+- The local-only reduction is `managed: false`, `updateMode: "local-only"`, and `remoteVersion: null`.
 - A present registry must use the current schema and contain an `entries` object; malformed or obsolete files fail visibly.
 - Registry writes are locked and atomic. Reports must come from the refreshed registry, not a stale in-memory copy.
