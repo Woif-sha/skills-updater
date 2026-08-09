@@ -1,0 +1,696 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>异常介入记录：冲突、缺失与恢复异常</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17211b;
+      --muted: #607067;
+      --paper: #f5f7f2;
+      --panel: #ffffff;
+      --line: #dce4dc;
+      --accent: #166534;
+      --accent-soft: #e6f3e8;
+      --warn: #8a4b08;
+      --warn-soft: #fff1d6;
+      --danger: #a12828;
+      --danger-soft: #fae9e6;
+      --code: #132019;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
+      line-height: 1.55;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 42px 0 70px;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { margin-bottom: 10px; font-size: clamp(28px, 4vw, 44px); letter-spacing: -0.035em; }
+    h2 { margin-bottom: 16px; font-size: 20px; }
+    h3 { margin-bottom: 8px; font-size: 15px; }
+
+    .lede {
+      max-width: 930px;
+      margin-bottom: 24px;
+      color: var(--muted);
+      font-size: 17px;
+    }
+
+    .decision {
+      margin-bottom: 24px;
+      padding: 16px 18px;
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+      border-radius: 8px;
+    }
+
+    .decision ul { margin: 8px 0 0; padding-left: 22px; }
+
+    .toolbar, .actions, .scenario-tabs, .scenario-steps {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .toolbar { margin-bottom: 16px; }
+
+    button {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--ink);
+      padding: 9px 13px;
+      font: inherit;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    button:hover { border-color: var(--accent); }
+    button.active, button.primary { border-color: var(--accent); background: var(--accent); color: white; }
+    button:disabled { opacity: 0.46; cursor: not-allowed; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 16px;
+      margin-bottom: 26px;
+    }
+
+    .card {
+      min-width: 0;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+      box-shadow: 0 8px 24px rgba(30, 45, 34, 0.04);
+    }
+
+    .span-two { grid-column: 1 / -1; }
+
+    .facts {
+      display: grid;
+      grid-template-columns: 150px 1fr;
+      gap: 8px 12px;
+      margin: 0;
+      font-size: 14px;
+    }
+
+    .facts dt { color: var(--muted); }
+    .facts dd { margin: 0; overflow-wrap: anywhere; }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      min-height: 25px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .badge.warn { background: var(--warn-soft); color: var(--warn); }
+    .badge.bad { background: var(--danger-soft); color: var(--danger); }
+
+    .notice {
+      margin: 0;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: var(--accent-soft);
+    }
+
+    .notice.warn { background: var(--warn-soft); color: var(--warn); }
+    .notice.bad { background: var(--danger-soft); color: var(--danger); }
+
+    pre {
+      max-height: 520px;
+      margin: 0;
+      padding: 15px;
+      overflow: auto;
+      border-radius: 8px;
+      background: var(--code);
+      color: #e8f0e9;
+      font: 12px/1.55 "Cascadia Code", Consolas, monospace;
+      white-space: pre;
+    }
+
+    .actions { margin-top: 14px; }
+    .walkthroughs { margin-top: 30px; }
+    .scenario-tabs { margin-bottom: 12px; }
+    .scenario-copy { min-height: 66px; color: var(--muted); }
+    .scenario-steps { counter-reset: step; }
+    .scenario-steps button::before {
+      counter-increment: step;
+      content: counter(step) ". ";
+      font-weight: 700;
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 26px;
+    }
+
+    .legend .card { box-shadow: none; }
+    .legend p { margin-bottom: 0; color: var(--muted); font-size: 14px; }
+
+    @media (max-width: 780px) {
+      .grid, .legend { grid-template-columns: 1fr; }
+      .span-two { grid-column: auto; }
+      .facts { grid-template-columns: 1fr; }
+      .facts dt { margin-top: 4px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>异常介入记录：冲突、缺失与恢复异常</h1>
+    <p class="lede">
+      问题：成功更新不保留旧版本时，哪些异常必须停止自动更新并留下足够材料，才能安全完成合并或人工恢复？
+      请比较成功、冲突、Skill 路径缺失和恢复不确定四类结果。
+    </p>
+
+    <section class="decision" aria-label="当前设计方向">
+      <strong>根据反馈调整后的设计方向：</strong>
+      <ul>
+        <li>普通更新和无冲突的三方合并成功后，不产生长期 intervention record；临时 journal / merge workspace 随成功清理。</li>
+        <li>只有需要诊断材料时才发布 intervention record：内容冲突或无法证明回滚完成。</li>
+        <li>Generated 是远端内容的产生方式，不是冲突状态；当前实例是 OpenSpec：仓库经构建和 workflow 生成最终 <code>SKILL.md</code>，<code>npm ci</code> 只是生成准备步骤。</li>
+        <li>预期路径不存在时不推断原因、不搜索改名候选、不自动重装；直接向用户报告并等待指导。</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="free-play-heading">
+      <h2 id="free-play-heading">自由操作</h2>
+      <div class="toolbar" id="case-buttons" aria-label="异常场景"></div>
+
+      <div class="grid">
+        <article class="card">
+          <h3>观察到的 Skill</h3>
+          <dl class="facts" id="observed-state"></dl>
+        </article>
+
+        <article class="card">
+          <h3>最近判断</h3>
+          <p class="notice" id="last-result"></p>
+          <div class="actions" id="free-play-actions"></div>
+        </article>
+
+        <article class="card">
+          <h3>长期 intervention materials</h3>
+          <pre id="record-tree"></pre>
+        </article>
+
+        <article class="card">
+          <h3>用户反馈 / Agent 定位信息</h3>
+          <pre id="operational-state"></pre>
+        </article>
+
+        <article class="card span-two">
+          <h3>当前 intervention manifest</h3>
+          <pre id="manifest"></pre>
+        </article>
+      </div>
+    </section>
+
+    <section class="walkthroughs card" aria-labelledby="walkthrough-heading">
+      <h2 id="walkthrough-heading">引导场景</h2>
+      <div class="scenario-tabs" id="scenario-tabs"></div>
+      <p class="scenario-copy" id="scenario-copy"></p>
+      <div class="scenario-steps" id="scenario-steps"></div>
+    </section>
+
+    <section class="legend" aria-label="三个持久性层次">
+      <article class="card">
+        <span class="badge">成功结果</span>
+        <h3>不留长期记录</h3>
+        <p>安装内容和 metadata 更新完成，临时材料清理；CLI 只返回结构化成功结果。</p>
+      </article>
+      <article class="card">
+        <span class="badge warn">intervention record</span>
+        <h3>等待人工决定</h3>
+        <p>只为冲突等需要 Agent 继续诊断的情况保留输入、身份和下一步。</p>
+      </article>
+      <article class="card">
+        <span class="badge bad">retained journal</span>
+        <h3>恢复结论不确定</h3>
+        <p>无法验证磁盘已精确回到更新前状态；保留 transaction 原件，绝不报告安全回滚。</p>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    // Portable state model. It has no DOM dependency and is the part under review.
+    const InterventionModel = (() => {
+      const BASE_COMMIT = "0a12bc34de56f7890a12bc34de56f7890a12bc34";
+      const REMOTE_COMMIT = "9f87ed65cb43a2109f87ed65cb43a2109f87ed65";
+      const LOCAL_SIGNATURE = "53ab4b420cf31dc20f62bfa4a78b12f0b8e9b27e6ca621b98976789b3f62f7cc";
+      const REMOTE_SIGNATURE = "b1f0d5a16e73af0b30f41389f44d95a40752911e5c546833726f994c84bf2182";
+
+      const CASES = {
+        clean: {
+          label: "普通成功",
+          sourceType: "github",
+          expectedExists: true,
+          foundPath: "~/.agents/skills/skills-updater",
+          localChange: "无",
+          remoteChange: "更新 SKILL.md",
+          classification: "clean-update",
+        },
+        autoMerge: {
+          label: "本地修改可自动合并",
+          sourceType: "github",
+          expectedExists: true,
+          foundPath: "~/.agents/skills/skills-updater",
+          localChange: "本地修改 README.md",
+          remoteChange: "远端修改 SKILL.md",
+          classification: "auto-merge",
+        },
+        conflict: {
+          label: "本地与远端冲突",
+          sourceType: "github",
+          expectedExists: true,
+          foundPath: "~/.agents/skills/skills-updater",
+          localChange: "本地修改 SKILL.md 第 18 行",
+          remoteChange: "远端也修改 SKILL.md 第 18 行",
+          classification: "content-conflict",
+        },
+        generatedConflict: {
+          label: "Generated 产物冲突",
+          sourceType: "git-generated",
+          expectedExists: true,
+          foundPath: "~/.agents/skills/openspec",
+          localChange: "本地修改生成后的 SKILL.md",
+          remoteChange: "新 workflow 重新生成同一段内容",
+          classification: "content-conflict",
+          generator: "openspec",
+          workflowId: "proposal",
+        },
+        missing: {
+          label: "Skill 路径缺失",
+          sourceType: "github",
+          expectedExists: false,
+          foundPath: null,
+          localChange: "无可读取内容",
+          remoteChange: "远端可访问",
+          classification: "missing",
+        },
+        uncertain: {
+          label: "回滚安全性不确定",
+          sourceType: "github",
+          expectedExists: true,
+          foundPath: "~/.agents/skills/skills-updater",
+          localChange: "更新期间出现并发修改",
+          remoteChange: "payload 已开始替换",
+          classification: "rollback-uncertain",
+        },
+      };
+
+      const clone = (value) => JSON.parse(JSON.stringify(value));
+
+      function initial(caseName = "clean") {
+        const spec = CASES[caseName];
+        return {
+          caseName,
+          scanned: false,
+          processed: false,
+          installedChanged: false,
+          journal: null,
+          intervention: null,
+          userFeedback: null,
+          agentDiagnostic: null,
+          observed: {
+            expectedName: "skills-updater",
+            expectedPath: "~/.agents/skills/skills-updater",
+            expectedExists: spec.expectedExists,
+            foundPath: spec.foundPath,
+            sourceType: spec.sourceType,
+            localChange: spec.localChange,
+            remoteChange: spec.remoteChange,
+          },
+          last: { tone: "ok", message: `已载入“${spec.label}”场景，请先扫描本地状态。` },
+        };
+      }
+
+      function makeIntervention(state, status, reason, materials, nextAction) {
+        const spec = CASES[state.caseName];
+        const manifest = {
+          schemaVersion: 1,
+          kind: "intervention",
+          status,
+          reason,
+          createdAt: "2026-08-09T10:42:18Z",
+          skill: {
+            expectedName: state.observed.expectedName,
+            expectedPath: state.observed.expectedPath,
+            observedPath: state.observed.foundPath,
+          },
+          source: {
+            sourceType: spec.sourceType,
+            repoUrl: "https://github.com/Woif-sha/skills-updater",
+            subpath: ".",
+          },
+          identity: {
+            installedBaseVersion: BASE_COMMIT,
+            remoteVersion: REMOTE_COMMIT,
+            localPayloadSha256: LOCAL_SIGNATURE,
+            remotePayloadSha256: REMOTE_SIGNATURE,
+          },
+          materials,
+          nextAction,
+        };
+        if (spec.generator) {
+          manifest.source.generator = spec.generator;
+          manifest.source.workflowId = spec.workflowId;
+        }
+        return {
+          directory: `20260809T104218Z__${reason}`,
+          manifest,
+        };
+      }
+
+      function reduce(previous, action) {
+        if (action.type === "RESET") return initial(action.caseName || previous.caseName);
+        const state = clone(previous);
+        const spec = CASES[state.caseName];
+
+        if (action.type === "SCAN") {
+          state.scanned = true;
+          const messages = {
+            "clean-update": "Skill 位于预期路径，没有本地修改，可以直接更新。",
+            "auto-merge": "检测到本地修改，但与远端修改不重叠，可以三方合并。",
+            "content-conflict": "本地与远端修改重叠，禁止覆盖，必须保留合并输入。",
+            missing: "预期路径不存在；系统不推断删除、改名或移动，直接停止并报告用户。",
+            "rollback-uncertain": "更新已越过修改边界，且磁盘状态受到并发变化，不能预先断言可安全回滚。",
+          };
+          state.last = {
+            tone: ["content-conflict", "rollback-uncertain"].includes(spec.classification) ? "warn" : spec.classification === "missing" ? "bad" : "ok",
+            message: messages[spec.classification],
+          };
+          return state;
+        }
+
+        if (action.type === "PROCESS") {
+          if (!state.scanned) {
+            state.last = { tone: "bad", message: "请先扫描；不能在身份和本地状态未知时更新。" };
+            return state;
+          }
+          state.processed = true;
+
+          if (spec.classification === "clean-update") {
+            state.journal = null;
+            state.installedChanged = true;
+            state.userFeedback = {
+              status: "success",
+              message: "skills-updater 更新完成。",
+            };
+            state.last = { tone: "ok", message: "更新成功：不创建 intervention record，只返回成功结果。" };
+            return state;
+          }
+
+          if (spec.classification === "auto-merge") {
+            state.journal = null;
+            state.installedChanged = true;
+            state.userFeedback = {
+              status: "success",
+              message: "skills-updater 更新完成，本地修改已合并保留。",
+            };
+            state.last = { tone: "ok", message: "三方合并成功：本地修改被保留，临时 merge workspace 已删除，不留长期记录。" };
+            return state;
+          }
+
+          if (spec.classification === "content-conflict") {
+            state.intervention = makeIntervention(
+              state,
+              "needs-resolution",
+              "content-conflict",
+              { base: "base/", local: "local/", remote: "remote/" },
+              "人工解决冲突后，再从明确结果执行更新",
+            );
+            state.userFeedback = {
+              status: "error",
+              code: "content_conflict",
+              message: "skills-updater 的本地修改与远端更新冲突，安装内容未改变。",
+              nextStep: "请让 Agent 检查 intervention materials 并协助解决冲突。",
+            };
+            state.last = { tone: "warn", message: "更新已停止，安装内容未变；base/local/remote 被发布为 intervention materials。" };
+            return state;
+          }
+
+          if (spec.classification === "missing") {
+            state.userFeedback = {
+              status: "error",
+              code: "skill_missing",
+              message: "预期路径中未找到 skills-updater；系统不会推断它被删除、改名或移动。",
+              nextStep: "已停止自动操作，请由用户说明实际情况和后续处理方向。",
+            };
+            state.last = { tone: "bad", message: "返回 structured missing error：不搜索候选、不备份其他目录、不静默重装，等待用户指导。" };
+            return state;
+          }
+
+          state.journal = {
+            path: "~/.agents/skills/.skills-updater.update-<random>/",
+            phase: "installing",
+            lastVerifiedState: "original payload moved; incoming payload not fully verified",
+            observedProblem: "恢复期间目标目录出现并发文件，无法证明来自原状态还是第三方写入",
+          };
+          state.intervention = makeIntervention(
+            state,
+            "recovery-required",
+            "rollback-unverified",
+            { retainedJournal: state.journal.path },
+            "停止自动操作，检查 journal 与当前安装目录后再决定恢复",
+          );
+          state.userFeedback = {
+            status: "error",
+            code: "recovery_required",
+            message: "skills-updater 更新失败，系统无法确认该 Skill 已恢复到更新前状态。",
+            impact: "当前安装内容可能处于原版本、新版本或两者之间；请暂时不要重试更新或手动删除恢复目录。",
+            nextStep: "请让 Agent 根据诊断 journal 检查并恢复。",
+            diagnosticJournal: state.journal.path,
+          };
+          state.agentDiagnostic = {
+            transactionType: "snapshot",
+            lastVerifiedPhase: "moving_original",
+            failedPhase: "installing",
+            expectedOriginalPayloadSha256: LOCAL_SIGNATURE,
+            expectedIncomingPayloadSha256: REMOTE_SIGNATURE,
+            observedProblem: state.journal.observedProblem,
+            safeToRetry: false,
+            journalPath: state.journal.path,
+          };
+          state.last = { tone: "bad", message: "更新失败且恢复状态不确定：已明确通知用户停止重试，并保留供 Agent 定位的诊断 journal。" };
+          return state;
+        }
+
+        return state;
+      }
+
+      return { CASES, initial, reduce };
+    })();
+
+    const ACTIONS = [
+      { type: "SCAN", label: "扫描本地状态" },
+      { type: "PROCESS", label: "尝试处理更新", primary: true },
+    ];
+
+    const SCENARIOS = {
+      clean: {
+        label: "成功不留记录",
+        copy: "普通成功更新只保留结构化结果；没有人工介入价值的旧版本不会进入长期存储。",
+        steps: [
+          { type: "RESET", caseName: "clean", label: "重置为普通更新" },
+          { type: "SCAN", label: "确认本地状态" },
+          { type: "PROCESS", label: "执行成功更新" },
+        ],
+      },
+      autoMerge: {
+        label: "本地修改可合并",
+        copy: "本地与远端修改不重叠时，临时 base/local/remote 完成三方合并；成功后全部清理。",
+        steps: [
+          { type: "RESET", caseName: "autoMerge", label: "重置为可合并修改" },
+          { type: "SCAN", label: "识别本地修改" },
+          { type: "PROCESS", label: "完成三方合并" },
+        ],
+      },
+      conflict: {
+        label: "冲突保留三方输入",
+        copy: "同一内容被本地和远端同时修改时，安装目录保持不变，base/local/remote 被提升为长期介入材料。",
+        steps: [
+          { type: "RESET", caseName: "conflict", label: "重置为冲突" },
+          { type: "SCAN", label: "识别重叠修改" },
+          { type: "PROCESS", label: "停止并保留材料" },
+        ],
+      },
+      generatedConflict: {
+        label: "Generated 与冲突无关",
+        copy: "Generated 只说明远端内容由 workflow 产生；这里发生冲突，是因为生成产物和本地修改碰到了同一段内容。",
+        steps: [
+          { type: "RESET", caseName: "generatedConflict", label: "重置为生成型来源" },
+          { type: "SCAN", label: "比较生成产物和本地内容" },
+          { type: "PROCESS", label: "停止并保留材料" },
+        ],
+      },
+      missing: {
+        label: "路径缺失直接汇报",
+        copy: "预期目录不存在时不调查是否改名或移动，不触碰其他目录；只向用户说明缺失并等待处理方向。",
+        steps: [
+          { type: "RESET", caseName: "missing", label: "重置为路径缺失" },
+          { type: "SCAN", label: "确认预期路径不存在" },
+          { type: "PROCESS", label: "停止并向用户汇报" },
+        ],
+      },
+      uncertain: {
+        label: "回滚为何不确定",
+        copy: "更新已开始替换文件，随后发生并发写入。用户会看到影响、禁行事项和下一步；Agent 则通过 journal 获得 phase、签名和失败位置。",
+        steps: [
+          { type: "RESET", caseName: "uncertain", label: "重置为恢复异常" },
+          { type: "SCAN", label: "读取最后已验证阶段" },
+          { type: "PROCESS", label: "保留 journal 并停止" },
+        ],
+      },
+    };
+
+    let state = InterventionModel.initial();
+    let activeScenario = "clean";
+    let scenarioProgress = 0;
+
+    const el = (id) => document.getElementById(id);
+
+    function dispatch(action, fromScenario = false) {
+      state = InterventionModel.reduce(state, action);
+      if (fromScenario) scenarioProgress += 1;
+      else scenarioProgress = 0;
+      render();
+    }
+
+    function renderCaseButtons() {
+      el("case-buttons").replaceChildren(...Object.entries(InterventionModel.CASES).map(([caseName, spec]) => {
+        const button = document.createElement("button");
+        button.textContent = spec.label;
+        button.className = state.caseName === caseName ? "active" : "";
+        button.addEventListener("click", () => dispatch({ type: "RESET", caseName }));
+        return button;
+      }));
+    }
+
+    function renderObserved() {
+      const rows = [
+        ["预期名称", state.observed.expectedName],
+        ["预期路径存在", state.observed.expectedExists ? "是" : "否"],
+        ["观察到的路径", state.observed.foundPath || "未找到"],
+        ["来源类型", state.observed.sourceType],
+        ["本地变化", state.observed.localChange],
+        ["远端变化", state.observed.remoteChange],
+        ["安装内容已改变", state.installedChanged ? "是" : "否"],
+      ];
+      el("observed-state").innerHTML = rows.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("");
+    }
+
+    function renderActions() {
+      el("free-play-actions").replaceChildren(...ACTIONS.map((action) => {
+        const button = document.createElement("button");
+        button.textContent = action.label;
+        if (action.primary) button.classList.add("primary");
+        button.addEventListener("click", () => dispatch(action));
+        return button;
+      }));
+      const reset = document.createElement("button");
+      reset.textContent = "重置当前场景";
+      reset.addEventListener("click", () => dispatch({ type: "RESET", caseName: state.caseName }));
+      el("free-play-actions").append(reset);
+    }
+
+    function recordTree() {
+      if (!state.intervention) {
+        return state.processed
+          ? "~/.agents/interventions/\n└── （无介入事项，因此不留长期材料）"
+          : "~/.agents/interventions/\n└── （尚无 intervention record）";
+      }
+      const record = state.intervention;
+      const inputs = record.manifest.materials;
+      const children = ["manifest.json", ...Object.values(inputs)];
+      const lines = [
+        "~/.agents/interventions/skills-updater/",
+        `└── ${record.directory}/`,
+      ];
+      children.forEach((child, index) => {
+        lines.push(`    ${index === children.length - 1 ? "└──" : "├──"} ${child}`);
+      });
+      return lines.join("\n");
+    }
+
+    function operationalState() {
+      const mergeWorkspace = state.scanned && !state.processed && ["autoMerge", "conflict", "generatedConflict"].includes(state.caseName)
+        ? { location: "temporary", inputs: ["base", "local", "remote"], published: false }
+        : null;
+      return JSON.stringify({
+        scanned: state.scanned,
+        processed: state.processed,
+        userFeedback: state.userFeedback,
+        agentDiagnostic: state.agentDiagnostic,
+        temporaryMergeWorkspace: mergeWorkspace,
+        retainedJournal: state.journal,
+      }, null, 2);
+    }
+
+    function renderScenarioTabs() {
+      el("scenario-tabs").replaceChildren(...Object.entries(SCENARIOS).map(([key, scenario]) => {
+        const button = document.createElement("button");
+        button.textContent = scenario.label;
+        button.className = activeScenario === key ? "active" : "";
+        button.addEventListener("click", () => {
+          activeScenario = key;
+          scenarioProgress = 0;
+          render();
+        });
+        return button;
+      }));
+
+      const scenario = SCENARIOS[activeScenario];
+      el("scenario-copy").textContent = scenario.copy;
+      el("scenario-steps").replaceChildren(...scenario.steps.map((action, index) => {
+        const button = document.createElement("button");
+        button.textContent = action.label;
+        button.disabled = index !== scenarioProgress;
+        if (index < scenarioProgress) button.textContent += " ✓";
+        button.addEventListener("click", () => dispatch(action, true));
+        return button;
+      }));
+    }
+
+    function render() {
+      renderCaseButtons();
+      renderObserved();
+      renderActions();
+      const result = el("last-result");
+      result.textContent = state.last.message;
+      result.className = `notice${state.last.tone === "ok" ? "" : ` ${state.last.tone}`}`;
+      el("record-tree").textContent = recordTree();
+      el("operational-state").textContent = operationalState();
+      el("manifest").textContent = state.intervention
+        ? JSON.stringify(state.intervention.manifest, null, 2)
+        : "（只有需要人工介入时才会发布 manifest）";
+      renderScenarioTabs();
+    }
+
+    render();
+  </script>
+</body>
+</html>
