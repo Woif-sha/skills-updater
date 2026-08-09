@@ -77,6 +77,85 @@ class AgentSkillUpdaterTests(unittest.TestCase):
         openspec_stage.assert_called_once()
         git_stage.assert_not_called()
 
+    def test_resolve_generated_update_retains_exact_source_revision(self):
+        from scripts.agent_skill_updater import (
+            AgentSkillSource,
+            fetch_source_remote_observation,
+            resolve_skill_update,
+        )
+
+        revision = "b" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local_dir = root / "skills" / "openspec-explore"
+            local_dir.mkdir(parents=True)
+            (local_dir / "SKILL.md").write_text(
+                "---\nname: openspec-explore\ngeneratedBy: 1.0.0\n---\nold\n",
+                encoding="utf-8",
+            )
+            metadata_path = local_dir / ".openskills.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "source": "Fission-AI/OpenSpec",
+                        "sourceType": "git-generated",
+                        "repoUrl": "https://github.com/Fission-AI/OpenSpec",
+                        "subpath": ".",
+                        "generator": "dist/core/shared/skill-generation.js",
+                        "workflowId": "explore",
+                        "installedBaseVersion": "1.0.0",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source = AgentSkillSource(
+                name="openspec-explore",
+                local_dir=local_dir,
+                source="Fission-AI/OpenSpec",
+                source_type="git-generated",
+                repo_url="https://github.com/Fission-AI/OpenSpec",
+                subpath=".",
+                generator="dist/core/shared/skill-generation.js",
+                workflow_id="explore",
+                metadata_path=metadata_path,
+                entry_type="single-skill",
+            )
+
+            def stage_generated(_source, stage_root, remote_version=None):
+                self.assertEqual(remote_version, revision)
+                staged = stage_root / "openspec-explore"
+                staged.mkdir(parents=True)
+                (staged / "SKILL.md").write_text(
+                    "---\nname: openspec-explore\ngeneratedBy: 2.0.0\n---\nnew\n",
+                    encoding="utf-8",
+                )
+                return staged
+
+            with mock.patch(
+                "scripts.agent_skill_updater._fetch_remote_commit_sha",
+                return_value=revision,
+            ) as fetch_revision:
+                with mock.patch(
+                    "scripts.agent_skill_updater._fetch_remote_package_version_at_revision",
+                    return_value="2.0.0",
+                ) as fetch_version:
+                    observation = fetch_source_remote_observation(source)
+                    with mock.patch(
+                        "scripts.agent_skill_updater.stage_remote_skill",
+                        side_effect=stage_generated,
+                    ):
+                        update = resolve_skill_update(
+                            source,
+                            root / "stage",
+                            observation,
+                        )
+
+        self.assertIs(update.remote_observation, observation)
+        self.assertEqual(update.remote_observation.revision, revision)
+        self.assertEqual(update.remote_version, "2.0.0")
+        fetch_revision.assert_called_once()
+        fetch_version.assert_called_once()
+
     def test_stage_remote_skill_requires_explicit_git_commit(self):
         from scripts.agent_skill_updater import (
             AgentSkillSource,
@@ -404,13 +483,22 @@ class AgentSkillUpdaterTests(unittest.TestCase):
             installed_base_version="old123456789",
             local_version="old123456789",
             remote_version="new123456789",
+            remote_observation=SimpleNamespace(
+                revision="new123456789",
+                version="new123456789",
+            ),
         )
         with mock.patch.object(updater.sys, "argv", ["update_agent_skills.py", "--skill", "demo-skill", "--json"]):
             with mock.patch("scripts.update_agent_skills.sync_registry", side_effect=[registry, registry]):
                 with mock.patch("scripts.update_agent_skills.update_registry_entries"):
                     with mock.patch(
                         "scripts.update_agent_skills._probe_entry",
-                        return_value=updater.EntryProbe("update_available", "old123456789", "new123456789"),
+                        return_value=updater.EntryProbe(
+                            "update_available",
+                            "old123456789",
+                            "new123456789",
+                            remote_observation=resolved.remote_observation,
+                        ),
                     ):
                         with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
                             with mock.patch("scripts.update_agent_skills.make_backup_root", return_value=Path(r"C:\backup-root")):
@@ -458,6 +546,10 @@ class AgentSkillUpdaterTests(unittest.TestCase):
             installed_base_version="old123456789",
             local_version="old123456789",
             remote_version="new123456789",
+            remote_observation=SimpleNamespace(
+                revision="new123456789",
+                version="new123456789",
+            ),
         )
         stdout = io.StringIO()
         with mock.patch.object(updater.sys, "argv", ["update_agent_skills.py", "--skill", "demo-skill", "--json"]):
@@ -465,13 +557,27 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                 with mock.patch("scripts.update_agent_skills.update_registry_entries"):
                     with mock.patch(
                         "scripts.update_agent_skills._probe_entry",
-                        return_value=updater.EntryProbe("update_available", "old123456789", "new123456789"),
+                        return_value=updater.EntryProbe(
+                            "update_available",
+                            "old123456789",
+                            "new123456789",
+                            remote_observation=resolved.remote_observation,
+                        ),
                     ):
                         with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
                             with mock.patch(
-                                "scripts.update_agent_skills.refresh_skill_metadata_version",
-                                return_value=True,
-                            ) as refresh_metadata:
+                                "scripts.update_agent_skills.apply_observed_update",
+                                return_value=SimpleNamespace(
+                                    status="up_to_date",
+                                    installed_state="committed",
+                                    applied=True,
+                                    action="metadata_refreshed",
+                                    version="new123456789",
+                                    error_message=None,
+                                    diagnostic_journal=None,
+                                    cleanup_residue=None,
+                                ),
+                            ) as apply_observed:
                                 with self.assertRaises(SystemExit) as exit_info:
                                     with redirect_stdout(stdout):
                                         updater.main()
@@ -480,7 +586,8 @@ class AgentSkillUpdaterTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload[0]["status"], "up_to_date")
         self.assertTrue(payload[0]["applied"])
-        refresh_metadata.assert_called_once()
+        self.assertEqual(payload[0]["installed_state"], "committed")
+        apply_observed.assert_called_once()
 
     def test_update_agent_skills_routes_skill_pack_through_transaction_engine(self):
         import scripts.update_agent_skills as updater
@@ -520,6 +627,9 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                 error_message=None,
                 applied=True,
                 action="fast_forwarded",
+                installed_state="committed",
+                diagnostic_journal=None,
+                cleanup_residue=None,
             )
             stdout = io.StringIO()
             with mock.patch.object(
