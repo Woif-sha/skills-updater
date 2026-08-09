@@ -398,9 +398,18 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                     ):
                         with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
                             with mock.patch(
-                                "scripts.update_agent_skills.refresh_skill_metadata_version",
-                                return_value=True,
-                            ) as refresh_metadata:
+                                "scripts.update_agent_skills.apply_observed_update",
+                                return_value=SimpleNamespace(
+                                    status="up_to_date",
+                                    installed_state="committed",
+                                    applied=True,
+                                    action="metadata_refreshed",
+                                    version="new123456789",
+                                    error_message=None,
+                                    diagnostic_journal=None,
+                                    cleanup_residue=None,
+                                ),
+                            ) as apply_observed:
                                 with self.assertRaises(SystemExit) as exit_info:
                                     with redirect_stdout(stdout):
                                         updater.main()
@@ -409,7 +418,8 @@ class AgentSkillUpdaterTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload[0]["status"], "up_to_date")
         self.assertTrue(payload[0]["applied"])
-        refresh_metadata.assert_called_once()
+        self.assertEqual(payload[0]["installed_state"], "committed")
+        apply_observed.assert_called_once()
 
     def test_update_agent_skills_routes_skill_pack_through_transaction_engine(self):
         import scripts.update_agent_skills as updater

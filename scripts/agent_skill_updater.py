@@ -90,6 +90,36 @@ METADATA_TRANSACTION_PHASES = frozenset(
         TRANSACTION_PHASE_ROLLED_BACK,
     }
 )
+COORDINATOR_TRANSACTION_STATE_VERSION = 1
+COORDINATOR_TRANSACTION_TYPE = "coordinator"
+METADATA_ONLY_TRANSACTION_KIND = "metadata-only"
+COORDINATOR_PHASE_PREPARED = "prepared"
+COORDINATOR_PHASE_CAPTURING_METADATA = "capturing_metadata"
+COORDINATOR_PHASE_METADATA_CAPTURED = "metadata_captured"
+COORDINATOR_PHASE_PUBLISHING_METADATA = "publishing_metadata"
+COORDINATOR_PHASE_METADATA_PUBLISH_FAILED = "metadata_publish_failed"
+COORDINATOR_PHASE_METADATA_PUBLISHED = "metadata_published"
+COORDINATOR_PHASE_COMMITTED = "committed"
+COORDINATOR_PHASE_ROLLED_BACK = "rolled_back"
+COORDINATOR_PHASES = frozenset(
+    {
+        COORDINATOR_PHASE_PREPARED,
+        COORDINATOR_PHASE_CAPTURING_METADATA,
+        COORDINATOR_PHASE_METADATA_CAPTURED,
+        COORDINATOR_PHASE_PUBLISHING_METADATA,
+        COORDINATOR_PHASE_METADATA_PUBLISH_FAILED,
+        COORDINATOR_PHASE_METADATA_PUBLISHED,
+        COORDINATOR_PHASE_COMMITTED,
+        COORDINATOR_PHASE_ROLLED_BACK,
+    }
+)
+COORDINATOR_METADATA_PHASE_NAMES = {
+    "capturing": COORDINATOR_PHASE_CAPTURING_METADATA,
+    "captured": COORDINATOR_PHASE_METADATA_CAPTURED,
+    "publishing": COORDINATOR_PHASE_PUBLISHING_METADATA,
+    "publish_failed": COORDINATOR_PHASE_METADATA_PUBLISH_FAILED,
+    "published": COORDINATOR_PHASE_METADATA_PUBLISHED,
+}
 METADATA_PHASE_PREPARED = "prepared"
 METADATA_PHASE_CAPTURING = "capturing"
 METADATA_PHASE_CAPTURED = "captured"
@@ -184,6 +214,25 @@ class GitWorktreeResult:
     applied: bool = False
     action: str = "none"
     error_message: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RemoteObservation:
+    revision: str
+    version: str
+
+
+@dataclass(frozen=True)
+class TransactionOutcome:
+    name: str
+    status: str
+    installed_state: str
+    applied: bool
+    action: str
+    version: Optional[str] = None
+    error_message: Optional[str] = None
+    diagnostic_journal: Optional[Path] = None
+    cleanup_residue: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -648,24 +697,47 @@ def update_skill_from_staged(
         )
 
 
-def refresh_skill_metadata_version(
+def apply_observed_update(
     source: AgentSkillSource,
+    observation: RemoteObservation,
+    *,
     installed_base_version: str,
-    remote_version: Optional[str],
-) -> bool:
+) -> TransactionOutcome:
+    if not observation.revision or not observation.version:
+        raise AgentSkillUpdaterError(
+            f"Skill '{source.name}' requires an explicit Remote Observation."
+        )
     _require_remote_updates_enabled(source, installed_base_version)
+    _validate_snapshot_metadata_refresh_state(source, installed_base_version)
     with skill_update_lock(source.local_dir):
         _recover_skill_transactions_locked(source.local_dir)
         _require_remote_updates_enabled(source, installed_base_version)
-        return _refresh_skill_metadata_version_unlocked(
+        return _apply_metadata_only_transaction_locked(
             source,
+            observation,
             installed_base_version,
-            remote_version,
             lambda expected_base: _validate_snapshot_metadata_refresh_state(
                 source,
                 expected_base,
             ),
         )
+
+
+def refresh_skill_metadata_version(
+    source: AgentSkillSource,
+    installed_base_version: str,
+    remote_version: Optional[str],
+) -> bool:
+    if not remote_version:
+        raise AgentSkillUpdaterError(
+            f"Skill '{source.name}' is missing the remote version required for metadata refresh."
+        )
+    outcome = apply_observed_update(
+        source,
+        RemoteObservation(revision=remote_version, version=remote_version),
+        installed_base_version=installed_base_version,
+    )
+    return _legacy_metadata_result(outcome)
 
 
 def _refresh_skill_metadata_version_unlocked(
@@ -678,15 +750,25 @@ def _refresh_skill_metadata_version_unlocked(
         raise AgentSkillUpdaterError(
             f"Skill '{source.name}' is missing the remote version required for metadata refresh."
         )
-    update = AgentSkillUpdate(
+    outcome = _apply_metadata_only_transaction_locked(
         source=source,
-        staged_dir=None,
-        status="up_to_date",
         installed_base_version=installed_base_version,
-        local_version=_read_local_version(source),
-        remote_version=remote_version,
+        observation=RemoteObservation(revision=remote_version, version=remote_version),
+        commit_state_validator=commit_state_validator,
     )
-    return _refresh_metadata(update, commit_state_validator)
+    return _legacy_metadata_result(outcome)
+
+
+def _legacy_metadata_result(outcome: TransactionOutcome) -> bool:
+    if outcome.status != "error":
+        return outcome.applied
+    if outcome.installed_state == "committed":
+        raise AgentSkillUpdateCommittedError(
+            outcome.error_message or "Metadata refresh committed with cleanup residue.",
+            action=outcome.action,
+            version=outcome.version,
+        )
+    raise AgentSkillUpdaterError(outcome.error_message or "Metadata refresh failed.")
 
 
 def _validate_snapshot_metadata_refresh_state(
@@ -2556,6 +2638,7 @@ def _looks_like_transaction_name(name: str) -> bool:
         ".update-" in name
         or ".git-update-" in name
         or ".metadata-update-" in name
+        or ".transaction-" in name
     )
 
 
@@ -2708,6 +2791,46 @@ def _safe_recovery_subdirectory(recovery_root: Path, relative_path: Path) -> Pat
     return path
 
 
+def recover_updates(skills_root: Path) -> list[TransactionOutcome]:
+    outcomes: list[TransactionOutcome] = []
+    if not skills_root.exists():
+        return outcomes
+    for transaction_root in sorted(skills_root.iterdir(), key=lambda path: path.name.casefold()):
+        if not _looks_like_transaction_name(transaction_root.name):
+            continue
+        try:
+            _validate_transaction_root(transaction_root, skills_root)
+            if not _looks_like_transaction_directory(transaction_root):
+                continue
+            transaction_type, state = _read_recovery_state(
+                transaction_root,
+                skills_root,
+            )
+            skill_dir = Path(state["skillDir"])
+            with skill_update_lock(skill_dir):
+                outcome = _recover_decoded_transaction_locked(
+                    transaction_root,
+                    transaction_type,
+                    state,
+                )
+            outcomes.append(outcome)
+        except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+            outcomes.append(
+                TransactionOutcome(
+                    name=_transaction_skill_name_hint(transaction_root),
+                    status="error",
+                    installed_state="uncertain",
+                    applied=False,
+                    action="none",
+                    error_message=(
+                        f"Recovery is uncertain for Diagnostic Journal {transaction_root}: {exc}"
+                    ),
+                    diagnostic_journal=transaction_root,
+                )
+            )
+    return outcomes
+
+
 def recover_incomplete_skill_transactions(skills_root: Path) -> None:
     if not skills_root.exists():
         return
@@ -2723,21 +2846,18 @@ def recover_incomplete_skill_transactions(skills_root: Path) -> None:
                 f"Update transaction state is missing at {transaction_root}; "
                 "recovery data was preserved for manual inspection."
             )
-
-        transaction_type = _read_transaction_type(transaction_root)
-        state = _read_typed_transaction_state(
-            transaction_root,
-            skills_root,
-            transaction_type,
-        )
+        transaction_type, state = _read_recovery_state(transaction_root, skills_root)
         skill_dir = Path(state["skillDir"])
         with skill_update_lock(skill_dir):
-            if transaction_type == GIT_TRANSACTION_TYPE:
-                _recover_git_transaction_from_state(transaction_root, state)
-            elif transaction_type == SNAPSHOT_TRANSACTION_TYPE:
-                _recover_transaction_from_state(transaction_root, state)
-            else:
-                _recover_metadata_transaction_from_state(transaction_root, state)
+            outcome = _recover_decoded_transaction_locked(
+                transaction_root,
+                transaction_type,
+                state,
+            )
+            if outcome.installed_state == "uncertain":
+                raise AgentSkillUpdaterError(
+                    outcome.error_message or "Transaction recovery is uncertain."
+                )
 
 
 def _recover_skill_transactions_locked(skill_dir: Path) -> None:
@@ -2745,6 +2865,7 @@ def _recover_skill_transactions_locked(skill_dir: Path) -> None:
         f".{skill_dir.name}.update-",
         f".{skill_dir.name}.git-update-",
         f".{skill_dir.name}.metadata-update-",
+        f".{skill_dir.name}.transaction-",
     )
     for transaction_root in sorted(skill_dir.parent.iterdir(), key=lambda path: path.name.casefold()):
         if not transaction_root.name.startswith(prefixes):
@@ -2758,22 +2879,283 @@ def _recover_skill_transactions_locked(skill_dir: Path) -> None:
                     "recovery data was preserved for manual inspection."
                 )
             continue
-        transaction_type = _read_transaction_type(transaction_root)
-        state = _read_typed_transaction_state(
+        transaction_type, state = _read_recovery_state(
             transaction_root,
             skill_dir.parent,
-            transaction_type,
         )
         if not _same_path(Path(state["skillDir"]), skill_dir):
             raise AgentSkillUpdaterError(
                 f"Transaction {transaction_root} belongs to a different skill directory."
             )
-        if transaction_type == GIT_TRANSACTION_TYPE:
-            _recover_git_transaction_from_state(transaction_root, state)
-        elif transaction_type == SNAPSHOT_TRANSACTION_TYPE:
-            _recover_transaction_from_state(transaction_root, state)
-        else:
-            _recover_metadata_transaction_from_state(transaction_root, state)
+        outcome = _recover_decoded_transaction_locked(
+            transaction_root,
+            transaction_type,
+            state,
+        )
+        if outcome.installed_state == "uncertain":
+            raise AgentSkillUpdaterError(
+                outcome.error_message or "Transaction recovery is uncertain."
+            )
+
+
+def _read_recovery_state(
+    transaction_root: Path,
+    skills_root: Path,
+) -> tuple[str, dict]:
+    transaction_type = _read_transaction_type(transaction_root)
+    if transaction_type == COORDINATOR_TRANSACTION_TYPE:
+        state = _read_coordinator_transaction_state(transaction_root, skills_root)
+    else:
+        state = _read_typed_transaction_state(
+            transaction_root,
+            skills_root,
+            transaction_type,
+        )
+    return transaction_type, state
+
+
+def _recover_decoded_transaction_locked(
+    transaction_root: Path,
+    transaction_type: str,
+    state: dict,
+) -> TransactionOutcome:
+    if transaction_type in {COORDINATOR_TRANSACTION_TYPE, METADATA_TRANSACTION_TYPE}:
+        return _recover_metadata_journal_locked(
+            transaction_root,
+            state,
+            coordinator=transaction_type == COORDINATOR_TRANSACTION_TYPE,
+        )
+    original_phase = state["phase"]
+    if transaction_type == GIT_TRANSACTION_TYPE:
+        _recover_git_transaction_from_state(transaction_root, state)
+    else:
+        _recover_transaction_from_state(transaction_root, state)
+    return _legacy_recovery_outcome(state, original_phase)
+
+
+def _read_coordinator_transaction_state(
+    transaction_root: Path,
+    skills_root: Path,
+) -> dict:
+    try:
+        state_path = _transaction_file(
+            transaction_root,
+            TRANSACTION_STATE_FILENAME,
+            required=True,
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise AgentSkillUpdaterError(
+            f"Cannot read Transaction Coordinator journal at {transaction_root}: {exc}"
+        ) from exc
+    required = {
+        "version",
+        "transactionType",
+        "transactionKind",
+        "skillName",
+        "skillDir",
+        "phase",
+        "targetRevision",
+        "targetVersion",
+        "evidence",
+    }
+    if not isinstance(state, dict) or not required.issubset(state):
+        raise AgentSkillUpdaterError(
+            f"Incomplete Transaction Coordinator journal at {transaction_root}."
+        )
+    string_keys = required - {"version", "evidence"}
+    if not all(isinstance(state[key], str) for key in string_keys):
+        raise AgentSkillUpdaterError(
+            f"Invalid Transaction Coordinator journal at {transaction_root}."
+        )
+    if (
+        state["version"] != COORDINATOR_TRANSACTION_STATE_VERSION
+        or state["transactionType"] != COORDINATOR_TRANSACTION_TYPE
+        or state["transactionKind"] != METADATA_ONLY_TRANSACTION_KIND
+        or state["phase"] not in COORDINATOR_PHASES
+    ):
+        raise AgentSkillUpdaterError(
+            f"Unsupported Transaction Coordinator journal at {transaction_root}."
+        )
+    evidence = state["evidence"]
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "beforeMetadata",
+        "expectedMetadata",
+    }:
+        raise AgentSkillUpdaterError(
+            f"Invalid Transaction Evidence at {transaction_root}."
+        )
+    for label, record in evidence.items():
+        if not isinstance(record, dict) or set(record) != {"present", "sha256"}:
+            raise AgentSkillUpdaterError(
+                f"Invalid {label} Transaction Evidence at {transaction_root}."
+            )
+        if not isinstance(record["present"], bool):
+            raise AgentSkillUpdaterError(
+                f"Invalid {label} Transaction Evidence at {transaction_root}."
+            )
+        digest = record["sha256"]
+        if record["present"]:
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise AgentSkillUpdaterError(
+                    f"Invalid {label} Transaction Evidence at {transaction_root}."
+                )
+        elif digest is not None:
+            raise AgentSkillUpdaterError(
+                f"Invalid {label} Transaction Evidence at {transaction_root}."
+            )
+    skill_dir = Path(state["skillDir"])
+    if not _same_path(skill_dir.parent, skills_root):
+        raise AgentSkillUpdaterError(
+            f"Transaction {transaction_root} points outside skills root {skills_root}."
+        )
+    expected_prefix = f".{state['skillName']}.transaction-"
+    if skill_dir.name != state["skillName"] or not transaction_root.name.startswith(
+        expected_prefix
+    ):
+        raise AgentSkillUpdaterError(
+            f"Transaction identity mismatch at {transaction_root}."
+        )
+    return state
+
+
+def _recover_metadata_journal_locked(
+    transaction_root: Path,
+    state: dict,
+    *,
+    coordinator: bool,
+) -> TransactionOutcome:
+    normalized = _coordinator_metadata_state(state) if coordinator else state
+    skill_dir = Path(state["skillDir"])
+    _validate_skill_root(skill_dir)
+    original_content, expected_content = _read_verified_transaction_metadata_snapshots(
+        transaction_root,
+        normalized,
+    )
+    phase = state["phase"]
+    committed = (
+        phase == COORDINATOR_PHASE_COMMITTED
+        if coordinator
+        else phase == TRANSACTION_PHASE_COMMITTED
+    )
+    prepared = (
+        phase == COORDINATOR_PHASE_PREPARED
+        if coordinator
+        else phase == TRANSACTION_PHASE_PREPARED
+    )
+    rolled_back = (
+        phase == COORDINATOR_PHASE_ROLLED_BACK
+        if coordinator
+        else phase == TRANSACTION_PHASE_ROLLED_BACK
+    )
+    if committed:
+        _validate_transaction_metadata(skill_dir, normalized, expected=True)
+        try:
+            _remove_transaction_tree(transaction_root)
+        except (AgentSkillUpdaterError, OSError) as exc:
+            return TransactionOutcome(
+                name=state["skillName"],
+                status="error",
+                installed_state="committed",
+                applied=True,
+                action="metadata_refreshed",
+                version=state.get("targetVersion"),
+                error_message=(
+                    f"Committed metadata update is valid, but cleanup failed at "
+                    f"{transaction_root}: {exc}"
+                ),
+                cleanup_residue=transaction_root,
+            )
+        return TransactionOutcome(
+            name=state["skillName"],
+            status="recovered",
+            installed_state="committed",
+            applied=True,
+            action="metadata_refreshed",
+            version=state.get("targetVersion"),
+        )
+    if prepared:
+        _validate_transaction_metadata(skill_dir, normalized, expected=False)
+        _remove_transaction_tree(transaction_root)
+        return TransactionOutcome(
+            name=state["skillName"],
+            status="recovered",
+            installed_state="unchanged",
+            applied=False,
+            action="none",
+            version=state.get("targetVersion"),
+        )
+    if rolled_back:
+        _validate_transaction_metadata(skill_dir, normalized, expected=False)
+        _remove_transaction_tree(transaction_root)
+        return TransactionOutcome(
+            name=state["skillName"],
+            status="recovered",
+            installed_state="rolled_back",
+            applied=False,
+            action="none",
+            version=state.get("targetVersion"),
+        )
+
+    recovery_path = _rollback_transaction_metadata(
+        transaction_root,
+        normalized,
+        skill_dir / ".openskills.json",
+        original_content,
+        expected_content,
+    )
+    if recovery_path is not None:
+        return TransactionOutcome(
+            name=state["skillName"],
+            status="error",
+            installed_state="uncertain",
+            applied=False,
+            action="none",
+            version=state.get("targetVersion"),
+            error_message=(
+                f"Recovery could not prove the original Installed State; concurrent metadata "
+                f"was preserved at {recovery_path}."
+            ),
+            diagnostic_journal=transaction_root,
+        )
+    _validate_transaction_metadata(skill_dir, normalized, expected=False)
+    if coordinator:
+        _set_coordinator_phase(
+            transaction_root,
+            state,
+            COORDINATOR_PHASE_ROLLED_BACK,
+        )
+    _remove_transaction_tree(transaction_root)
+    return TransactionOutcome(
+        name=state["skillName"],
+        status="recovered",
+        installed_state="rolled_back",
+        applied=False,
+        action="none",
+        version=state.get("targetVersion"),
+    )
+
+
+def _legacy_recovery_outcome(state: dict, original_phase: str) -> TransactionOutcome:
+    committed = original_phase in {
+        TRANSACTION_PHASE_COMMITTED,
+        GIT_TRANSACTION_PHASE_COMMITTED,
+    }
+    return TransactionOutcome(
+        name=state["skillName"],
+        status="recovered",
+        installed_state="committed" if committed else "rolled_back",
+        applied=committed,
+        action="none",
+    )
+
+
+def _transaction_skill_name_hint(transaction_root: Path) -> str:
+    name = transaction_root.name.removeprefix(".")
+    for marker in (".transaction-", ".metadata-update-", ".git-update-", ".update-"):
+        if marker in name:
+            return name.split(marker, 1)[0]
+    return transaction_root.name
 
 
 def _recover_git_transaction_from_state(transaction_root: Path, state: dict) -> None:
@@ -3034,63 +3416,6 @@ def _recover_transaction_from_state(transaction_root: Path, state: dict) -> None
         )
 
 
-def _recover_metadata_transaction_from_state(transaction_root: Path, state: dict) -> None:
-    skill_dir = Path(state["skillDir"])
-    _validate_transaction_root(transaction_root, skill_dir.parent)
-    _validate_skill_root(skill_dir)
-    phase = state["phase"]
-    if phase in {TRANSACTION_PHASE_COMMITTED, TRANSACTION_PHASE_PREPARED}:
-        _validate_safe_metadata_path(skill_dir)
-        _remove_transaction_tree(transaction_root)
-        return
-
-    recovery_root = _safe_recovery_directory(
-        skill_dir,
-        transaction_root,
-        create=False,
-    )
-    if phase == TRANSACTION_PHASE_ROLLED_BACK:
-        if state.get("recoveryPath"):
-            _validate_safe_metadata_path(skill_dir)
-        else:
-            _validate_transaction_metadata(skill_dir, state, expected=False)
-        has_recovery_data = recovery_root is not None and any(recovery_root.iterdir())
-        _remove_transaction_tree(transaction_root)
-        if has_recovery_data:
-            raise AgentSkillUpdaterError(
-                f"Interrupted metadata refresh for '{skill_dir.name}' was rolled back; "
-                f"concurrent data was preserved at {recovery_root}."
-            )
-        return
-
-    original_metadata, expected_metadata = _read_verified_transaction_metadata_snapshots(
-        transaction_root,
-        state,
-    )
-    recovery_path = _rollback_transaction_metadata(
-        transaction_root,
-        state,
-        skill_dir / ".openskills.json",
-        original_metadata,
-        expected_metadata,
-    )
-    if recovery_path is None:
-        _validate_transaction_metadata(skill_dir, state, expected=False)
-    else:
-        state["recoveryPath"] = str(recovery_path)
-    _set_metadata_transaction_phase(
-        transaction_root,
-        state,
-        TRANSACTION_PHASE_ROLLED_BACK,
-    )
-    _remove_transaction_tree(transaction_root)
-    if recovery_path is not None:
-        raise AgentSkillUpdaterError(
-            f"Interrupted metadata refresh for '{skill_dir.name}' was rolled back; "
-            f"concurrent data was preserved at {recovery_path}."
-        )
-
-
 def _restore_payload_transaction(transaction_root: Path, state: dict) -> Optional[Path]:
     skill_dir = Path(state["skillDir"])
     original_dir = _transaction_subdirectory(transaction_root, "original")
@@ -3252,7 +3577,18 @@ def _commit_transaction_metadata(
     metadata_path: Path,
     content: bytes,
     expected_content: Optional[bytes],
+    *,
+    phase_owner: Optional[Callable[[Path, dict, str], None]] = None,
+    phase_names: Optional[dict[str, str]] = None,
 ) -> None:
+    set_phase = phase_owner or _set_transaction_metadata_phase
+    phases = phase_names or {
+        "capturing": METADATA_PHASE_CAPTURING,
+        "captured": METADATA_PHASE_CAPTURED,
+        "publishing": METADATA_PHASE_PUBLISHING,
+        "publish_failed": METADATA_PHASE_PUBLISH_FAILED,
+        "published": METADATA_PHASE_PUBLISHED,
+    }
     if expected_content is None:
         if os.path.lexists(metadata_path):
             raise AgentSkillUpdaterError(
@@ -3272,10 +3608,10 @@ def _commit_transaction_metadata(
         raise AgentSkillUpdaterError(
             f"Metadata capture path already exists in transaction: {displaced}"
         )
-    _set_transaction_metadata_phase(
+    set_phase(
         transaction_root,
         state,
-        METADATA_PHASE_CAPTURING,
+        phases["capturing"],
     )
     if expected_content is not None:
         os.replace(metadata_path, displaced)
@@ -3288,10 +3624,10 @@ def _commit_transaction_metadata(
             raise AgentSkillUpdaterError(
                 f"Concurrent write detected while replacing control file: {metadata_path}"
             )
-    _set_transaction_metadata_phase(
+    set_phase(
         transaction_root,
         state,
-        METADATA_PHASE_CAPTURED,
+        phases["captured"],
     )
 
     publish_source = _transaction_file(
@@ -3303,25 +3639,25 @@ def _commit_transaction_metadata(
         raise AgentSkillUpdaterError(
             f"Transaction metadata publish snapshot is invalid: {publish_source}"
         )
-    _set_transaction_metadata_phase(
+    set_phase(
         transaction_root,
         state,
-        METADATA_PHASE_PUBLISHING,
+        phases["publishing"],
     )
     try:
         published = _publish_metadata_file_if_absent(publish_source, metadata_path)
     except AgentSkillUpdaterError:
-        _set_transaction_metadata_phase(
+        set_phase(
             transaction_root,
             state,
-            METADATA_PHASE_PUBLISH_FAILED,
+            phases["publish_failed"],
         )
         raise
     if not published:
-        _set_transaction_metadata_phase(
+        set_phase(
             transaction_root,
             state,
-            METADATA_PHASE_PUBLISH_FAILED,
+            phases["publish_failed"],
         )
         raise AgentSkillUpdaterError(
             f"Concurrent write detected while publishing control file: {metadata_path}"
@@ -3335,10 +3671,10 @@ def _commit_transaction_metadata(
         raise AgentSkillUpdaterError(
             f"Published transaction metadata failed verification: {metadata_path}"
         )
-    _set_transaction_metadata_phase(
+    set_phase(
         transaction_root,
         state,
-        METADATA_PHASE_PUBLISHED,
+        phases["published"],
     )
 
 
@@ -3444,13 +3780,13 @@ def _set_transaction_metadata_phase(
     state.update(next_state)
 
 
-def _set_metadata_transaction_phase(
+def _set_coordinator_phase(
     transaction_root: Path,
     state: dict,
     phase: str,
 ) -> None:
-    if phase not in METADATA_TRANSACTION_PHASES:
-        raise AgentSkillUpdaterError(f"Invalid metadata transaction status: {phase}")
+    if phase not in COORDINATOR_PHASES:
+        raise AgentSkillUpdaterError(f"Invalid Transaction Coordinator phase: {phase}")
     next_state = {**state, "phase": phase}
     _write_json_atomic(transaction_root / TRANSACTION_STATE_FILENAME, next_state)
     state.clear()
@@ -3627,6 +3963,7 @@ def _read_transaction_type(transaction_root: Path) -> str:
         raise AgentSkillUpdaterError(f"Invalid update transaction state at {transaction_root}.")
     transaction_type = state.get("transactionType")
     if transaction_type in {
+        COORDINATOR_TRANSACTION_TYPE,
         GIT_TRANSACTION_TYPE,
         SNAPSHOT_TRANSACTION_TYPE,
         METADATA_TRANSACTION_TYPE,
@@ -3988,42 +4325,66 @@ def _parse_github_repo(repo_url: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
-def _refresh_metadata(
-    update: AgentSkillUpdate,
+def _apply_metadata_only_transaction_locked(
+    source: AgentSkillSource,
+    observation: RemoteObservation,
+    installed_base_version: str,
     commit_state_validator: Callable[[str], None],
-) -> bool:
-    commit_state_validator(update.installed_base_version)
-    metadata_snapshot, original_content = _require_remote_updates_enabled(
-        update.source,
-        update.installed_base_version,
+) -> TransactionOutcome:
+    update = AgentSkillUpdate(
+        source=source,
+        staged_dir=None,
+        status="up_to_date",
+        installed_base_version=installed_base_version,
+        local_version=_read_local_version(source),
+        remote_version=observation.version,
     )
-    metadata_path = update.source.metadata_path
+    commit_state_validator(installed_base_version)
+    metadata_snapshot, original_content = _require_remote_updates_enabled(
+        source,
+        installed_base_version,
+    )
+    metadata_path = source.metadata_path
     if metadata_path is None or metadata_snapshot is None or original_content is None:
         raise AgentSkillUpdaterError(
-            f"Remotely managed skill '{update.source.name}' requires canonical metadata."
+            f"Remotely managed skill '{source.name}' requires canonical metadata."
         )
     metadata, changed = _build_refreshed_metadata(update, metadata_snapshot)
     if not changed:
-        return False
+        return TransactionOutcome(
+            name=source.name,
+            status="up_to_date",
+            installed_state="unchanged",
+            applied=False,
+            action="none",
+            version=observation.version,
+        )
     expected_content = _json_payload_bytes(metadata)
     transaction_root = Path(
         tempfile.mkdtemp(
-            prefix=f".{update.source.name}.metadata-update-",
-            dir=update.source.local_dir.parent,
+            prefix=f".{source.name}.transaction-",
+            dir=source.local_dir.parent,
         )
     )
     state = {
-        "version": METADATA_TRANSACTION_STATE_VERSION,
-        "transactionType": METADATA_TRANSACTION_TYPE,
-        "skillName": update.source.name,
-        "skillDir": str(update.source.local_dir.resolve()),
-        "phase": TRANSACTION_PHASE_PREPARED,
-        "metadataPhase": METADATA_PHASE_PREPARED,
-        "originalMetadataPresent": True,
-        "originalMetadataSha256": _sha256_bytes(original_content),
-        "expectedMetadataPresent": True,
-        "expectedMetadataSha256": _sha256_bytes(expected_content),
-        "targetVersion": update.remote_version,
+        "version": COORDINATOR_TRANSACTION_STATE_VERSION,
+        "transactionType": COORDINATOR_TRANSACTION_TYPE,
+        "transactionKind": METADATA_ONLY_TRANSACTION_KIND,
+        "skillName": source.name,
+        "skillDir": str(source.local_dir.resolve()),
+        "phase": COORDINATOR_PHASE_PREPARED,
+        "targetRevision": observation.revision,
+        "targetVersion": observation.version,
+        "evidence": {
+            "beforeMetadata": {
+                "present": True,
+                "sha256": _sha256_bytes(original_content),
+            },
+            "expectedMetadata": {
+                "present": True,
+                "sha256": _sha256_bytes(expected_content),
+            },
+        },
     }
     try:
         _prepare_transaction_metadata_files(
@@ -4038,26 +4399,20 @@ def _refresh_metadata(
             _remove_transaction_tree(transaction_root)
         except (OSError, AgentSkillUpdaterError) as cleanup_exc:
             raise AgentSkillUpdaterError(
-                f"Unable to prepare metadata refresh for '{update.source.name}': {exc}. "
+                f"Unable to prepare metadata refresh for '{source.name}': {exc}. "
                 f"Temporary transaction cleanup also failed at {transaction_root}: {cleanup_exc}"
             ) from exc
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         raise AgentSkillUpdaterError(
-            f"Unable to prepare metadata refresh for '{update.source.name}': {exc}"
+            f"Unable to prepare metadata refresh for '{source.name}': {exc}"
         ) from exc
 
-    recovery_path: Optional[Path] = None
     try:
-        commit_state_validator(update.installed_base_version)
+        commit_state_validator(installed_base_version)
         _require_remote_updates_enabled(
-            update.source,
-            update.installed_base_version,
-        )
-        _set_metadata_transaction_phase(
-            transaction_root,
-            state,
-            GIT_TRANSACTION_PHASE_APPLYING,
+            source,
+            installed_base_version,
         )
         _commit_transaction_metadata(
             transaction_root,
@@ -4065,67 +4420,133 @@ def _refresh_metadata(
             metadata_path,
             expected_content,
             original_content,
+            phase_owner=_set_coordinator_phase,
+            phase_names=COORDINATOR_METADATA_PHASE_NAMES,
         )
-        _validate_transaction_metadata(update.source.local_dir, state, expected=True)
-        commit_state_validator(update.remote_version)
-        _set_metadata_transaction_phase(
+        normalized_state = _coordinator_metadata_state(state)
+        _validate_transaction_metadata(source.local_dir, normalized_state, expected=True)
+        commit_state_validator(observation.version)
+        _set_coordinator_phase(
             transaction_root,
             state,
-            TRANSACTION_PHASE_COMMITTED,
+            COORDINATOR_PHASE_COMMITTED,
         )
     except BaseException as exc:
-        if state["phase"] == TRANSACTION_PHASE_PREPARED:
-            _remove_transaction_tree(transaction_root)
-        else:
-            try:
-                recovery_path = _rollback_transaction_metadata(
-                    transaction_root,
-                    state,
-                    metadata_path,
-                    original_content,
-                    expected_content,
-                )
-                if recovery_path is None:
-                    _validate_transaction_metadata(
-                        update.source.local_dir,
-                        state,
-                        expected=False,
-                    )
-                else:
-                    state["recoveryPath"] = str(recovery_path)
-                _set_metadata_transaction_phase(
-                    transaction_root,
-                    state,
-                    TRANSACTION_PHASE_ROLLED_BACK,
-                )
-                _remove_transaction_tree(transaction_root)
-            except BaseException as rollback_exc:
-                raise AgentSkillUpdaterError(
-                    f"Metadata refresh failed for '{update.source.name}': {exc}. "
-                    f"Rollback also failed: {rollback_exc}. Recovery data remains at "
-                    f"{transaction_root}."
-                ) from exc
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
-        recovery_suffix = (
-            f" Concurrent metadata was preserved at {recovery_path}."
-            if recovery_path is not None
-            else ""
+        if state["phase"] == COORDINATOR_PHASE_PREPARED:
+            _remove_transaction_tree(transaction_root)
+            return TransactionOutcome(
+                name=source.name,
+                status="error",
+                installed_state="unchanged",
+                applied=False,
+                action="none",
+                version=observation.version,
+                error_message=f"Metadata refresh failed for '{source.name}': {exc}",
+            )
+        try:
+            normalized_state = _coordinator_metadata_state(state)
+            recovery_path = _rollback_transaction_metadata(
+                transaction_root,
+                normalized_state,
+                metadata_path,
+                original_content,
+                expected_content,
+            )
+            if recovery_path is not None:
+                return TransactionOutcome(
+                    name=source.name,
+                    status="error",
+                    installed_state="uncertain",
+                    applied=False,
+                    action="none",
+                    version=observation.version,
+                    error_message=(
+                        f"Metadata refresh failed for '{source.name}': {exc}. "
+                        f"Concurrent metadata was preserved at {recovery_path}."
+                    ),
+                    diagnostic_journal=transaction_root,
+                )
+            _validate_transaction_metadata(source.local_dir, normalized_state, expected=False)
+            _set_coordinator_phase(
+                transaction_root,
+                state,
+                COORDINATOR_PHASE_ROLLED_BACK,
+            )
+            _remove_transaction_tree(transaction_root)
+        except BaseException as rollback_exc:
+            return TransactionOutcome(
+                name=source.name,
+                status="error",
+                installed_state="uncertain",
+                applied=False,
+                action="none",
+                version=observation.version,
+                error_message=(
+                    f"Metadata refresh failed for '{source.name}': {exc}. "
+                    f"Rollback also failed: {rollback_exc}. Recovery data remains at "
+                    f"{transaction_root}."
+                ),
+                diagnostic_journal=transaction_root,
+            )
+        return TransactionOutcome(
+            name=source.name,
+            status="error",
+            installed_state="rolled_back",
+            applied=False,
+            action="none",
+            version=observation.version,
+            error_message=f"Metadata refresh failed for '{source.name}': {exc}",
         )
-        raise AgentSkillUpdaterError(
-            f"Metadata refresh failed for '{update.source.name}': {exc}.{recovery_suffix}"
-        ) from exc
 
     try:
         _remove_transaction_tree(transaction_root)
     except (OSError, AgentSkillUpdaterError) as cleanup_exc:
-        raise AgentSkillUpdateCommittedError(
-            f"Metadata refresh for '{update.source.name}' committed, but transaction cleanup "
-            f"failed at {transaction_root}: {cleanup_exc}",
+        return TransactionOutcome(
+            name=source.name,
+            status="error",
+            installed_state="committed",
+            applied=True,
             action="metadata_refreshed",
-            version=update.remote_version,
-        ) from cleanup_exc
-    return True
+            version=observation.version,
+            error_message=(
+                f"Metadata refresh for '{source.name}' committed, but transaction cleanup "
+                f"failed at {transaction_root}: {cleanup_exc}"
+            ),
+            cleanup_residue=transaction_root,
+        )
+    return TransactionOutcome(
+        name=source.name,
+        status="up_to_date",
+        installed_state="committed",
+        applied=True,
+        action="metadata_refreshed",
+        version=observation.version,
+    )
+
+
+def _coordinator_metadata_state(state: dict) -> dict:
+    evidence = state["evidence"]
+    before = evidence["beforeMetadata"]
+    expected = evidence["expectedMetadata"]
+    phase_map = {
+        COORDINATOR_PHASE_PREPARED: METADATA_PHASE_PREPARED,
+        COORDINATOR_PHASE_CAPTURING_METADATA: METADATA_PHASE_CAPTURING,
+        COORDINATOR_PHASE_METADATA_CAPTURED: METADATA_PHASE_CAPTURED,
+        COORDINATOR_PHASE_PUBLISHING_METADATA: METADATA_PHASE_PUBLISHING,
+        COORDINATOR_PHASE_METADATA_PUBLISH_FAILED: METADATA_PHASE_PUBLISH_FAILED,
+        COORDINATOR_PHASE_METADATA_PUBLISHED: METADATA_PHASE_PUBLISHED,
+        COORDINATOR_PHASE_COMMITTED: METADATA_PHASE_PUBLISHED,
+        COORDINATOR_PHASE_ROLLED_BACK: METADATA_PHASE_CAPTURED,
+    }
+    return {
+        "metadataPhase": phase_map[state["phase"]],
+        "originalMetadataPresent": before["present"],
+        "originalMetadataSha256": before["sha256"],
+        "expectedMetadataPresent": expected["present"],
+        "expectedMetadataSha256": expected["sha256"],
+    }
 
 
 def _build_refreshed_metadata(

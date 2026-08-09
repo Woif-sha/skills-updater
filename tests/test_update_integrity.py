@@ -1636,9 +1636,18 @@ class PayloadIntegrityTests(unittest.TestCase):
                         return_value=updater.EntryProbe("up_to_date", full_sha[:12], full_sha),
                     ):
                         with mock.patch(
-                            "scripts.update_agent_skills.refresh_skill_metadata_version",
-                            return_value=True,
-                        ) as refresh:
+                            "scripts.update_agent_skills.apply_observed_update",
+                            return_value=SimpleNamespace(
+                                status="up_to_date",
+                                installed_state="committed",
+                                applied=True,
+                                action="metadata_refreshed",
+                                version=full_sha,
+                                error_message=None,
+                                diagnostic_journal=None,
+                                cleanup_residue=None,
+                            ),
+                        ) as apply_observed:
                             with mock.patch("scripts.update_agent_skills.resolve_skill_update") as resolve:
                                 with self.assertRaises(SystemExit) as exit_info:
                                     with redirect_stdout(stdout):
@@ -1649,7 +1658,8 @@ class PayloadIntegrityTests(unittest.TestCase):
         self.assertEqual(payload[0]["action"], "metadata_refreshed")
         self.assertEqual(payload[0]["installed_base_version"], full_sha)
         self.assertEqual(payload[0]["local_version"], full_sha)
-        refresh.assert_called_once()
+        self.assertEqual(payload[0]["installed_state"], "committed")
+        apply_observed.assert_called_once()
         resolve.assert_not_called()
 
     def test_snapshot_metadata_refresh_preserves_concurrent_local_only_write(self):
@@ -1687,17 +1697,17 @@ class PayloadIntegrityTests(unittest.TestCase):
                 entry_type="single-skill",
             )
             concurrent = b'{"updatePolicy":"local-only","concurrent":true}'
-            real_set_phase = updater._set_transaction_metadata_phase
+            real_set_phase = updater._set_coordinator_phase
             injected = {"value": False}
 
             def inject_concurrent_write(transaction_root, state, phase):
                 real_set_phase(transaction_root, state, phase)
-                if phase == updater.METADATA_PHASE_CAPTURING and not injected["value"]:
+                if phase == updater.COORDINATOR_PHASE_CAPTURING_METADATA and not injected["value"]:
                     metadata_path.write_bytes(concurrent)
                     injected["value"] = True
 
             with mock.patch(
-                "scripts.agent_skill_updater._set_transaction_metadata_phase",
+                "scripts.agent_skill_updater._set_coordinator_phase",
                 side_effect=inject_concurrent_write,
             ):
                 with self.assertRaisesRegex(updater.AgentSkillUpdaterError, "Concurrent write"):
@@ -1815,7 +1825,7 @@ class PayloadIntegrityTests(unittest.TestCase):
                 json.loads(metadata_path.read_text(encoding="utf-8"))["installedBaseVersion"],
                 remote,
             )
-            transactions = list(skills_root.glob(".demo.metadata-update-*"))
+            transactions = list(skills_root.glob(".demo.transaction-*"))
             self.assertEqual(len(transactions), 1)
             updater.recover_incomplete_skill_transactions(skills_root)
             self.assertFalse(transactions[0].exists())
@@ -1920,7 +1930,7 @@ class PayloadIntegrityTests(unittest.TestCase):
                 entry_type="single-skill",
             )
             real_link = os.link
-            real_set_phase = updater._set_transaction_metadata_phase
+            real_set_phase = updater._set_coordinator_phase
             injected = {"value": False}
             phases = []
 
@@ -1943,7 +1953,7 @@ class PayloadIntegrityTests(unittest.TestCase):
                 side_effect=fail_first_publish_link,
             ):
                 with mock.patch(
-                    "scripts.agent_skill_updater._set_transaction_metadata_phase",
+                    "scripts.agent_skill_updater._set_coordinator_phase",
                     side_effect=record_phase,
                 ):
                     with self.assertRaisesRegex(
@@ -1953,9 +1963,9 @@ class PayloadIntegrityTests(unittest.TestCase):
                         updater.refresh_skill_metadata_version(source, base, remote)
 
             self.assertTrue(injected["value"])
-            self.assertIn(updater.METADATA_PHASE_PUBLISH_FAILED, phases)
+            self.assertIn(updater.COORDINATOR_PHASE_METADATA_PUBLISH_FAILED, phases)
             self.assertEqual(metadata_path.read_bytes(), original)
-            self.assertEqual(list(skills_root.glob(".demo.metadata-update-*")), [])
+            self.assertEqual(list(skills_root.glob(".demo.transaction-*")), [])
 
     def test_metadata_rollback_read_failure_is_recovered_from_existing_capture(self):
         import scripts.agent_skill_updater as updater
@@ -2023,7 +2033,7 @@ class PayloadIntegrityTests(unittest.TestCase):
 
             self.assertTrue(injected["value"])
             self.assertFalse(metadata_path.exists())
-            transactions = list(skills_root.glob(".demo.metadata-update-*"))
+            transactions = list(skills_root.glob(".demo.transaction-*"))
             self.assertEqual(len(transactions), 1)
             self.assertEqual(len(list(transactions[0].glob("metadata.rollback-*"))), 1)
 
@@ -2288,7 +2298,9 @@ class PayloadIntegrityTests(unittest.TestCase):
 
         self.assertEqual(update_exit.exception.code, 1)
         self.assertEqual(check_exit.exception.code, 1)
-        self.assertEqual(json.loads(update_stdout.getvalue())[0]["status"], "error")
+        update_item = json.loads(update_stdout.getvalue())[0]
+        self.assertEqual(update_item["status"], "error")
+        self.assertEqual(update_item["installed_state"], "unchanged")
         self.assertEqual(json.loads(check_stdout.getvalue())[0]["status"], "error")
 
     def test_snapshot_resolution_stages_the_exact_probed_revision(self):
@@ -2893,17 +2905,17 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             metadata_path = self.write_metadata(local, remote, version[:12])
             source = self.source_for(local, metadata_path)
             concurrent = b'{"updatePolicy":"local-only","concurrent":true}'
-            real_set_phase = updater._set_transaction_metadata_phase
+            real_set_phase = updater._set_coordinator_phase
             injected = {"value": False}
 
             def inject_concurrent_write(transaction_root, state, phase):
                 real_set_phase(transaction_root, state, phase)
-                if phase == updater.METADATA_PHASE_CAPTURING and not injected["value"]:
+                if phase == updater.COORDINATOR_PHASE_CAPTURING_METADATA and not injected["value"]:
                     metadata_path.write_bytes(concurrent)
                     injected["value"] = True
 
             with mock.patch(
-                "scripts.agent_skill_updater._set_transaction_metadata_phase",
+                "scripts.agent_skill_updater._set_coordinator_phase",
                 side_effect=inject_concurrent_write,
             ):
                 with self.assertRaisesRegex(updater.AgentSkillUpdaterError, "Concurrent write"):
@@ -2924,8 +2936,8 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             changed_origin = str(root / "other.git")
             real_commit = updater._commit_transaction_metadata
 
-            def change_origin_after_publish(*args):
-                real_commit(*args)
+            def change_origin_after_publish(*args, **kwargs):
+                real_commit(*args, **kwargs)
                 run_git(local, "config", "remote.origin.url", changed_origin)
 
             with mock.patch(
@@ -2941,7 +2953,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version)
             self.assertEqual(metadata_path.read_bytes(), original_metadata)
             self.assertEqual(run_git(local, "config", "--get", "remote.origin.url"), changed_origin)
-            self.assertEqual(list(local.parent.glob(".demo.metadata-update-*")), [])
+            self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
 
     def test_clean_behind_fast_forwards_without_damaging_repository(self):
         from scripts.agent_skill_updater import update_git_worktree_skill
