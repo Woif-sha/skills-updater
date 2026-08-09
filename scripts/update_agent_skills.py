@@ -13,6 +13,8 @@ from typing import Optional
 if __package__:
     from .agent_skill_updater import (
         LOCAL_ONLY_UPDATE_POLICY,
+        AgentSkillSource,
+        AgentSkillRecoveryUncertainError,
         AgentSkillUpdateCommittedError,
         AgentSkillUpdaterError,
         RemoteObservation,
@@ -35,6 +37,8 @@ else:
     sys.path.insert(0, str(Path(__file__).parent))
     from agent_skill_updater import (  # noqa: E402
         LOCAL_ONLY_UPDATE_POLICY,
+        AgentSkillSource,
+        AgentSkillRecoveryUncertainError,
         AgentSkillUpdateCommittedError,
         AgentSkillUpdaterError,
         RemoteObservation,
@@ -92,7 +96,25 @@ def main() -> None:
     if args.lang:
         get_i18n(args.lang)
 
-    registry = sync_registry()
+    try:
+        registry = sync_registry()
+    except AgentSkillRecoveryUncertainError as exc:
+        outcome = exc.outcome
+        item = {
+            "name": outcome.name,
+            "entry_type": "recovery",
+            "status": "error",
+            "error_message": outcome.error_message,
+            "applied": outcome.applied,
+            "action": outcome.action,
+            "installed_state": outcome.installed_state,
+            "diagnostic_journal": str(outcome.diagnostic_journal),
+        }
+        if args.json:
+            print(json.dumps([item], indent=2, ensure_ascii=False))
+        else:
+            print(f"Error: {outcome.error_message}", file=sys.stderr)
+        raise SystemExit(1)
     payload: list[dict[str, object]] = []
     updated_names: list[str] = []
     backup_root: Path | None = None
@@ -153,7 +175,17 @@ def main() -> None:
                     item["error_message"] = result.error_message
                     item["applied"] = result.applied
                     item["action"] = result.action
-                    item["installed_state"] = "committed" if result.applied else "unchanged"
+                    item["installed_state"] = getattr(
+                        result,
+                        "installed_state",
+                        "committed" if result.applied else "unchanged",
+                    )
+                    diagnostic_journal = getattr(result, "diagnostic_journal", None)
+                    if diagnostic_journal is not None:
+                        item["diagnostic_journal"] = str(diagnostic_journal)
+                    cleanup_residue = getattr(result, "cleanup_residue", None)
+                    if cleanup_residue is not None:
+                        item["cleanup_residue"] = str(cleanup_residue)
                     if result.action in {"metadata_refreshed", "fast_forwarded"}:
                         item["installed_base_version"] = result.remote_version
                     if result.applied:
@@ -167,18 +199,12 @@ def main() -> None:
                     and probe.local_version != probe.remote_version
                     and versions_match(probe.local_version, probe.remote_version)
                 ):
-                    outcome = apply_observed_update(
+                    outcome = _apply_metadata_observation(
+                        item,
                         source,
-                        RemoteObservation(
-                            revision=probe.remote_version,
-                            version=probe.remote_version,
-                        ),
-                        installed_base_version=str(entry["installedBaseVersion"]),
+                        str(entry["installedBaseVersion"]),
+                        probe.remote_version,
                     )
-                    _apply_transaction_outcome(item, outcome)
-                    if outcome.version is not None and outcome.installed_state == "committed":
-                        item["installed_base_version"] = outcome.version
-                        item["local_version"] = outcome.version
                     if outcome.applied:
                         updated_names.append(name)
                     payload.append(item)
@@ -206,24 +232,24 @@ def main() -> None:
                     item["backup_root"] = str(backup_root)
                     updated_names.append(name)
                 elif resolved.status == "up_to_date" and resolved_remote_version:
-                    outcome = apply_observed_update(
+                    outcome = _apply_metadata_observation(
+                        item,
                         source,
-                        RemoteObservation(
-                            revision=resolved_remote_version,
-                            version=resolved_remote_version,
+                        resolved.installed_base_version,
+                        resolved_remote_version,
+                        remote_revision=(
+                            getattr(resolved, "remote_revision", None)
+                            or resolved_remote_version
                         ),
-                        installed_base_version=resolved.installed_base_version,
                     )
-                    _apply_transaction_outcome(item, outcome)
                     item["remote_version"] = resolved_remote_version
-                    if outcome.version is not None and outcome.installed_state == "committed":
-                        item["installed_base_version"] = outcome.version
-                        item["local_version"] = outcome.version
                     if outcome.applied:
                         updated_names.append(name)
                 else:
                     item["status"] = resolved.status
                     item["error_message"] = resolved.error_message
+            except AgentSkillRecoveryUncertainError as exc:
+                _apply_transaction_outcome(item, exc.outcome)
             except AgentSkillUpdateCommittedError as exc:
                 item["status"] = "error"
                 item["error_message"] = str(exc)
@@ -280,6 +306,20 @@ def main() -> None:
         update_registry_entries(
             registry_updates,
             Path(refreshed_registry["skillsRoot"]),
+        )
+    except AgentSkillRecoveryUncertainError as exc:
+        outcome = exc.outcome
+        payload.append(
+            {
+                "name": outcome.name,
+                "entry_type": "recovery",
+                "status": "error",
+                "error_message": outcome.error_message,
+                "applied": outcome.applied,
+                "action": outcome.action,
+                "installed_state": outcome.installed_state,
+                "diagnostic_journal": str(outcome.diagnostic_journal),
+            }
         )
     except (AgentSkillUpdaterError, OSError, ValueError) as exc:
         payload.append(
@@ -367,6 +407,30 @@ def _apply_transaction_outcome(
         item["diagnostic_journal"] = str(outcome.diagnostic_journal)
     if outcome.cleanup_residue is not None:
         item["cleanup_residue"] = str(outcome.cleanup_residue)
+
+
+def _apply_metadata_observation(
+    item: dict[str, object],
+    source: AgentSkillSource,
+    installed_base_version: str,
+    remote_version: str,
+    *,
+    remote_revision: Optional[str] = None,
+) -> TransactionOutcome:
+    outcome = apply_observed_update(
+        source,
+        RemoteObservation.from_source(
+            source,
+            revision=remote_revision or remote_version,
+            version=remote_version,
+        ),
+        installed_base_version=installed_base_version,
+    )
+    _apply_transaction_outcome(item, outcome)
+    if outcome.version is not None and outcome.installed_state == "committed":
+        item["installed_base_version"] = outcome.version
+        item["local_version"] = outcome.version
+    return outcome
 
 
 def _probe_entry(entry: dict) -> EntryProbe:

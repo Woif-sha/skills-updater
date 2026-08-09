@@ -76,6 +76,69 @@ class AgentSkillUpdaterTests(unittest.TestCase):
         openspec_stage.assert_called_once()
         git_stage.assert_not_called()
 
+    def test_resolve_generated_update_retains_exact_source_revision(self):
+        from scripts.agent_skill_updater import AgentSkillSource, resolve_skill_update
+
+        revision = "b" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local_dir = root / "skills" / "openspec-explore"
+            local_dir.mkdir(parents=True)
+            (local_dir / "SKILL.md").write_text(
+                "---\nname: openspec-explore\ngeneratedBy: 1.0.0\n---\nold\n",
+                encoding="utf-8",
+            )
+            metadata_path = local_dir / ".openskills.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "source": "Fission-AI/OpenSpec",
+                        "sourceType": "git-generated",
+                        "repoUrl": "https://github.com/Fission-AI/OpenSpec",
+                        "subpath": ".",
+                        "generator": "dist/core/shared/skill-generation.js",
+                        "workflowId": "explore",
+                        "installedBaseVersion": "1.0.0",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source = AgentSkillSource(
+                name="openspec-explore",
+                local_dir=local_dir,
+                source="Fission-AI/OpenSpec",
+                source_type="git-generated",
+                repo_url="https://github.com/Fission-AI/OpenSpec",
+                subpath=".",
+                generator="dist/core/shared/skill-generation.js",
+                workflow_id="explore",
+                metadata_path=metadata_path,
+                entry_type="single-skill",
+            )
+
+            def stage_generated(_source, stage_root, remote_version=None):
+                self.assertEqual(remote_version, revision)
+                staged = stage_root / "openspec-explore"
+                staged.mkdir(parents=True)
+                (staged / "SKILL.md").write_text(
+                    "---\nname: openspec-explore\ngeneratedBy: 2.0.0\n---\nnew\n",
+                    encoding="utf-8",
+                )
+                return staged
+
+            with mock.patch(
+                "scripts.agent_skill_updater.fetch_source_remote_version",
+                return_value=revision,
+            ):
+                with mock.patch(
+                    "scripts.agent_skill_updater.stage_remote_skill",
+                    side_effect=stage_generated,
+                ):
+                    update = resolve_skill_update(source, root / "stage")
+
+        self.assertEqual(update.remote_revision, revision)
+        self.assertEqual(update.remote_version, "2.0.0")
+
     def test_stage_remote_skill_requires_explicit_git_commit(self):
         from scripts.agent_skill_updater import (
             AgentSkillSource,

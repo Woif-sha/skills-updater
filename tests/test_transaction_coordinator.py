@@ -31,7 +31,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 with self.assertRaisesRegex(updater.AgentSkillUpdaterError, "local-only"):
                     updater.apply_observed_update(
                         source,
-                        updater.RemoteObservation(revision="b" * 40, version="b" * 40),
+                        updater.RemoteObservation.from_source(
+                            source, revision="b" * 40, version="b" * 40
+                        ),
                         installed_base_version="a" * 40,
                     )
 
@@ -77,7 +79,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 ):
                     updater.apply_observed_update(
                         source,
-                        updater.RemoteObservation(revision="b" * 40, version="b" * 40),
+                        updater.RemoteObservation.from_source(
+                            source, revision="b" * 40, version="b" * 40
+                        ),
                         installed_base_version="a" * 40,
                     )
 
@@ -125,7 +129,7 @@ class TransactionCoordinatorTests(unittest.TestCase):
 
             outcome = apply_observed_update(
                 source,
-                RemoteObservation(revision=remote, version=remote),
+                RemoteObservation.from_source(source, revision=remote, version=remote),
                 installed_base_version=base,
             )
 
@@ -139,6 +143,61 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 remote,
             )
             self.assertEqual(list(skills_root.glob(".demo.transaction-*")), [])
+
+    def test_generated_observation_keeps_revision_separate_from_version(self):
+        import scripts.agent_skill_updater as updater
+
+        revision = "b" * 40
+        version = "2.0.0"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            skill_dir = skills_root / "openspec-explore"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: openspec-explore\ngeneratedBy: 1.0.0\n---\n",
+                encoding="utf-8",
+            )
+            metadata_path = skill_dir / ".openskills.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "source": "Fission-AI/OpenSpec",
+                        "sourceType": "git-generated",
+                        "repoUrl": "https://github.com/Fission-AI/OpenSpec",
+                        "subpath": ".",
+                        "generator": "dist/core/shared/skill-generation.js",
+                        "workflowId": "explore",
+                        "installedBaseVersion": "1.0.0",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source = updater.load_agent_skill_source(skill_dir)
+
+            with mock.patch(
+                "scripts.agent_skill_updater._commit_transaction_metadata",
+                side_effect=KeyboardInterrupt,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    updater.apply_observed_update(
+                        source,
+                        updater.RemoteObservation.from_source(
+                            source,
+                            revision=revision,
+                            version=version,
+                        ),
+                        installed_base_version="1.0.0",
+                    )
+
+            transaction = next(skills_root.glob(".openspec-explore.transaction-*"))
+            state = json.loads((transaction / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["targetRevision"], revision)
+            self.assertEqual(state["targetVersion"], version)
+
+            outcomes = updater.recover_updates(skills_root)
+
+            self.assertEqual(outcomes[0].version, version)
+            self.assertEqual(outcomes[0].installed_state, "unchanged")
 
     def test_metadata_publish_failure_returns_verified_rollback(self):
         import scripts.agent_skill_updater as updater
@@ -188,7 +247,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
             ):
                 outcome = updater.apply_observed_update(
                     source,
-                    updater.RemoteObservation(revision=remote, version=remote),
+                    updater.RemoteObservation.from_source(
+                        source, revision=remote, version=remote
+                    ),
                     installed_base_version=base,
                 )
 
@@ -278,6 +339,29 @@ class TransactionCoordinatorTests(unittest.TestCase):
             self.assertEqual(outcomes[0].diagnostic_journal, transaction)
             self.assertTrue(transaction.exists())
 
+    def test_registry_recovery_maps_missing_coordinator_state_to_uncertain(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            skill_dir = skills_root / "demo"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+            transaction = skills_root / ".demo.transaction-missing-state"
+            transaction.mkdir()
+            (transaction / ".skills-updater-transaction").write_text(
+                "1\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(updater.AgentSkillRecoveryUncertainError) as error:
+                updater.recover_incomplete_skill_transactions(skills_root)
+
+            outcome = error.exception.outcome
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.diagnostic_journal, transaction)
+            self.assertTrue(transaction.exists())
+
     def test_interrupted_metadata_transaction_uses_single_phase_envelope(self):
         import scripts.agent_skill_updater as updater
 
@@ -311,21 +395,24 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 metadata_path,
                 entry_type="single-skill",
             )
-            real_set_phase = updater._set_coordinator_phase
-
-            def interrupt_after_durable_intent(transaction_root, state, phase):
-                real_set_phase(transaction_root, state, phase)
-                if phase == updater.COORDINATOR_PHASE_CAPTURING_METADATA:
-                    raise KeyboardInterrupt()
+            def interrupt_after_durable_intent(transaction_root, state, *_args, **_kwargs):
+                updater._set_coordinator_phase(
+                    transaction_root,
+                    state,
+                    updater.COORDINATOR_PHASE_CAPTURING_METADATA,
+                )
+                raise KeyboardInterrupt()
 
             with mock.patch(
-                "scripts.agent_skill_updater._set_coordinator_phase",
+                "scripts.agent_skill_updater._commit_transaction_metadata",
                 side_effect=interrupt_after_durable_intent,
             ):
                 with self.assertRaises(KeyboardInterrupt):
                     updater.apply_observed_update(
                         source,
-                        updater.RemoteObservation(revision=remote, version=remote),
+                        updater.RemoteObservation.from_source(
+                            source, revision=remote, version=remote
+                        ),
                         installed_base_version=base,
                     )
 
@@ -446,7 +533,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):
                     updater.apply_observed_update(
                         source,
-                        updater.RemoteObservation(revision=remote, version=remote),
+                        updater.RemoteObservation.from_source(
+                            source, revision=remote, version=remote
+                        ),
                         installed_base_version=base,
                     )
             transaction = next(skills_root.glob(".demo.transaction-*"))
@@ -524,6 +613,40 @@ class TransactionCoordinatorTests(unittest.TestCase):
         self.assertEqual(item["installed_state"], "committed")
         self.assertTrue(item["applied"])
         apply.assert_called_once()
+
+    def test_json_cli_preserves_uncertain_startup_recovery_journal(self):
+        import scripts.update_agent_skills as cli
+        from scripts.agent_skill_updater import (
+            AgentSkillRecoveryUncertainError,
+            TransactionOutcome,
+        )
+
+        journal = Path(r"C:\skills\.demo.transaction-damaged")
+        outcome = TransactionOutcome(
+            name="demo",
+            status="error",
+            installed_state="uncertain",
+            applied=False,
+            action="none",
+            error_message="Recovery evidence is damaged.",
+            diagnostic_journal=journal,
+        )
+        output = io.StringIO()
+
+        with mock.patch.object(sys, "argv", ["update_agent_skills.py", "--json"]):
+            with mock.patch.object(
+                cli,
+                "sync_registry",
+                side_effect=AgentSkillRecoveryUncertainError(outcome),
+            ):
+                with self.assertRaises(SystemExit) as exit_info:
+                    with redirect_stdout(output):
+                        cli.main()
+
+        self.assertEqual(exit_info.exception.code, 1)
+        item = json.loads(output.getvalue())[0]
+        self.assertEqual(item["installed_state"], "uncertain")
+        self.assertEqual(item["diagnostic_journal"], str(journal))
 
 
 if __name__ == "__main__":

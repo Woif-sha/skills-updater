@@ -281,8 +281,8 @@ class PayloadIntegrityTests(unittest.TestCase):
             )
             real_commit = updater._commit_transaction_metadata
 
-            def add_git_control(*args):
-                real_commit(*args)
+            def add_git_control(*args, **kwargs):
+                real_commit(*args, **kwargs)
                 (local / ".git").mkdir()
 
             with mock.patch(
@@ -781,7 +781,7 @@ class PayloadIntegrityTests(unittest.TestCase):
                 source, merged, "update_available", "a" * 40, "a" * 40, "b" * 40
             )
 
-            def fail_after_payload_is_installed(_path, _content, _expected_content):
+            def fail_after_payload_is_installed(*_args, **_kwargs):
                 self.assertEqual(
                     (local / "node" / "child.txt").read_text(encoding="utf-8"),
                     "new child\n",
@@ -2918,10 +2918,13 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._set_coordinator_phase",
                 side_effect=inject_concurrent_write,
             ):
-                with self.assertRaisesRegex(updater.AgentSkillUpdaterError, "Concurrent write"):
-                    updater.update_git_worktree_skill(source)
+                result = updater.update_git_worktree_skill(source)
 
             self.assertTrue(injected["value"])
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.installed_state, "uncertain")
+            self.assertIn("Concurrent write", result.error_message)
+            self.assertIsNotNone(result.diagnostic_journal)
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version)
             self.assertEqual(metadata_path.read_bytes(), concurrent)
 
@@ -2944,12 +2947,13 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._commit_transaction_metadata",
                 side_effect=change_origin_after_publish,
             ):
-                with self.assertRaisesRegex(
-                    updater.AgentSkillUpdaterError,
-                    "Metadata refresh failed",
-                ):
-                    updater.update_git_worktree_skill(self.source_for(local, metadata_path))
+                result = updater.update_git_worktree_skill(
+                    self.source_for(local, metadata_path)
+                )
 
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.installed_state, "rolled_back")
+            self.assertIn("Metadata refresh failed", result.error_message)
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version)
             self.assertEqual(metadata_path.read_bytes(), original_metadata)
             self.assertEqual(run_git(local, "config", "--get", "remote.origin.url"), changed_origin)
@@ -3222,8 +3226,8 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             original_metadata = metadata_path.read_bytes()
             source = self.source_for(local, metadata_path)
 
-            def fail_metadata_write(_path, _payload, _expected_content):
-                self.assertEqual(Path(_path), metadata_path)
+            def fail_metadata_write(_transaction, _state, path, *_args, **_kwargs):
+                self.assertEqual(Path(path), metadata_path)
                 self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
                 raise PermissionError("injected metadata failure")
 
