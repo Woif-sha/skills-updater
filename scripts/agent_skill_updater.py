@@ -1883,8 +1883,14 @@ def _stage_git_skill_at_ref(source: AgentSkillSource, stage_root: Path, ref: str
     normalized_ref = _require_git_commit(ref, f"Skill '{source.name}' staging")
     owner, repo = _parse_github_repo(source.repo_url)
     _require_remote_probe_ready(source)
-    repo_root = _download_repo_archive(owner, repo, normalized_ref, stage_root)
     normalized_subpath = normalize_skill_subpath(source.subpath)
+    repo_root = _download_repo_archive(
+        owner,
+        repo,
+        normalized_ref,
+        stage_root,
+        payload_subpath=normalized_subpath,
+    )
     skill_path = repo_root
     if normalized_subpath != ".":
         skill_path = repo_root.joinpath(*PurePosixPath(normalized_subpath).parts)
@@ -3897,7 +3903,14 @@ fs.writeFileSync(
     return destination
 
 
-def _download_repo_archive(owner: str, repo: str, ref: str, temp_root: Path) -> Path:
+def _download_repo_archive(
+    owner: str,
+    repo: str,
+    ref: str,
+    temp_root: Path,
+    *,
+    payload_subpath: str | None = None,
+) -> Path:
     commit = _require_git_commit(ref, f"Archive download for {owner}/{repo}")
     archive_url = f"https://codeload.github.com/{owner}/{repo}/zip/{commit}"
     request = urllib.request.Request(archive_url, headers={"User-Agent": DEFAULT_USER_AGENT})
@@ -3920,7 +3933,7 @@ def _download_repo_archive(owner: str, repo: str, ref: str, temp_root: Path) -> 
     extract_dir = temp_root / f"{repo}-{commit}"
     extract_dir.mkdir(parents=True, exist_ok=False)
     with zipfile.ZipFile(zip_path) as archive:
-        _validate_zip_members(archive, extract_dir)
+        _validate_zip_members(archive, extract_dir, payload_subpath=payload_subpath)
         archive.extractall(extract_dir)
 
     extracted_entries = list(extract_dir.iterdir())
@@ -3929,9 +3942,19 @@ def _download_repo_archive(owner: str, repo: str, ref: str, temp_root: Path) -> 
     return extracted_entries[0]
 
 
-def _validate_zip_members(archive: zipfile.ZipFile, extract_dir: Path) -> None:
+def _validate_zip_members(
+    archive: zipfile.ZipFile,
+    extract_dir: Path,
+    *,
+    payload_subpath: str | None = None,
+) -> None:
     seen: set[str] = set()
     root = extract_dir.resolve()
+    payload_parts = (
+        ()
+        if payload_subpath in {None, "."}
+        else PurePosixPath(payload_subpath).parts
+    )
     for member in archive.infolist():
         raw_name = member.filename
         relative = PurePosixPath(raw_name)
@@ -3961,7 +3984,12 @@ def _validate_zip_members(archive: zipfile.ZipFile, extract_dir: Path) -> None:
                 f"Archive path escapes the extraction root: {raw_name!r}"
             ) from exc
         file_type = (member.external_attr >> 16) & 0o170000
-        if file_type == stat.S_IFLNK:
+        member_parts = relative.parts[1:]
+        member_is_payload = (
+            not payload_parts
+            or member_parts[: len(payload_parts)] == payload_parts
+        )
+        if file_type == stat.S_IFLNK and member_is_payload:
             raise AgentSkillUpdaterError(f"Archive contains a symbolic link: {raw_name!r}")
 
 

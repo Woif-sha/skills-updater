@@ -1,5 +1,6 @@
 import json
 import io
+import stat
 import tempfile
 import unittest
 import zipfile
@@ -140,6 +141,76 @@ class AgentSkillUpdaterTests(unittest.TestCase):
             with mock.patch("scripts.agent_skill_updater.urllib.request.urlopen", return_value=response):
                 with self.assertRaisesRegex(AgentSkillUpdaterError, "unsafe path"):
                     _download_repo_archive("owner", "demo", commit, Path(temp_dir))
+
+    def test_stage_remote_skill_ignores_symlink_outside_selected_payload(self):
+        from scripts.agent_skill_updater import AgentSkillSource, stage_remote_skill
+
+        commit = "a" * 40
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as archive:
+            archive.writestr(
+                f"demo-{commit}/skills/selected/SKILL.md",
+                "---\nname: selected\n---\n",
+            )
+            symlink = zipfile.ZipInfo(f"demo-{commit}/AGENTS.md")
+            symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(symlink, "CLAUDE.md")
+
+        response = mock.MagicMock()
+        response.read.return_value = zip_buffer.getvalue()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local_dir = root / "installed" / "selected"
+            local_dir.parent.mkdir()
+            source = AgentSkillSource(
+                name="selected",
+                local_dir=local_dir,
+                source="owner/demo",
+                source_type="git",
+                repo_url="https://github.com/owner/demo",
+                subpath="skills/selected",
+                generator=None,
+                workflow_id=None,
+                entry_type="single-skill",
+            )
+            with mock.patch("scripts.agent_skill_updater.urllib.request.urlopen", return_value=response):
+                staged = stage_remote_skill(source, root / "stage", remote_version=commit)
+
+            self.assertTrue((staged / "SKILL.md").is_file())
+            self.assertFalse((staged / "AGENTS.md").exists())
+
+    def test_download_repo_archive_rejects_symlink_inside_selected_payload(self):
+        from scripts.agent_skill_updater import AgentSkillUpdaterError, _download_repo_archive
+
+        commit = "a" * 40
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w") as archive:
+            archive.writestr(
+                f"demo-{commit}/skills/selected/SKILL.md",
+                "---\nname: selected\n---\n",
+            )
+            symlink = zipfile.ZipInfo(f"demo-{commit}/skills/selected/rules.md")
+            symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(symlink, "../../shared/rules.md")
+
+        response = mock.MagicMock()
+        response.read.return_value = zip_buffer.getvalue()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch("scripts.agent_skill_updater.urllib.request.urlopen", return_value=response):
+                with self.assertRaisesRegex(AgentSkillUpdaterError, "symbolic link"):
+                    _download_repo_archive(
+                        "owner",
+                        "demo",
+                        commit,
+                        Path(temp_dir),
+                        payload_subpath="skills/selected",
+                    )
 
     def test_resolve_command_uses_exact_path_resolution_on_windows(self):
         import scripts.agent_skill_updater as updater

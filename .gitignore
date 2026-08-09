@@ -6,3 +6,7 @@ __pycache__/
 htmlcov/
 .DS_Store
 .openskills.json
+/AGENTS.md
+/CONTEXT.md
+/docs/agents/
+/scripts/prototypes/
