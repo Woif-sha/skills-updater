@@ -77,7 +77,11 @@ class AgentSkillUpdaterTests(unittest.TestCase):
         git_stage.assert_not_called()
 
     def test_resolve_generated_update_retains_exact_source_revision(self):
-        from scripts.agent_skill_updater import AgentSkillSource, resolve_skill_update
+        from scripts.agent_skill_updater import (
+            AgentSkillSource,
+            fetch_source_remote_observation,
+            resolve_skill_update,
+        )
 
         revision = "b" * 40
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -127,17 +131,29 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                 return staged
 
             with mock.patch(
-                "scripts.agent_skill_updater.fetch_source_remote_version",
+                "scripts.agent_skill_updater._fetch_remote_commit_sha",
                 return_value=revision,
-            ):
+            ) as fetch_revision:
                 with mock.patch(
-                    "scripts.agent_skill_updater.stage_remote_skill",
-                    side_effect=stage_generated,
-                ):
-                    update = resolve_skill_update(source, root / "stage")
+                    "scripts.agent_skill_updater._fetch_remote_package_version_at_revision",
+                    return_value="2.0.0",
+                ) as fetch_version:
+                    observation = fetch_source_remote_observation(source)
+                    with mock.patch(
+                        "scripts.agent_skill_updater.stage_remote_skill",
+                        side_effect=stage_generated,
+                    ):
+                        update = resolve_skill_update(
+                            source,
+                            root / "stage",
+                            observation,
+                        )
 
-        self.assertEqual(update.remote_revision, revision)
+        self.assertIs(update.remote_observation, observation)
+        self.assertEqual(update.remote_observation.revision, revision)
         self.assertEqual(update.remote_version, "2.0.0")
+        fetch_revision.assert_called_once()
+        fetch_version.assert_called_once()
 
     def test_stage_remote_skill_requires_explicit_git_commit(self):
         from scripts.agent_skill_updater import (
@@ -396,13 +412,22 @@ class AgentSkillUpdaterTests(unittest.TestCase):
             installed_base_version="old123456789",
             local_version="old123456789",
             remote_version="new123456789",
+            remote_observation=SimpleNamespace(
+                revision="new123456789",
+                version="new123456789",
+            ),
         )
         with mock.patch.object(updater.sys, "argv", ["update_agent_skills.py", "--skill", "demo-skill", "--json"]):
             with mock.patch("scripts.update_agent_skills.sync_registry", side_effect=[registry, registry]):
                 with mock.patch("scripts.update_agent_skills.update_registry_entries"):
                     with mock.patch(
                         "scripts.update_agent_skills._probe_entry",
-                        return_value=updater.EntryProbe("update_available", "old123456789", "new123456789"),
+                        return_value=updater.EntryProbe(
+                            "update_available",
+                            "old123456789",
+                            "new123456789",
+                            remote_observation=resolved.remote_observation,
+                        ),
                     ):
                         with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
                             with mock.patch("scripts.update_agent_skills.make_backup_root", return_value=Path(r"C:\backup-root")):
@@ -450,6 +475,10 @@ class AgentSkillUpdaterTests(unittest.TestCase):
             installed_base_version="old123456789",
             local_version="old123456789",
             remote_version="new123456789",
+            remote_observation=SimpleNamespace(
+                revision="new123456789",
+                version="new123456789",
+            ),
         )
         stdout = io.StringIO()
         with mock.patch.object(updater.sys, "argv", ["update_agent_skills.py", "--skill", "demo-skill", "--json"]):
@@ -457,7 +486,12 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                 with mock.patch("scripts.update_agent_skills.update_registry_entries"):
                     with mock.patch(
                         "scripts.update_agent_skills._probe_entry",
-                        return_value=updater.EntryProbe("update_available", "old123456789", "new123456789"),
+                        return_value=updater.EntryProbe(
+                            "update_available",
+                            "old123456789",
+                            "new123456789",
+                            remote_observation=resolved.remote_observation,
+                        ),
                     ):
                         with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
                             with mock.patch(
@@ -522,6 +556,9 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                 error_message=None,
                 applied=True,
                 action="fast_forwarded",
+                installed_state="committed",
+                diagnostic_journal=None,
+                cleanup_residue=None,
             )
             stdout = io.StringIO()
             with mock.patch.object(

@@ -1391,7 +1391,12 @@ class PayloadIntegrityTests(unittest.TestCase):
                 with mock.patch("scripts.update_agent_skills.update_registry_entries"):
                     with mock.patch(
                         "scripts.update_agent_skills._probe_entry",
-                        return_value=updater.EntryProbe("update_available", "a" * 40, "b" * 40),
+                        return_value=updater.EntryProbe(
+                            "update_available",
+                            "a" * 40,
+                            "b" * 40,
+                            remote_observation=mock.sentinel.remote_observation,
+                        ),
                     ):
                         with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
                             with mock.patch(
@@ -1464,6 +1469,7 @@ class PayloadIntegrityTests(unittest.TestCase):
                             "update_available",
                             version_a,
                             version_b,
+                            remote_observation=mock.sentinel.remote_observation,
                         ),
                     ):
                         with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
@@ -1512,7 +1518,10 @@ class PayloadIntegrityTests(unittest.TestCase):
         }
         with mock.patch("scripts.check_updates.fetch_source_remote_version", return_value=full_sha):
             checked = checker._entry_to_skill_info(entry)
-        with mock.patch("scripts.update_agent_skills.fetch_source_remote_version", return_value=full_sha):
+        with mock.patch(
+            "scripts.update_agent_skills.fetch_source_remote_observation",
+            return_value=SimpleNamespace(version=full_sha),
+        ):
             probed = updater._probe_entry(entry)
 
         self.assertEqual(checked.status, checker.UpdateStatus.UP_TO_DATE)
@@ -1633,7 +1642,12 @@ class PayloadIntegrityTests(unittest.TestCase):
                 with mock.patch("scripts.update_agent_skills.update_registry_entries"):
                     with mock.patch(
                         "scripts.update_agent_skills._probe_entry",
-                        return_value=updater.EntryProbe("up_to_date", full_sha[:12], full_sha),
+                        return_value=updater.EntryProbe(
+                            "up_to_date",
+                            full_sha[:12],
+                            full_sha,
+                            remote_observation=mock.sentinel.remote_observation,
+                        ),
                     ):
                         with mock.patch(
                             "scripts.update_agent_skills.apply_observed_update",
@@ -2205,6 +2219,9 @@ class PayloadIntegrityTests(unittest.TestCase):
             error_message=None,
             applied=True,
             action="metadata_refreshed",
+            installed_state="committed",
+            diagnostic_journal=None,
+            cleanup_residue=None,
         )
         stdout = io.StringIO()
         with mock.patch.object(
@@ -2304,7 +2321,11 @@ class PayloadIntegrityTests(unittest.TestCase):
         self.assertEqual(json.loads(check_stdout.getvalue())[0]["status"], "error")
 
     def test_snapshot_resolution_stages_the_exact_probed_revision(self):
-        from scripts.agent_skill_updater import AgentSkillSource, resolve_skill_update
+        from scripts.agent_skill_updater import (
+            AgentSkillSource,
+            RemoteObservation,
+            resolve_skill_update,
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2333,15 +2354,20 @@ class PayloadIntegrityTests(unittest.TestCase):
             )
             remote_sha = "a" * 40
 
+            observation = RemoteObservation.from_source(
+                source,
+                revision=remote_sha,
+                version=remote_sha,
+            )
             with mock.patch(
-                "scripts.agent_skill_updater._fetch_remote_commit_sha",
-                return_value=remote_sha,
-            ):
-                with mock.patch(
-                    "scripts.agent_skill_updater._stage_git_skill_at_ref",
-                    return_value=remote,
-                ) as stage:
-                    result = resolve_skill_update(source, root / "stage")
+                "scripts.agent_skill_updater._stage_git_skill_at_ref",
+                return_value=remote,
+            ) as stage:
+                result = resolve_skill_update(
+                    source,
+                    root / "stage",
+                    observation,
+                )
 
             self.assertEqual(result.status, "up_to_date")
             self.assertEqual(result.remote_version, remote_sha)
@@ -2580,7 +2606,7 @@ class PayloadIntegrityTests(unittest.TestCase):
         ):
             info = _entry_to_skill_info(entry)
         with mock.patch(
-            "scripts.update_agent_skills.fetch_source_remote_version",
+            "scripts.update_agent_skills.fetch_source_remote_observation",
             side_effect=AgentSkillUpdaterError("remote unavailable"),
         ):
             probe = _probe_entry(entry)

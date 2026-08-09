@@ -200,7 +200,7 @@ class AgentSkillUpdate:
     local_version: str
     remote_version: Optional[str]
     error_message: Optional[str] = None
-    remote_revision: Optional[str] = None
+    remote_observation: Optional["RemoteObservation"] = None
 
 
 @dataclass
@@ -641,7 +641,11 @@ def stage_remote_skill(
     return _stage_git_skill_at_ref(source, stage_root, remote_version)
 
 
-def resolve_skill_update(source: AgentSkillSource, stage_root: Path) -> AgentSkillUpdate:
+def resolve_skill_update(
+    source: AgentSkillSource,
+    stage_root: Path,
+    observation: Optional[RemoteObservation] = None,
+) -> AgentSkillUpdate:
     if _is_local_only_source(source):
         local_version = _read_local_only_version(source)
         return AgentSkillUpdate(
@@ -652,33 +656,43 @@ def resolve_skill_update(source: AgentSkillSource, stage_root: Path) -> AgentSki
             local_version=local_version,
             remote_version=None,
         )
-    _require_remote_updates_enabled(source)
-    installed_base_version = _read_installed_base_version(source)
-    _require_remote_updates_enabled(source, installed_base_version)
     if is_git_worktree_skill(source.local_dir):
         raise AgentSkillUpdaterError(
             f"Skill '{source.name}' is a Git worktree and must use the dedicated Git update path."
         )
+    if observation is None:
+        raise AgentSkillUpdaterError(
+            f"Skill '{source.name}' requires an explicit Remote Observation."
+        )
+    _validate_remote_observation(source, observation)
+    _require_remote_updates_enabled(source)
+    installed_base_version = _read_installed_base_version(source)
+    _require_remote_updates_enabled(source, installed_base_version)
     local_version = _read_local_version(source)
-    remote_revision: Optional[str] = None
-
     try:
         if source.source_type == "git-generated" and _is_openspec_source(source):
-            remote_revision = fetch_source_remote_version(source)
             _require_remote_updates_enabled(source, installed_base_version)
-            staged_dir = stage_remote_skill(source, stage_root, remote_revision)
+            staged_dir = stage_remote_skill(source, stage_root, observation.revision)
             remote_version = _read_generated_by_version(staged_dir / "SKILL.md")
             if not remote_version:
                 raise AgentSkillUpdaterError(
                     f"Generated skill '{source.name}' has no generatedBy version."
                 )
+            if remote_version != observation.version:
+                raise AgentSkillUpdaterError(
+                    f"Generated skill '{source.name}' version does not match its observed "
+                    f"source revision: {remote_version} != {observation.version}."
+                )
         elif source.repo_url:
-            remote_version = fetch_source_remote_version(source)
-            remote_revision = remote_version
+            remote_version = observation.version
             _require_remote_updates_enabled(source, installed_base_version)
             if not remote_version:
                 raise AgentSkillUpdaterError(f"Unable to resolve the remote commit for '{source.name}'.")
-            staged_dir = _stage_git_skill_at_ref(source, stage_root, remote_version)
+            staged_dir = _stage_git_skill_at_ref(
+                source,
+                stage_root,
+                observation.revision,
+            )
         else:
             raise AgentSkillUpdaterError(f"Skill '{source.name}' is missing repo metadata.")
 
@@ -708,7 +722,7 @@ def resolve_skill_update(source: AgentSkillSource, stage_root: Path) -> AgentSki
         installed_base_version=installed_base_version,
         local_version=local_version,
         remote_version=remote_version,
-        remote_revision=remote_revision,
+        remote_observation=observation,
     )
 
 
@@ -785,14 +799,7 @@ def apply_observed_update(
         raise AgentSkillUpdaterError(
             f"Skill '{source.name}' requires an explicit Remote Observation."
         )
-    if observation.source_contract != _source_contract(source):
-        raise AgentSkillUpdaterError(
-            f"Remote Observation source contract does not match Skill '{source.name}'."
-        )
-    if not re.fullmatch(r"[0-9a-fA-F]{40}", observation.revision):
-        raise AgentSkillUpdaterError(
-            f"Remote Observation for '{source.name}' requires an exact full revision."
-        )
+    _validate_remote_observation(source, observation)
     _require_remote_updates_enabled(source, installed_base_version)
     commit_state_validator = _metadata_commit_state_validator(source, observation)
     commit_state_validator(installed_base_version)
@@ -862,6 +869,20 @@ def _source_contract(source: AgentSkillSource) -> SourceContract:
     )
 
 
+def _validate_remote_observation(
+    source: AgentSkillSource,
+    observation: RemoteObservation,
+) -> None:
+    if observation.source_contract != _source_contract(source):
+        raise AgentSkillUpdaterError(
+            f"Remote Observation source contract does not match Skill '{source.name}'."
+        )
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", observation.revision):
+        raise AgentSkillUpdaterError(
+            f"Remote Observation for '{source.name}' requires an exact full revision."
+        )
+
+
 def _metadata_commit_state_validator(
     source: AgentSkillSource,
     observation: RemoteObservation,
@@ -929,28 +950,30 @@ def fetch_remote_commit_sha(repo_url: str) -> str:
     return _fetch_remote_commit_sha(repo_url)
 
 
-def fetch_source_remote_version(source: AgentSkillSource) -> str:
+def fetch_source_remote_observation(source: AgentSkillSource) -> RemoteObservation:
+    _require_remote_probe_ready(source)
+    if not source.repo_url:
+        raise AgentSkillUpdaterError(f"Skill '{source.name}' is missing repoUrl metadata.")
+    revision = _fetch_remote_commit_sha(source.repo_url)
     _require_remote_probe_ready(source)
     if source.source_type == "git-generated" and _is_openspec_source(source):
-        if not source.repo_url:
-            raise AgentSkillUpdaterError(
-                f"Generated skill '{source.name}' is missing repoUrl metadata."
-            )
-        revision = _fetch_remote_commit_sha(source.repo_url)
-        _require_remote_probe_ready(source)
         version = _fetch_remote_package_version_at_revision(
             source.repo_url,
             revision,
             "package.json",
         )
         _require_remote_probe_ready(source)
-        return version
-    if not source.repo_url:
-        raise AgentSkillUpdaterError(f"Skill '{source.name}' is missing repoUrl metadata.")
-    _require_remote_probe_ready(source)
-    version = _fetch_remote_commit_sha(source.repo_url)
-    _require_remote_probe_ready(source)
-    return version
+    else:
+        version = revision
+    return RemoteObservation.from_source(
+        source,
+        revision=revision,
+        version=version,
+    )
+
+
+def fetch_source_remote_version(source: AgentSkillSource) -> str:
+    return fetch_source_remote_observation(source).version
 
 
 def _fetch_remote_package_version_at_revision(

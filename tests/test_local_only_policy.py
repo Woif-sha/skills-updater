@@ -116,7 +116,7 @@ class LocalOnlyPolicyTests(unittest.TestCase):
             ):
                 info = _entry_to_skill_info(entry)
         with mock.patch(
-            "scripts.update_agent_skills.fetch_source_remote_version",
+            "scripts.update_agent_skills.fetch_source_remote_observation",
             side_effect=AssertionError("remote commit probe called"),
         ):
             with mock.patch(
@@ -220,7 +220,7 @@ class LocalOnlyPolicyTests(unittest.TestCase):
             with mock.patch.object(update_agent_skills, "update_registry_entries", return_value=registry):
                 with mock.patch.object(
                     update_agent_skills,
-                    "fetch_source_remote_version",
+                    "fetch_source_remote_observation",
                     side_effect=AssertionError("update CLI accessed remote"),
                 ):
                     output = io.StringIO()

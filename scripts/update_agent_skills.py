@@ -21,7 +21,7 @@ if __package__:
         TransactionOutcome,
         apply_observed_update,
         agent_skill_source_from_registry_entry,
-        fetch_source_remote_version,
+        fetch_source_remote_observation,
         make_backup_root,
         probe_git_worktree,
         registry_entry_uses_git_worktree,
@@ -45,7 +45,7 @@ else:
         TransactionOutcome,
         apply_observed_update,
         agent_skill_source_from_registry_entry,
-        fetch_source_remote_version,
+        fetch_source_remote_observation,
         make_backup_root,
         probe_git_worktree,
         registry_entry_uses_git_worktree,
@@ -70,6 +70,7 @@ class EntryProbe:
     error_message: Optional[str] = None
     git_relation: Optional[str] = None
     working_tree_dirty: Optional[bool] = None
+    remote_observation: Optional[RemoteObservation] = None
 
 
 def main() -> None:
@@ -100,16 +101,7 @@ def main() -> None:
         registry = sync_registry()
     except AgentSkillRecoveryUncertainError as exc:
         outcome = exc.outcome
-        item = {
-            "name": outcome.name,
-            "entry_type": "recovery",
-            "status": "error",
-            "error_message": outcome.error_message,
-            "applied": outcome.applied,
-            "action": outcome.action,
-            "installed_state": outcome.installed_state,
-            "diagnostic_journal": str(outcome.diagnostic_journal),
-        }
+        item = _recovery_outcome_item(outcome)
         if args.json:
             print(json.dumps([item], indent=2, ensure_ascii=False))
         else:
@@ -175,17 +167,11 @@ def main() -> None:
                     item["error_message"] = result.error_message
                     item["applied"] = result.applied
                     item["action"] = result.action
-                    item["installed_state"] = getattr(
-                        result,
-                        "installed_state",
-                        "committed" if result.applied else "unchanged",
-                    )
-                    diagnostic_journal = getattr(result, "diagnostic_journal", None)
-                    if diagnostic_journal is not None:
-                        item["diagnostic_journal"] = str(diagnostic_journal)
-                    cleanup_residue = getattr(result, "cleanup_residue", None)
-                    if cleanup_residue is not None:
-                        item["cleanup_residue"] = str(cleanup_residue)
+                    item["installed_state"] = result.installed_state
+                    if result.diagnostic_journal is not None:
+                        item["diagnostic_journal"] = str(result.diagnostic_journal)
+                    if result.cleanup_residue is not None:
+                        item["cleanup_residue"] = str(result.cleanup_residue)
                     if result.action in {"metadata_refreshed", "fast_forwarded"}:
                         item["installed_base_version"] = result.remote_version
                     if result.applied:
@@ -203,7 +189,7 @@ def main() -> None:
                         item,
                         source,
                         str(entry["installedBaseVersion"]),
-                        probe.remote_version,
+                        _require_probe_observation(name, probe),
                     )
                     if outcome.applied:
                         updated_names.append(name)
@@ -214,7 +200,11 @@ def main() -> None:
                     payload.append(item)
                     continue
 
-                resolved = resolve_skill_update(source, stage_root / name)
+                resolved = resolve_skill_update(
+                    source,
+                    stage_root / name,
+                    _require_probe_observation(name, probe),
+                )
                 item["installed_base_version"] = resolved.installed_base_version
                 item["local_version"] = resolved.local_version
                 resolved_remote_version = resolved.remote_version or probe.remote_version
@@ -232,15 +222,15 @@ def main() -> None:
                     item["backup_root"] = str(backup_root)
                     updated_names.append(name)
                 elif resolved.status == "up_to_date" and resolved_remote_version:
+                    if resolved.remote_observation is None:
+                        raise AgentSkillUpdaterError(
+                            f"Resolved update for '{name}' is missing its Remote Observation."
+                        )
                     outcome = _apply_metadata_observation(
                         item,
                         source,
                         resolved.installed_base_version,
-                        resolved_remote_version,
-                        remote_revision=(
-                            getattr(resolved, "remote_revision", None)
-                            or resolved_remote_version
-                        ),
+                        resolved.remote_observation,
                     )
                     item["remote_version"] = resolved_remote_version
                     if outcome.applied:
@@ -308,19 +298,7 @@ def main() -> None:
             Path(refreshed_registry["skillsRoot"]),
         )
     except AgentSkillRecoveryUncertainError as exc:
-        outcome = exc.outcome
-        payload.append(
-            {
-                "name": outcome.name,
-                "entry_type": "recovery",
-                "status": "error",
-                "error_message": outcome.error_message,
-                "applied": outcome.applied,
-                "action": outcome.action,
-                "installed_state": outcome.installed_state,
-                "diagnostic_journal": str(outcome.diagnostic_journal),
-            }
-        )
+        payload.append(_recovery_outcome_item(exc.outcome))
     except (AgentSkillUpdaterError, OSError, ValueError) as exc:
         payload.append(
             {
@@ -409,21 +387,35 @@ def _apply_transaction_outcome(
         item["cleanup_residue"] = str(outcome.cleanup_residue)
 
 
+def _require_probe_observation(
+    name: str,
+    probe: EntryProbe,
+) -> RemoteObservation:
+    if probe.remote_observation is None:
+        raise AgentSkillUpdaterError(
+            f"Probe for '{name}' is missing its Remote Observation."
+        )
+    return probe.remote_observation
+
+
+def _recovery_outcome_item(outcome: TransactionOutcome) -> dict[str, object]:
+    item: dict[str, object] = {
+        "name": outcome.name,
+        "entry_type": "recovery",
+    }
+    _apply_transaction_outcome(item, outcome)
+    return item
+
+
 def _apply_metadata_observation(
     item: dict[str, object],
     source: AgentSkillSource,
     installed_base_version: str,
-    remote_version: str,
-    *,
-    remote_revision: Optional[str] = None,
+    observation: RemoteObservation,
 ) -> TransactionOutcome:
     outcome = apply_observed_update(
         source,
-        RemoteObservation.from_source(
-            source,
-            revision=remote_revision or remote_version,
-            version=remote_version,
-        ),
+        observation,
         installed_base_version=installed_base_version,
     )
     _apply_transaction_outcome(item, outcome)
@@ -464,15 +456,31 @@ def _probe_entry(entry: dict) -> EntryProbe:
         )
 
     try:
-        remote_version = fetch_source_remote_version(source)
+        observation = fetch_source_remote_observation(source)
     except (AgentSkillUpdaterError, OSError, ValueError) as exc:
         return EntryProbe("error", local_version, None, str(exc))
 
+    remote_version = observation.version
     if not remote_version or local_version == "unknown":
-        return EntryProbe("unknown_version", local_version, remote_version)
+        return EntryProbe(
+            "unknown_version",
+            local_version,
+            remote_version,
+            remote_observation=observation,
+        )
     if versions_match(remote_version, local_version):
-        return EntryProbe("up_to_date", local_version, remote_version)
-    return EntryProbe("update_available", local_version, remote_version)
+        return EntryProbe(
+            "up_to_date",
+            local_version,
+            remote_version,
+            remote_observation=observation,
+        )
+    return EntryProbe(
+        "update_available",
+        local_version,
+        remote_version,
+        remote_observation=observation,
+    )
 
 
 def _run_cli() -> None:

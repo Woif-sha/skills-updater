@@ -596,7 +596,12 @@ class TransactionCoordinatorTests(unittest.TestCase):
                     with mock.patch.object(
                         cli,
                         "_probe_entry",
-                        return_value=cli.EntryProbe("up_to_date", remote[:12], remote),
+                        return_value=cli.EntryProbe(
+                            "up_to_date",
+                            remote[:12],
+                            remote,
+                            remote_observation=mock.sentinel.remote_observation,
+                        ),
                     ):
                         with mock.patch.object(
                             cli,
