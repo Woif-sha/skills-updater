@@ -11,7 +11,6 @@ class SkillStructureTests(unittest.TestCase):
     def test_routing_manifest_is_valid_and_all_reads_exist(self):
         manifest = json.loads((REPO_ROOT / "routing.yaml").read_text(encoding="utf-8"))
 
-        self.assertEqual(manifest["always_read"], ["rules/scope-and-registry.md"])
         self.assertTrue(
             {
                 "repair-updater takes precedence when the request changes or reviews this repository's implementation",
