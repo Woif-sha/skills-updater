@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.error
 import urllib.parse
@@ -93,7 +95,10 @@ METADATA_TRANSACTION_PHASES = frozenset(
 COORDINATOR_TRANSACTION_STATE_VERSION = 1
 COORDINATOR_TRANSACTION_TYPE = "coordinator"
 METADATA_ONLY_TRANSACTION_KIND = "metadata-only"
+GIT_WORKTREE_TRANSACTION_KIND = "git-worktree"
 COORDINATOR_PHASE_PREPARED = "prepared"
+COORDINATOR_PHASE_APPLYING_PAYLOAD = "applying_payload"
+COORDINATOR_PHASE_PAYLOAD_APPLIED = "payload_applied"
 COORDINATOR_PHASE_CAPTURING_METADATA = "capturing_metadata"
 COORDINATOR_PHASE_METADATA_CAPTURED = "metadata_captured"
 COORDINATOR_PHASE_PUBLISHING_METADATA = "publishing_metadata"
@@ -104,6 +109,8 @@ COORDINATOR_PHASE_ROLLED_BACK = "rolled_back"
 COORDINATOR_PHASES = frozenset(
     {
         COORDINATOR_PHASE_PREPARED,
+        COORDINATOR_PHASE_APPLYING_PAYLOAD,
+        COORDINATOR_PHASE_PAYLOAD_APPLIED,
         COORDINATOR_PHASE_CAPTURING_METADATA,
         COORDINATOR_PHASE_METADATA_CAPTURED,
         COORDINATOR_PHASE_PUBLISHING_METADATA,
@@ -160,6 +167,10 @@ class AgentSkillRecoveryUncertainError(AgentSkillUpdaterError):
 
 class AgentSkillMergeConflictError(AgentSkillUpdaterError):
     """Raised when local and remote payload edits require explicit resolution."""
+
+
+class _GitConcurrentChangeError(AgentSkillUpdaterError):
+    """Raised when Git identity no longer matches captured Transaction Evidence."""
 
 
 def _payload_contract(entry_type: str) -> tuple[str, str]:
@@ -293,6 +304,35 @@ class _MetadataJournal:
 
 
 @dataclass(frozen=True)
+class _GitTransactionEvidence:
+    entry_type: str
+    branch: str
+    branch_ref: str
+    remote_ref: str
+    origin_identity: str
+    original_commit: str
+    expected_commit: str
+    original_signature: str
+    expected_signature: str
+    ignored_signature: str
+    ignored_paths: tuple[str, ...]
+    original_temporary_ref: str
+    expected_temporary_ref: str
+
+
+@dataclass
+class _GitJournal:
+    skill_name: str
+    skill_dir: Path
+    phase: str
+    target_version: str
+    metadata_evidence: _ControlMetadataEvidence
+    git_evidence: Optional[_GitTransactionEvidence]
+    writable_state: Optional[dict]
+    legacy_state: Optional[dict] = None
+
+
+@dataclass(frozen=True)
 class _MetadataPhaseProtocol:
     set_phase: Callable[[Path, dict, str], None]
     capturing: str
@@ -300,12 +340,6 @@ class _MetadataPhaseProtocol:
     publishing: str
     publish_failed: str
     published: str
-
-
-@dataclass(frozen=True)
-class _PendingGitMetadataUpdate:
-    result: GitWorktreeResult
-    installed_base: str
 
 
 @dataclass(frozen=True)
@@ -802,10 +836,18 @@ def apply_observed_update(
     _validate_remote_observation(source, observation)
     _require_remote_updates_enabled(source, installed_base_version)
     commit_state_validator = _metadata_commit_state_validator(source, observation)
-    commit_state_validator(installed_base_version)
+    if observation.git_identity is None:
+        commit_state_validator(installed_base_version)
     with skill_update_lock(source.local_dir):
         _recover_skill_transactions_locked(source.local_dir)
         _require_remote_updates_enabled(source, installed_base_version)
+        if observation.git_identity is not None:
+            return _apply_git_transaction_locked(
+                source,
+                observation,
+                installed_base_version,
+                commit_state_validator,
+            )
         return _apply_metadata_only_transaction_locked(
             source,
             observation,
@@ -1013,14 +1055,6 @@ def git_clone_repo(repo_url: str, destination: Path) -> None:
 
 def probe_git_worktree(source: AgentSkillSource) -> GitWorktreeResult:
     _require_remote_updates_enabled(source)
-    with skill_update_lock(source.local_dir):
-        _recover_skill_transactions_locked(source.local_dir)
-        _require_remote_updates_enabled(source)
-        return _probe_git_worktree_unlocked(source)
-
-
-def _probe_git_worktree_unlocked(source: AgentSkillSource) -> GitWorktreeResult:
-    _require_remote_updates_enabled(source)
     repo_dir = source.local_dir
     _validate_skill_root(repo_dir)
     if not is_git_worktree_skill(repo_dir):
@@ -1107,55 +1141,14 @@ def _probe_git_worktree_unlocked(source: AgentSkillSource) -> GitWorktreeResult:
 
 
 def update_git_worktree_skill(source: AgentSkillSource) -> GitWorktreeResult:
-    _require_remote_updates_enabled(source)
-    with skill_update_lock(source.local_dir):
-        _recover_skill_transactions_locked(source.local_dir)
-        _require_remote_updates_enabled(source)
-        result = _update_git_worktree_skill_locked(source)
-    if not isinstance(result, _PendingGitMetadataUpdate):
-        return result
-    observation = RemoteObservation.from_source(
-        source,
-        revision=result.result.remote_version,
-        version=result.result.remote_version,
-        git_identity=GitIdentityEvidence(
-            local_revision=result.result.local_version,
-            branch=result.result.branch,
-            remote_ref=result.result.remote_ref,
-        ),
-    )
-    outcome = apply_observed_update(
-        source,
-        observation,
-        installed_base_version=result.installed_base,
-    )
-    result.result.status = outcome.status
-    result.result.applied = outcome.applied
-    result.result.action = outcome.action
-    result.result.error_message = outcome.error_message
-    result.result.installed_state = outcome.installed_state
-    result.result.diagnostic_journal = outcome.diagnostic_journal
-    result.result.cleanup_residue = outcome.cleanup_residue
-    return result.result
-
-
-def _update_git_worktree_skill_locked(
-    source: AgentSkillSource,
-) -> GitWorktreeResult | _PendingGitMetadataUpdate:
-    result = _probe_git_worktree_unlocked(source)
+    result = probe_git_worktree(source)
     if result.status == "error":
-        raise AgentSkillUpdaterError(result.error_message or f"Unable to update '{source.name}'.")
-
+        raise AgentSkillUpdaterError(
+            result.error_message or f"Unable to update '{source.name}'."
+        )
     installed_base = _read_installed_base_version(source)
-    metadata_snapshot, original_metadata = _require_remote_updates_enabled(
-        source,
-        installed_base,
-    )
-    if result.relation in {"equal", "ahead"}:
-        if installed_base != result.remote_version:
-            return _PendingGitMetadataUpdate(result, installed_base)
+    if result.relation in {"equal", "ahead"} and installed_base == result.remote_version:
         return result
-
     if result.working_tree_dirty:
         conflict_suffix = (
             f" Ignored paths would be overwritten: {', '.join(result.ignored_conflicts)}."
@@ -1166,13 +1159,88 @@ def _update_git_worktree_skill_locked(
             f"Git worktree '{source.name}' has payload changes; refusing automatic fast-forward. "
             f"Commit, stash, or discard them explicitly first.{conflict_suffix}"
         )
-
-    _git_require_payload_at_revision(
-        source.local_dir,
-        result.remote_version,
-        source.entry_type,
+    observation = RemoteObservation.from_source(
+        source,
+        revision=result.remote_version,
+        version=result.remote_version,
+        git_identity=GitIdentityEvidence(
+            local_revision=result.local_version,
+            branch=result.branch,
+            remote_ref=result.remote_ref,
+        ),
     )
-    _verify_git_apply_preconditions(source, result, installed_base)
+    outcome = apply_observed_update(
+        source,
+        observation,
+        installed_base_version=installed_base,
+    )
+    result.status = outcome.status
+    result.applied = outcome.applied
+    result.action = outcome.action
+    result.error_message = outcome.error_message
+    result.installed_state = outcome.installed_state
+    result.diagnostic_journal = outcome.diagnostic_journal
+    result.cleanup_residue = outcome.cleanup_residue
+    if (
+        outcome.installed_state == "committed"
+        and outcome.version is not None
+        and outcome.action == "fast_forwarded"
+    ):
+        result.local_version = outcome.version
+        result.relation = "equal"
+        result.working_tree_dirty = _git_worktree_has_payload_changes(source.local_dir)
+    return result
+
+
+def _apply_git_transaction_locked(
+    source: AgentSkillSource,
+    observation: RemoteObservation,
+    installed_base: str,
+    commit_state_validator: Callable[[str], None],
+) -> TransactionOutcome:
+    identity = observation.git_identity
+    if identity is None:
+        raise AgentSkillUpdaterError(
+            f"Git worktree '{source.name}' requires Git identity evidence."
+        )
+    relation = _git_commit_relation(
+        source.local_dir,
+        identity.local_revision,
+        observation.revision,
+    )
+    try:
+        commit_state_validator(installed_base)
+    except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+        return _git_transaction_error_outcome(
+            source,
+            observation,
+            installed_state="unchanged",
+            error=(
+                f"Concurrent Change cancelled the Git update for '{source.name}': {exc}"
+            ),
+        )
+    if relation == "diverged":
+        return _git_transaction_error_outcome(
+            source,
+            observation,
+            installed_state="unchanged",
+            error=(
+                f"Git worktree '{source.name}' has diverged from {identity.remote_ref}; "
+                "merge or rebase explicitly before updating."
+            ),
+        )
+    if relation != "behind":
+        return _apply_metadata_only_transaction_locked(
+            source,
+            observation,
+            installed_base,
+            commit_state_validator,
+        )
+
+    metadata_snapshot, original_metadata = _require_remote_updates_enabled(
+        source,
+        installed_base,
+    )
     metadata_path = source.metadata_path
     if metadata_path is None or metadata_snapshot is None or original_metadata is None:
         raise AgentSkillUpdaterError(
@@ -1183,266 +1251,351 @@ def _update_git_worktree_skill_locked(
         staged_dir=None,
         status="up_to_date",
         installed_base_version=installed_base,
-        local_version=result.local_version,
-        remote_version=result.remote_version,
+        local_version=identity.local_revision,
+        remote_version=observation.revision,
     )
-    expected_metadata, metadata_changed = _build_refreshed_metadata(
+    expected_metadata, _ = _build_refreshed_metadata(
         metadata_update,
         metadata_snapshot,
     )
-    expected_metadata_bytes = (
-        _json_payload_bytes(expected_metadata)
-        if metadata_changed or original_metadata is None
-        else original_metadata
+    expected_metadata_bytes = _json_payload_bytes(expected_metadata)
+    original_signature = _git_revision_payload_signature(
+        source.local_dir,
+        identity.local_revision,
+        source.entry_type,
+    )
+    expected_signature = _git_revision_payload_signature(
+        source.local_dir,
+        observation.revision,
+        source.entry_type,
+    )
+    ignored_paths = _git_ignored_payload_paths(source.local_dir)
+    ignored_signature = _git_payload_paths_signature(
+        source.local_dir,
+        ignored_paths,
     )
     transaction_root = Path(
         tempfile.mkdtemp(
-            prefix=f".{source.name}.git-update-",
+            prefix=f".{source.name}.transaction-",
             dir=source.local_dir.parent,
         )
     )
-    original_payload = transaction_root / "original"
-    incoming_payload = transaction_root / "incoming"
-    state: dict[str, object] = {}
+    temporary_refs = _git_transaction_temporary_refs(transaction_root)
+    git_evidence = _GitTransactionEvidence(
+        entry_type=source.entry_type,
+        branch=identity.branch,
+        branch_ref=f"refs/heads/{identity.branch}",
+        remote_ref=identity.remote_ref,
+        origin_identity=canonical_repo_identity(source.repo_url or ""),
+        original_commit=identity.local_revision,
+        expected_commit=observation.revision,
+        original_signature=original_signature,
+        expected_signature=expected_signature,
+        ignored_signature=ignored_signature,
+        ignored_paths=ignored_paths,
+        original_temporary_ref=temporary_refs["original"],
+        expected_temporary_ref=temporary_refs["expected"],
+    )
+    metadata_evidence = _ControlMetadataEvidence(
+        before_present=True,
+        before_sha256=_sha256_bytes(original_metadata),
+        expected_sha256=_sha256_bytes(expected_metadata_bytes),
+    )
+    state = _coordinator_git_state(
+        source,
+        observation,
+        metadata_evidence,
+        git_evidence,
+    )
+    journal_prepared = False
     try:
-        original_payload.mkdir()
-        _copy_directory_contents(source.local_dir, original_payload)
-        original_signature = _validate_skill_payload(
-            original_payload,
-            entry_type=source.entry_type,
-        )
-        _stage_git_revision_payload(
-            source.local_dir,
-            result.remote_version,
-            incoming_payload,
-            source.entry_type,
-        )
-        expected_signature = _validate_skill_payload(
-            incoming_payload,
-            entry_type=source.entry_type,
-        )
         _prepare_transaction_metadata_files(
             transaction_root,
             original_metadata,
             expected_metadata_bytes,
         )
-        state = {
-            "version": GIT_TRANSACTION_STATE_VERSION,
-            "transactionType": GIT_TRANSACTION_TYPE,
-            "skillName": source.name,
-            "skillDir": str(source.local_dir.resolve()),
-            "entryType": source.entry_type,
-            "phase": GIT_TRANSACTION_PHASE_PREPARED,
-            "metadataPhase": METADATA_PHASE_PREPARED,
-            "originalBranch": result.branch,
-            "originalHead": result.local_version,
-            "expectedHead": result.remote_version,
-            "originalSignature": original_signature,
-            "incomingSignature": expected_signature,
-            "expectedSignature": expected_signature,
-            "originalMetadataPresent": original_metadata is not None,
-            "originalMetadataSha256": _sha256_bytes(original_metadata),
-            "expectedMetadataPresent": True,
-            "expectedMetadataSha256": _sha256_bytes(expected_metadata_bytes),
-        }
         _write_json_atomic(transaction_root / TRANSACTION_STATE_FILENAME, state)
         _write_bytes_atomic(transaction_root / TRANSACTION_MARKER_FILENAME, b"1\n")
-    except BaseException as exc:  # preparation must leave the worktree untouched
+        journal_prepared = True
+        _establish_git_temporary_refs(source.local_dir, git_evidence)
+    except BaseException as exc:
+        if journal_prepared and isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         try:
-            _remove_transaction_tree(transaction_root)
-        except (OSError, AgentSkillUpdaterError) as cleanup_exc:
-            raise AgentSkillUpdaterError(
-                f"Unable to prepare Git update for '{source.name}': {exc}. "
-                f"Temporary snapshot cleanup also failed at {transaction_root}: {cleanup_exc}"
-            ) from exc
+            _cleanup_git_transaction(source.local_dir, transaction_root, git_evidence)
+        except (AgentSkillUpdaterError, OSError) as cleanup_exc:
+            return _git_transaction_error_outcome(
+                source,
+                observation,
+                installed_state="unchanged",
+                error=(
+                    f"Unable to prepare Git update for '{source.name}': {exc}. "
+                    f"Cleanup also failed at {transaction_root}: {cleanup_exc}"
+                ),
+                cleanup_residue=transaction_root,
+            )
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
-        raise AgentSkillUpdaterError(
-            f"Unable to prepare Git update for '{source.name}': {exc}"
-        ) from exc
+        return _git_transaction_error_outcome(
+            source,
+            observation,
+            installed_state="unchanged",
+            error=f"Unable to prepare Git update for '{source.name}': {exc}",
+        )
 
     try:
-        _verify_git_apply_preconditions(source, result, installed_base)
-        _set_git_transaction_phase(
+        try:
+            commit_state_validator(installed_base)
+        except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+            raise _GitConcurrentChangeError(str(exc)) from exc
+        _set_coordinator_phase(
             transaction_root,
             state,
-            GIT_TRANSACTION_PHASE_APPLYING,
+            COORDINATOR_PHASE_APPLYING_PAYLOAD,
         )
-        branch_ref = f"refs/heads/{result.branch}"
-        _require_remote_updates_enabled(source, installed_base)
-        _run(
-            [
-                "git",
-                "-C",
-                str(source.local_dir),
-                "update-ref",
-                branch_ref,
-                result.remote_version,
-                result.local_version,
-            ],
-            cwd=source.local_dir,
-        )
-        current_branch = _git_output(
-            source.local_dir,
-            ["symbolic-ref", "--short", "HEAD"],
-        )
-        if current_branch != result.branch:
-            try:
-                _run(
-                    [
-                        "git",
-                        "-C",
-                        str(source.local_dir),
-                        "update-ref",
-                        branch_ref,
-                        result.local_version,
-                        result.remote_version,
-                    ],
-                    cwd=source.local_dir,
-                )
-            except AgentSkillUpdaterError as rollback_exc:
-                raise AgentSkillUpdaterError(
-                    f"Git branch changed while applying update for '{source.name}', and the "
-                    f"explicit branch ref could not be restored: {rollback_exc}"
-                ) from rollback_exc
-            raise AgentSkillUpdaterError(
-                f"Git branch changed while applying update for '{source.name}': "
-                f"{result.branch} -> {current_branch}."
-            )
-        _run(
-            [
-                "git",
-                "-C",
-                str(source.local_dir),
-                "read-tree",
-                "--reset",
-                "-u",
-                result.remote_version,
-            ],
-            cwd=source.local_dir,
-        )
-        committed_signature = _validate_skill_payload(
-            source.local_dir,
-            entry_type=source.entry_type,
-        )
-        updated_head = _validate_git_worktree_revision(
-            source.local_dir,
-            result.branch,
-            result.remote_version,
-            committed_signature,
-            source.entry_type,
-        )
-        _set_git_transaction_expected_signature(
+        _establish_git_identity(source.local_dir, git_evidence, expected=True)
+        _set_coordinator_phase(
             transaction_root,
             state,
-            committed_signature,
+            COORDINATOR_PHASE_PAYLOAD_APPLIED,
         )
-        _require_remote_updates_enabled(source, installed_base)
-        _verify_git_source_configuration(source, result.branch, result.remote_ref)
-        _validate_transaction_metadata(source.local_dir, state, expected=False)
+        _validate_transaction_metadata(
+            source.local_dir,
+            metadata_evidence,
+            expected=False,
+        )
         _commit_transaction_metadata(
             transaction_root,
             state,
             metadata_path,
             expected_metadata_bytes,
             original_metadata,
-            phases=LEGACY_METADATA_PHASES,
+            phases=COORDINATOR_METADATA_PHASES,
         )
-        _validate_transaction_metadata(source.local_dir, state, expected=True)
-        _validate_git_transaction_worktree(source.local_dir, state, expected=True)
-        _verify_git_source_configuration(source, result.branch, result.remote_ref)
-        _require_remote_updates_enabled(source, result.remote_version)
-        _set_git_transaction_phase(
+        _verify_git_source_configuration(
+            source,
+            git_evidence.branch,
+            git_evidence.remote_ref,
+        )
+        _validate_git_identity(
+            source.local_dir,
+            git_evidence,
+            expected=True,
+            require_configuration=True,
+        )
+        _validate_transaction_metadata(
+            source.local_dir,
+            metadata_evidence,
+            expected=True,
+        )
+        _require_remote_updates_enabled(source, observation.revision)
+        _set_coordinator_phase(
             transaction_root,
             state,
-            GIT_TRANSACTION_PHASE_COMMITTED,
+            COORDINATOR_PHASE_COMMITTED,
         )
-        _validate_git_transaction_worktree(source.local_dir, state, expected=True)
-    except BaseException as exc:  # clean fast-forward has an explicit rollback contract
-        if state.get("phase") == GIT_TRANSACTION_PHASE_PREPARED:
-            try:
-                _remove_transaction_tree(transaction_root)
-            except (OSError, AgentSkillUpdaterError) as cleanup_exc:
-                raise AgentSkillUpdaterError(
-                    f"Git update for '{source.name}' was cancelled before apply, but snapshot "
-                    f"cleanup failed at {transaction_root}: {cleanup_exc}"
-                ) from exc
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
-            raise AgentSkillUpdaterError(
-                f"Git update for '{source.name}' was cancelled before apply: {exc}"
-            ) from exc
+    except _GitConcurrentChangeError as exc:
         try:
-            recovery_path = _rollback_git_fast_forward(
-                source.local_dir,
-                result.local_version,
-                result.remote_version,
-                result.branch,
-                original_payload,
-                incoming_payload,
-                transaction_root,
-                state["originalSignature"],
-                state["incomingSignature"],
-                source.entry_type,
+            _cleanup_git_transaction(source.local_dir, transaction_root, git_evidence)
+        except (AgentSkillUpdaterError, OSError) as cleanup_exc:
+            return _git_transaction_error_outcome(
+                source,
+                observation,
+                installed_state="unchanged",
+                error=(
+                    f"Concurrent Change cancelled the Git update for '{source.name}': {exc}. "
+                    f"Cleanup failed at {transaction_root}: {cleanup_exc}"
+                ),
+                cleanup_residue=transaction_root,
             )
-            metadata_recovery = _rollback_transaction_metadata(
+        return _git_transaction_error_outcome(
+            source,
+            observation,
+            installed_state="unchanged",
+            error=(
+                f"Concurrent Change cancelled the Git update for '{source.name}': {exc}"
+            ),
+        )
+    except Exception as exc:
+        if state["phase"] == COORDINATOR_PHASE_COMMITTED:
+            return _finish_committed_git_transaction(
+                source,
+                observation,
                 transaction_root,
-                _decode_legacy_metadata_phase(state["metadataPhase"]),
+                git_evidence,
+                error=exc,
+            )
+        try:
+            _establish_git_identity(source.local_dir, git_evidence, expected=False)
+            recovery_path = _rollback_transaction_metadata(
+                transaction_root,
+                state["phase"],
                 metadata_path,
                 original_metadata,
                 expected_metadata_bytes,
             )
-            if metadata_recovery is None:
-                _validate_transaction_metadata(source.local_dir, state, expected=False)
-            else:
-                state["recoveryPath"] = str(metadata_recovery)
-            _set_git_transaction_phase(
+            if recovery_path is not None:
+                raise AgentSkillUpdaterError(
+                    f"Concurrent metadata was preserved at {recovery_path}."
+                )
+            _validate_transaction_metadata(
+                source.local_dir,
+                metadata_evidence,
+                expected=False,
+            )
+            _set_coordinator_phase(
                 transaction_root,
                 state,
-                GIT_TRANSACTION_PHASE_ROLLED_BACK,
+                COORDINATOR_PHASE_ROLLED_BACK,
             )
-        except BaseException as rollback_exc:  # preserve both failures
-            raise AgentSkillUpdaterError(
-                f"Git update failed for '{source.name}': {exc}. Rollback also failed: {rollback_exc}. "
-                f"Recovery snapshots remain at {transaction_root}."
-            ) from exc
-        recovery_path = recovery_path or metadata_recovery
+        except Exception as rollback_exc:
+            return _git_transaction_error_outcome(
+                source,
+                observation,
+                installed_state="uncertain",
+                error=(
+                    f"Git update failed for '{source.name}': {exc}. Rollback also failed: "
+                    f"{rollback_exc}. Recovery data remains at {transaction_root}."
+                ),
+                diagnostic_journal=transaction_root,
+            )
         try:
-            _remove_transaction_tree(transaction_root)
-        except (OSError, AgentSkillUpdaterError) as cleanup_exc:
-            raise AgentSkillUpdaterError(
-                f"Git update failed for '{source.name}'; HEAD, payload, and metadata were restored, "
-                f"but snapshot cleanup failed at {transaction_root}: {cleanup_exc}"
-            ) from exc
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-            raise
-        recovery_suffix = (
-            f" Concurrent data was preserved at {recovery_path}."
-            if recovery_path is not None
-            else ""
+            _cleanup_git_transaction(source.local_dir, transaction_root, git_evidence)
+        except (AgentSkillUpdaterError, OSError) as cleanup_exc:
+            return _git_transaction_error_outcome(
+                source,
+                observation,
+                installed_state="rolled_back",
+                error=(
+                    f"Git update failed for '{source.name}': {exc}. Original state was "
+                    f"restored, but cleanup failed at {transaction_root}: {cleanup_exc}"
+                ),
+                cleanup_residue=transaction_root,
+            )
+        return _git_transaction_error_outcome(
+            source,
+            observation,
+            installed_state="rolled_back",
+            error=(
+                f"Git update failed for '{source.name}'; original state was restored: {exc}"
+            ),
         )
-        raise AgentSkillUpdaterError(
-            f"Git update failed for '{source.name}'; HEAD, payload, and metadata were restored: "
-            f"{exc}.{recovery_suffix}"
-        ) from exc
 
+    return _finish_committed_git_transaction(
+        source,
+        observation,
+        transaction_root,
+        git_evidence,
+    )
+
+
+def _finish_committed_git_transaction(
+    source: AgentSkillSource,
+    observation: RemoteObservation,
+    transaction_root: Path,
+    evidence: _GitTransactionEvidence,
+    *,
+    error: Optional[BaseException] = None,
+) -> TransactionOutcome:
     try:
-        _remove_transaction_tree(transaction_root)
-    except (OSError, AgentSkillUpdaterError) as cleanup_exc:
-        raise AgentSkillUpdateCommittedError(
-            f"Git update for '{source.name}' committed, but temporary snapshot cleanup failed "
-            f"at {transaction_root}: {cleanup_exc}",
+        _validate_git_identity(
+            source.local_dir,
+            evidence,
+            expected=True,
+            require_configuration=True,
+        )
+        _cleanup_git_transaction(source.local_dir, transaction_root, evidence)
+    except (AgentSkillUpdaterError, OSError) as cleanup_exc:
+        prefix = f"Git update for '{source.name}' committed"
+        if error is not None:
+            prefix += f" despite a post-commit error ({error})"
+        return TransactionOutcome(
+            name=source.name,
+            status="error",
+            installed_state="committed",
+            applied=True,
             action="fast_forwarded",
-            version=updated_head,
-        ) from cleanup_exc
+            version=observation.revision,
+            error_message=(
+                f"{prefix}, but cleanup failed at {transaction_root}: {cleanup_exc}"
+            ),
+            cleanup_residue=transaction_root,
+        )
+    return TransactionOutcome(
+        name=source.name,
+        status="up_to_date",
+        installed_state="committed",
+        applied=True,
+        action="fast_forwarded",
+        version=observation.revision,
+    )
 
-    result.status = "up_to_date"
-    result.local_version = updated_head
-    result.relation = "equal"
-    result.working_tree_dirty = _git_worktree_has_payload_changes(source.local_dir)
-    result.applied = True
-    result.action = "fast_forwarded"
-    return result
+
+def _git_transaction_error_outcome(
+    source: AgentSkillSource,
+    observation: RemoteObservation,
+    *,
+    installed_state: str,
+    error: str,
+    diagnostic_journal: Optional[Path] = None,
+    cleanup_residue: Optional[Path] = None,
+) -> TransactionOutcome:
+    return TransactionOutcome(
+        name=source.name,
+        status="error",
+        installed_state=installed_state,
+        applied=False,
+        action="none",
+        version=observation.revision,
+        error_message=error,
+        diagnostic_journal=diagnostic_journal,
+        cleanup_residue=cleanup_residue,
+    )
+
+
+def _coordinator_git_state(
+    source: AgentSkillSource,
+    observation: RemoteObservation,
+    metadata: _ControlMetadataEvidence,
+    git: _GitTransactionEvidence,
+) -> dict:
+    return {
+        "version": COORDINATOR_TRANSACTION_STATE_VERSION,
+        "transactionType": COORDINATOR_TRANSACTION_TYPE,
+        "transactionKind": GIT_WORKTREE_TRANSACTION_KIND,
+        "skillName": source.name,
+        "skillDir": str(source.local_dir.resolve()),
+        "phase": COORDINATOR_PHASE_PREPARED,
+        "targetRevision": observation.revision,
+        "targetVersion": observation.version,
+        "evidence": {
+            "beforeMetadata": {
+                "present": metadata.before_present,
+                "sha256": metadata.before_sha256,
+            },
+            "expectedMetadata": {
+                "present": True,
+                "sha256": metadata.expected_sha256,
+            },
+            "git": {
+                "entryType": git.entry_type,
+                "branch": git.branch,
+                "branchRef": git.branch_ref,
+                "remoteRef": git.remote_ref,
+                "originIdentity": git.origin_identity,
+                "originalCommit": git.original_commit,
+                "expectedCommit": git.expected_commit,
+                "originalSignature": git.original_signature,
+                "expectedSignature": git.expected_signature,
+                "ignoredSignature": git.ignored_signature,
+                "ignoredPaths": list(git.ignored_paths),
+                "temporaryRefs": {
+                    "original": git.original_temporary_ref,
+                    "expected": git.expected_temporary_ref,
+                },
+            },
+        },
+    }
 
 
 def _git_remote_ref(repo_dir: Path, branch: str) -> str:
@@ -1524,7 +1677,10 @@ def _git_is_ancestor(repo_dir: Path, ancestor: str, descendant: str) -> bool:
     raise AgentSkillUpdaterError(message)
 
 
-def _git_worktree_has_payload_changes(repo_dir: Path) -> bool:
+def _git_worktree_has_payload_changes(
+    repo_dir: Path,
+    allowed_untracked_paths: tuple[str, ...] = (),
+) -> bool:
     _validate_git_control_entry(repo_dir)
     result = subprocess.run(
         _resolve_command(
@@ -1538,6 +1694,7 @@ def _git_worktree_has_payload_changes(repo_dir: Path) -> bool:
         message = result.stderr.decode(errors="replace").strip() or "git status failed"
         raise AgentSkillUpdaterError(message)
 
+    allowed_untracked = {os.path.normcase(path) for path in allowed_untracked_paths}
     records = result.stdout.split(b"\0")
     index = 0
     while index < len(records):
@@ -1554,7 +1711,15 @@ def _git_worktree_has_payload_changes(repo_dir: Path) -> bool:
                 raise AgentSkillUpdaterError(f"Incomplete git rename record in '{repo_dir}'.")
             paths.append(os.fsdecode(records[index]))
             index += 1
-        if any(is_skill_payload_path(repo_dir / Path(path.replace("/", os.sep)), repo_dir) for path in paths):
+        normalized_paths = [path.replace("\\", "/") for path in paths]
+        if status == "??" and all(
+            os.path.normcase(path) in allowed_untracked for path in normalized_paths
+        ):
+            continue
+        if any(
+            is_skill_payload_path(repo_dir / Path(path.replace("/", os.sep)), repo_dir)
+            for path in normalized_paths
+        ):
             return True
     return False
 
@@ -1564,10 +1729,7 @@ def _git_ignored_payload_conflicts(
     local_version: str,
     remote_version: str,
 ) -> tuple[str, ...]:
-    ignored_paths = _git_path_list(
-        repo_dir,
-        ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
-    )
+    ignored_paths = _git_ignored_payload_paths(repo_dir)
     changed_paths = _git_path_list(
         repo_dir,
         ["diff", "--name-only", "-z", local_version, remote_version],
@@ -1628,6 +1790,22 @@ def _git_paths_overlap(left: str, right: str) -> bool:
     return left_parts[:common_length] == right_parts[:common_length]
 
 
+def _is_valid_git_payload_relative_path(value: object) -> bool:
+    if not isinstance(value, str) or not value or "\0" in value or "\\" in value:
+        return False
+    relative = PurePosixPath(value)
+    windows_path = PureWindowsPath(value)
+    return not (
+        relative.is_absolute()
+        or bool(windows_path.drive)
+        or bool(windows_path.root)
+        or relative.as_posix() != value
+        or value == "."
+        or ".." in relative.parts
+        or any(_is_skill_control_part(part) for part in relative.parts)
+    )
+
+
 def _verify_git_apply_preconditions(
     source: AgentSkillSource,
     result: GitWorktreeResult,
@@ -1683,6 +1861,356 @@ def _verify_git_source_configuration(
         )
     if _git_remote_ref(source.local_dir, branch) != expected_remote_ref:
         raise AgentSkillUpdaterError(f"Git upstream changed during update for '{source.name}'.")
+
+
+def _git_revision_payload_signature(
+    repo_dir: Path,
+    revision: str,
+    entry_type: str,
+) -> str:
+    _git_require_payload_at_revision(repo_dir, revision, entry_type)
+    result = subprocess.run(
+        _resolve_command(
+            ["git", "-C", str(repo_dir), "archive", "--format=tar", revision]
+        ),
+        cwd=repo_dir,
+        capture_output=True,
+        text=False,
+    )
+    if result.returncode != 0:
+        message = result.stderr.decode(errors="replace").strip() or "git archive failed"
+        raise AgentSkillUpdaterError(message)
+
+    directories: dict[str, None] = {}
+    files: dict[str, bytes] = {}
+    seen_names: dict[str, str] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
+            for member in archive.getmembers():
+                normalized = member.name.replace("\\", "/").rstrip("/")
+                if not normalized:
+                    continue
+                relative = PurePosixPath(normalized)
+                if (
+                    relative.is_absolute()
+                    or ".." in relative.parts
+                    or any(_is_skill_control_part(part) for part in relative.parts)
+                ):
+                    if any(_is_skill_control_part(part) for part in relative.parts):
+                        continue
+                    raise AgentSkillUpdaterError(
+                        f"Git revision contains an unsafe payload path: {member.name!r}"
+                    )
+                folded = normalized.casefold()
+                previous = seen_names.get(folded)
+                if previous is not None and previous != normalized:
+                    raise AgentSkillUpdaterError(
+                        f"Git revision contains case-colliding payload paths: "
+                        f"{previous!r} and {normalized!r}."
+                    )
+                seen_names[folded] = normalized
+                if member.isdir():
+                    directories[normalized] = None
+                    continue
+                if not member.isfile():
+                    raise AgentSkillUpdaterError(
+                        f"Git revision contains an unsupported payload entry: {normalized}"
+                    )
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise AgentSkillUpdaterError(
+                        f"Git revision payload could not be read: {normalized}"
+                    )
+                files[normalized] = hashlib.sha256(extracted.read()).digest()
+    except tarfile.TarError as exc:
+        raise AgentSkillUpdaterError(
+            f"Git object database returned an invalid archive for {revision}: {exc}"
+        ) from exc
+
+    digest = hashlib.sha256()
+    for path in sorted(directories):
+        _update_signature_record(digest, b"directory", path)
+    for path in sorted(files):
+        _update_signature_record(digest, b"file", path, files[path])
+    return digest.hexdigest()
+
+
+def _git_ignored_payload_paths(repo_dir: Path) -> tuple[str, ...]:
+    paths = _git_path_list(
+        repo_dir,
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+    )
+    return tuple(
+        sorted(
+            (
+                path
+                for path in paths
+                if is_skill_payload_path(
+                    repo_dir / Path(path.replace("/", os.sep)),
+                    repo_dir,
+                )
+            ),
+            key=lambda path: (path.casefold(), path),
+        )
+    )
+
+
+def _git_payload_paths_signature(
+    repo_dir: Path,
+    paths: tuple[str, ...],
+    mismatch_error: type[AgentSkillUpdaterError] = AgentSkillUpdaterError,
+) -> str:
+    digest = hashlib.sha256()
+    for relative in paths:
+        path = repo_dir / Path(relative.replace("/", os.sep))
+        if _is_filesystem_link(path) or not path.is_file():
+            raise mismatch_error(
+                f"Ignored Git payload entry must be a regular file: {path}"
+            )
+        _update_signature_record(
+            digest,
+            b"ignored-file",
+            relative,
+            hashlib.sha256(path.read_bytes()).digest(),
+        )
+    return digest.hexdigest()
+
+
+def _git_transaction_temporary_refs(transaction_root: Path) -> dict[str, str]:
+    token = hashlib.sha256(
+        str(transaction_root.resolve()).casefold().encode("utf-8")
+    ).hexdigest()[:24]
+    prefix = f"refs/skills-updater/transactions/{token}"
+    return {
+        "original": f"{prefix}/original",
+        "expected": f"{prefix}/expected",
+    }
+
+
+def _establish_git_temporary_refs(
+    repo_dir: Path,
+    evidence: _GitTransactionEvidence,
+) -> None:
+    _establish_git_temporary_ref(
+        repo_dir,
+        evidence.original_temporary_ref,
+        evidence.original_commit,
+    )
+    _establish_git_temporary_ref(
+        repo_dir,
+        evidence.expected_temporary_ref,
+        evidence.expected_commit,
+    )
+
+
+def _establish_git_temporary_ref(repo_dir: Path, ref: str, commit: str) -> None:
+    current = _git_optional_ref_commit(repo_dir, ref)
+    if current is not None:
+        if same_git_commit(current, commit):
+            return
+        raise AgentSkillUpdaterError(
+            f"Git Transaction temporary ref changed concurrently: {ref}"
+        )
+    _git_compare_and_swap_ref(repo_dir, ref, commit, "0" * 40)
+
+
+def _git_optional_ref_commit(repo_dir: Path, ref: str) -> Optional[str]:
+    _validate_git_control_entry(repo_dir)
+    result = subprocess.run(
+        _resolve_command(
+            [
+                "git",
+                "-C",
+                str(repo_dir),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"{ref}^{{commit}}",
+            ]
+        ),
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
+        return None
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or f"Git ref query failed: {ref}"
+        raise AgentSkillUpdaterError(message)
+    value = result.stdout.strip()
+    return _require_git_commit(value, f"Git ref {ref}")
+
+
+def _git_compare_and_swap_ref(
+    repo_dir: Path,
+    ref: str,
+    new_commit: str,
+    old_commit: str,
+) -> None:
+    result = subprocess.run(
+        _resolve_command(
+            ["git", "-C", str(repo_dir), "update-ref", ref, new_commit, old_commit]
+        ),
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or f"Git ref changed: {ref}"
+        current = _git_optional_ref_commit(repo_dir, ref)
+        expected_old = None if old_commit == "0" * 40 else old_commit
+        if current != expected_old:
+            raise _GitConcurrentChangeError(message)
+        raise AgentSkillUpdaterError(message)
+
+
+def _validate_git_identity(
+    repo_dir: Path,
+    evidence: _GitTransactionEvidence,
+    *,
+    expected: bool,
+    require_configuration: bool,
+    mismatch_error: type[AgentSkillUpdaterError] = AgentSkillUpdaterError,
+) -> None:
+    commit = evidence.expected_commit if expected else evidence.original_commit
+    signature = evidence.expected_signature if expected else evidence.original_signature
+    current_branch = _git_output(repo_dir, ["symbolic-ref", "--short", "HEAD"])
+    if current_branch != evidence.branch:
+        raise mismatch_error(
+            f"Git identity requires branch '{evidence.branch}', but '{current_branch}' is checked out."
+        )
+    current_commit = _git_output(repo_dir, ["rev-parse", "--verify", "HEAD^{commit}"])
+    if not same_git_commit(current_commit, commit):
+        raise mismatch_error(
+            f"Git identity does not match the {'expected' if expected else 'original'} commit."
+        )
+    if _git_revision_payload_signature(repo_dir, commit, evidence.entry_type) != signature:
+        raise mismatch_error(
+            f"Git object database evidence changed for commit {commit}."
+        )
+    allowed_untracked = evidence.ignored_paths if expected else ()
+    if _git_worktree_has_payload_changes(repo_dir, allowed_untracked):
+        raise mismatch_error(
+            f"Git worktree '{repo_dir.name}' contains payload changes."
+        )
+    current_ignored_paths = _git_ignored_payload_paths(repo_dir)
+    known_ignored = {os.path.normcase(path) for path in evidence.ignored_paths}
+    if expected:
+        unexpected_ignored = tuple(
+            path
+            for path in current_ignored_paths
+            if os.path.normcase(path) not in known_ignored
+        )
+        ignored_paths_match = not unexpected_ignored
+    else:
+        ignored_paths_match = current_ignored_paths == evidence.ignored_paths
+    if not ignored_paths_match or _git_payload_paths_signature(
+        repo_dir,
+        evidence.ignored_paths,
+        mismatch_error,
+    ) != evidence.ignored_signature:
+        raise mismatch_error(
+            f"Ignored Git payload changed during the Transaction for '{repo_dir.name}'."
+        )
+    if require_configuration:
+        origin_url = _git_output(repo_dir, ["config", "--get", "remote.origin.url"])
+        if canonical_repo_identity(origin_url) != evidence.origin_identity:
+            raise mismatch_error(
+                f"Git origin changed during the Transaction for '{repo_dir.name}'."
+            )
+        if _git_remote_ref(repo_dir, evidence.branch) != evidence.remote_ref:
+            raise mismatch_error(
+                f"Git upstream changed during the Transaction for '{repo_dir.name}'."
+            )
+        remote_commit = _git_output(
+            repo_dir,
+            ["rev-parse", "--verify", f"{evidence.remote_ref}^{{commit}}"],
+        )
+        if not same_git_commit(remote_commit, evidence.expected_commit):
+            raise mismatch_error(
+                f"Git remote tracking ref changed during the Transaction for '{repo_dir.name}'."
+            )
+
+
+def _establish_git_identity(
+    repo_dir: Path,
+    evidence: _GitTransactionEvidence,
+    *,
+    expected: bool,
+) -> None:
+    target = evidence.expected_commit if expected else evidence.original_commit
+    other = evidence.original_commit if expected else evidence.expected_commit
+    current_branch = _git_output(repo_dir, ["symbolic-ref", "--short", "HEAD"])
+    if current_branch != evidence.branch:
+        raise _GitConcurrentChangeError(
+            f"Git branch changed during the Transaction: {evidence.branch} -> {current_branch}."
+        )
+    current = _git_output(
+        repo_dir,
+        ["rev-parse", "--verify", f"{evidence.branch_ref}^{{commit}}"],
+    )
+    if same_git_commit(current, target):
+        _validate_git_identity(
+            repo_dir,
+            evidence,
+            expected=expected,
+            require_configuration=False,
+        )
+        return
+    if not same_git_commit(current, other):
+        raise _GitConcurrentChangeError(
+            f"Git branch ref changed during the Transaction: {current}."
+        )
+    _validate_git_identity(
+        repo_dir,
+        evidence,
+        expected=not expected,
+        require_configuration=False,
+        mismatch_error=(
+            _GitConcurrentChangeError if expected else AgentSkillUpdaterError
+        ),
+    )
+    _git_compare_and_swap_ref(repo_dir, evidence.branch_ref, target, other)
+    current_branch = _git_output(repo_dir, ["symbolic-ref", "--short", "HEAD"])
+    if current_branch != evidence.branch:
+        _git_compare_and_swap_ref(repo_dir, evidence.branch_ref, other, target)
+        raise _GitConcurrentChangeError(
+            f"Git branch changed during the Transaction: {evidence.branch} -> {current_branch}."
+        )
+    _run(
+        ["git", "-C", str(repo_dir), "read-tree", "--reset", "-u", target],
+        cwd=repo_dir,
+    )
+    _validate_git_identity(
+        repo_dir,
+        evidence,
+        expected=expected,
+        require_configuration=False,
+    )
+
+
+def _cleanup_git_transaction(
+    repo_dir: Path,
+    transaction_root: Path,
+    evidence: _GitTransactionEvidence,
+) -> None:
+    for ref, commit in (
+        (evidence.original_temporary_ref, evidence.original_commit),
+        (evidence.expected_temporary_ref, evidence.expected_commit),
+    ):
+        current = _git_optional_ref_commit(repo_dir, ref)
+        if current is None:
+            continue
+        if not same_git_commit(current, commit):
+            raise AgentSkillUpdaterError(
+                f"Refusing to delete changed Git Transaction ref: {ref}"
+            )
+        _git_compare_and_swap_ref(repo_dir, ref, "0" * 40, commit)
+    _remove_transaction_tree(transaction_root)
 
 
 def _rollback_git_fast_forward(
@@ -1797,37 +2325,6 @@ def _validate_git_rollback_ref(
             f"Git HEAD changed after the interrupted update: {current_head}. "
             "Recovery snapshots were preserved for manual inspection."
         )
-
-
-def _stage_git_revision_payload(
-    repo_dir: Path,
-    revision: str,
-    destination: Path,
-    entry_type: str,
-) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    archive_path = destination.parent / "incoming.zip"
-    extract_root = destination.parent / "incoming-archive"
-    _run(
-        [
-            "git",
-            "-C",
-            str(repo_dir),
-            "archive",
-            "--format=zip",
-            "--output",
-            str(archive_path),
-            revision,
-        ],
-        cwd=repo_dir,
-    )
-    extract_root.mkdir(parents=True, exist_ok=False)
-    with zipfile.ZipFile(archive_path) as archive:
-        _validate_zip_members(archive, extract_root)
-        archive.extractall(extract_root)
-    destination.mkdir(parents=True, exist_ok=False)
-    _copy_directory_contents(extract_root, destination)
-    _validate_skill_payload(destination, entry_type=entry_type)
 
 
 def _preserve_metadata_content(
@@ -2028,6 +2525,8 @@ def _metadata_deletion_is_ambiguous(
         return not displaced_exists
     return metadata_phase in {
         COORDINATOR_PHASE_PREPARED,
+        COORDINATOR_PHASE_APPLYING_PAYLOAD,
+        COORDINATOR_PHASE_PAYLOAD_APPLIED,
         COORDINATOR_PHASE_PUBLISHING_METADATA,
         COORDINATOR_PHASE_METADATA_PUBLISHED,
     }
@@ -2998,7 +3497,7 @@ def recover_incomplete_skill_transactions(skills_root: Path) -> None:
                 f"Update transaction state is missing at {transaction_root}; "
                 "recovery data was preserved for manual inspection."
             )
-            if _is_metadata_journal_name(transaction_root):
+            if _uses_structured_recovery_outcome(transaction_root):
                 raise AgentSkillRecoveryUncertainError(
                     _uncertain_recovery_outcome(transaction_root, error)
                 ) from error
@@ -3006,7 +3505,7 @@ def recover_incomplete_skill_transactions(skills_root: Path) -> None:
         try:
             transaction_type, state = _read_recovery_state(transaction_root, skills_root)
         except (AgentSkillUpdaterError, OSError, ValueError) as exc:
-            if not _is_metadata_journal_name(transaction_root):
+            if not _uses_structured_recovery_outcome(transaction_root):
                 raise
             raise AgentSkillRecoveryUncertainError(
                 _uncertain_recovery_outcome(transaction_root, exc)
@@ -3056,7 +3555,7 @@ def _recover_skill_transactions_locked(skill_dir: Path) -> None:
                 state,
             )
         except (AgentSkillUpdaterError, OSError, ValueError) as exc:
-            if _is_metadata_journal_name(transaction_root):
+            if _uses_structured_recovery_outcome(transaction_root):
                 raise AgentSkillRecoveryUncertainError(
                     _uncertain_recovery_outcome(transaction_root, exc)
                 ) from exc
@@ -3068,15 +3567,24 @@ def _recover_skill_transactions_locked(skill_dir: Path) -> None:
 def _read_recovery_state(
     transaction_root: Path,
     skills_root: Path,
-) -> tuple[str, dict | _MetadataJournal]:
+) -> tuple[str, dict | _MetadataJournal | _GitJournal]:
     transaction_type = _read_transaction_type(transaction_root)
     if transaction_type == COORDINATOR_TRANSACTION_TYPE:
-        state = _decode_coordinator_metadata_journal(
-            _read_coordinator_transaction_state(transaction_root, skills_root)
+        coordinator_state = _read_coordinator_transaction_state(
+            transaction_root,
+            skills_root,
         )
+        if coordinator_state["transactionKind"] == GIT_WORKTREE_TRANSACTION_KIND:
+            state = _decode_coordinator_git_journal(coordinator_state)
+        else:
+            state = _decode_coordinator_metadata_journal(coordinator_state)
     elif transaction_type == METADATA_TRANSACTION_TYPE:
         state = _decode_legacy_metadata_journal(
             _read_metadata_transaction_state(transaction_root, skills_root)
+        )
+    elif transaction_type == GIT_TRANSACTION_TYPE:
+        state = _decode_legacy_git_journal(
+            _read_git_transaction_state(transaction_root, skills_root)
         )
     else:
         state = _read_typed_transaction_state(
@@ -3087,26 +3595,25 @@ def _read_recovery_state(
     return transaction_type, state
 
 
-def _decoded_skill_dir(state: dict | _MetadataJournal) -> Path:
-    return state.skill_dir if isinstance(state, _MetadataJournal) else Path(state["skillDir"])
+def _decoded_skill_dir(state: dict | _MetadataJournal | _GitJournal) -> Path:
+    if isinstance(state, (_MetadataJournal, _GitJournal)):
+        return state.skill_dir
+    return Path(state["skillDir"])
 
 
 def _recover_decoded_transaction_locked(
     transaction_root: Path,
     transaction_type: str,
-    state: dict | _MetadataJournal,
+    state: dict | _MetadataJournal | _GitJournal,
 ) -> TransactionOutcome:
-    if transaction_type in {COORDINATOR_TRANSACTION_TYPE, METADATA_TRANSACTION_TYPE}:
-        if not isinstance(state, _MetadataJournal):
-            raise AgentSkillUpdaterError(f"Invalid decoded metadata journal: {transaction_root}")
+    if isinstance(state, _MetadataJournal):
         return _recover_metadata_journal_locked(transaction_root, state)
+    if isinstance(state, _GitJournal):
+        return _recover_git_journal_locked(transaction_root, state)
     if not isinstance(state, dict):
         raise AgentSkillUpdaterError(f"Invalid decoded transaction journal: {transaction_root}")
     original_phase = state["phase"]
-    if transaction_type == GIT_TRANSACTION_TYPE:
-        _recover_git_transaction_from_state(transaction_root, state)
-    else:
-        _recover_transaction_from_state(transaction_root, state)
+    _recover_transaction_from_state(transaction_root, state)
     return _legacy_recovery_outcome(state, original_phase)
 
 
@@ -3148,21 +3655,32 @@ def _read_coordinator_transaction_state(
     if (
         state["version"] != COORDINATOR_TRANSACTION_STATE_VERSION
         or state["transactionType"] != COORDINATOR_TRANSACTION_TYPE
-        or state["transactionKind"] != METADATA_ONLY_TRANSACTION_KIND
+        or state["transactionKind"] not in {
+            METADATA_ONLY_TRANSACTION_KIND,
+            GIT_WORKTREE_TRANSACTION_KIND,
+        }
         or state["phase"] not in COORDINATOR_PHASES
+        or (
+            state["transactionKind"] == METADATA_ONLY_TRANSACTION_KIND
+            and state["phase"] in {
+                COORDINATOR_PHASE_APPLYING_PAYLOAD,
+                COORDINATOR_PHASE_PAYLOAD_APPLIED,
+            }
+        )
     ):
         raise AgentSkillUpdaterError(
             f"Unsupported Transaction Coordinator journal at {transaction_root}."
         )
     evidence = state["evidence"]
-    if not isinstance(evidence, dict) or set(evidence) != {
-        "beforeMetadata",
-        "expectedMetadata",
-    }:
+    expected_evidence_keys = {"beforeMetadata", "expectedMetadata"}
+    if state["transactionKind"] == GIT_WORKTREE_TRANSACTION_KIND:
+        expected_evidence_keys.add("git")
+    if not isinstance(evidence, dict) or set(evidence) != expected_evidence_keys:
         raise AgentSkillUpdaterError(
             f"Invalid Transaction Evidence at {transaction_root}."
         )
-    for label, record in evidence.items():
+    for label in ("beforeMetadata", "expectedMetadata"):
+        record = evidence[label]
         if not isinstance(record, dict) or set(record) != {"present", "sha256"}:
             raise AgentSkillUpdaterError(
                 f"Invalid {label} Transaction Evidence at {transaction_root}."
@@ -3181,6 +3699,8 @@ def _read_coordinator_transaction_state(
             raise AgentSkillUpdaterError(
                 f"Invalid {label} Transaction Evidence at {transaction_root}."
             )
+    if state["transactionKind"] == GIT_WORKTREE_TRANSACTION_KIND:
+        _validate_coordinator_git_evidence(state, transaction_root)
     skill_dir = Path(state["skillDir"])
     if not _same_path(skill_dir.parent, skills_root):
         raise AgentSkillUpdaterError(
@@ -3214,6 +3734,124 @@ def _decode_coordinator_metadata_journal(state: dict) -> _MetadataJournal:
     )
 
 
+def _validate_coordinator_git_evidence(state: dict, transaction_root: Path) -> None:
+    git = state["evidence"]["git"]
+    required = {
+        "entryType",
+        "branch",
+        "branchRef",
+        "remoteRef",
+        "originIdentity",
+        "originalCommit",
+        "expectedCommit",
+        "originalSignature",
+        "expectedSignature",
+        "ignoredSignature",
+        "ignoredPaths",
+        "temporaryRefs",
+    }
+    if not isinstance(git, dict) or set(git) != required:
+        raise AgentSkillUpdaterError(
+            f"Invalid Git Transaction Evidence at {transaction_root}."
+        )
+    string_keys = required - {"ignoredPaths", "temporaryRefs"}
+    if not all(isinstance(git[key], str) and git[key] for key in string_keys):
+        raise AgentSkillUpdaterError(
+            f"Invalid Git Transaction Evidence at {transaction_root}."
+        )
+    if (
+        git["entryType"] not in PAYLOAD_CONTRACTS
+        or git["branchRef"] != f"refs/heads/{git['branch']}"
+        or not git["remoteRef"].startswith("refs/remotes/origin/")
+        or normalize_git_commit(git["originalCommit"]) is None
+        or normalize_git_commit(git["expectedCommit"]) is None
+        or state["targetRevision"] != git["expectedCommit"]
+        or state["targetVersion"] != git["expectedCommit"]
+    ):
+        raise AgentSkillUpdaterError(
+            f"Invalid Git identity evidence at {transaction_root}."
+        )
+    for key in ("originalSignature", "expectedSignature", "ignoredSignature"):
+        if re.fullmatch(r"[0-9a-f]{64}", git[key]) is None:
+            raise AgentSkillUpdaterError(
+                f"Invalid Git signature evidence at {transaction_root}."
+            )
+    ignored_paths = git["ignoredPaths"]
+    if (
+        not isinstance(ignored_paths, list)
+        or not all(_is_valid_git_payload_relative_path(path) for path in ignored_paths)
+        or ignored_paths
+        != sorted(ignored_paths, key=lambda path: (path.casefold(), path))
+        or len({os.path.normcase(path) for path in ignored_paths}) != len(ignored_paths)
+    ):
+        raise AgentSkillUpdaterError(
+            f"Invalid ignored Git payload evidence at {transaction_root}."
+        )
+    refs = git["temporaryRefs"]
+    if not isinstance(refs, dict) or set(refs) != {"original", "expected"}:
+        raise AgentSkillUpdaterError(
+            f"Invalid Git temporary refs at {transaction_root}."
+        )
+    expected_refs = _git_transaction_temporary_refs(transaction_root)
+    if refs != expected_refs:
+        raise AgentSkillUpdaterError(
+            f"Invalid Git temporary refs at {transaction_root}."
+        )
+
+
+def _decode_coordinator_git_journal(state: dict) -> _GitJournal:
+    evidence = state["evidence"]
+    before = evidence["beforeMetadata"]
+    expected = evidence["expectedMetadata"]
+    git = evidence["git"]
+    refs = git["temporaryRefs"]
+    return _GitJournal(
+        skill_name=state["skillName"],
+        skill_dir=Path(state["skillDir"]),
+        phase=state["phase"],
+        target_version=state["targetVersion"],
+        metadata_evidence=_ControlMetadataEvidence(
+            before_present=before["present"],
+            before_sha256=before["sha256"],
+            expected_sha256=expected["sha256"],
+        ),
+        git_evidence=_GitTransactionEvidence(
+            entry_type=git["entryType"],
+            branch=git["branch"],
+            branch_ref=git["branchRef"],
+            remote_ref=git["remoteRef"],
+            origin_identity=git["originIdentity"],
+            original_commit=git["originalCommit"],
+            expected_commit=git["expectedCommit"],
+            original_signature=git["originalSignature"],
+            expected_signature=git["expectedSignature"],
+            ignored_signature=git["ignoredSignature"],
+            ignored_paths=tuple(git["ignoredPaths"]),
+            original_temporary_ref=refs["original"],
+            expected_temporary_ref=refs["expected"],
+        ),
+        writable_state=state,
+    )
+
+
+def _decode_legacy_git_journal(state: dict) -> _GitJournal:
+    metadata = _ControlMetadataEvidence(
+        before_present=state["originalMetadataPresent"],
+        before_sha256=state["originalMetadataSha256"],
+        expected_sha256=state["expectedMetadataSha256"],
+    )
+    return _GitJournal(
+        skill_name=state["skillName"],
+        skill_dir=Path(state["skillDir"]),
+        phase=state["phase"],
+        target_version=state["expectedHead"],
+        metadata_evidence=metadata,
+        git_evidence=None,
+        writable_state=None,
+        legacy_state=state,
+    )
+
+
 def _decode_legacy_metadata_journal(state: dict) -> _MetadataJournal:
     phase = state["phase"]
     if phase == TRANSACTION_PHASE_PREPARED:
@@ -3244,10 +3882,6 @@ def _recover_metadata_journal_locked(
 ) -> TransactionOutcome:
     skill_dir = journal.skill_dir
     _validate_skill_root(skill_dir)
-    original_content, expected_content = _read_verified_transaction_metadata_snapshots(
-        transaction_root,
-        journal.evidence,
-    )
     if journal.phase == COORDINATOR_PHASE_COMMITTED:
         _validate_transaction_metadata(skill_dir, journal.evidence, expected=True)
         try:
@@ -3274,6 +3908,10 @@ def _recover_metadata_journal_locked(
             action="metadata_refreshed",
             version=journal.target_version,
         )
+    original_content, expected_content = _read_verified_transaction_metadata_snapshots(
+        transaction_root,
+        journal.evidence,
+    )
     if journal.phase == COORDINATOR_PHASE_PREPARED:
         _validate_transaction_metadata(skill_dir, journal.evidence, expected=False)
         _remove_transaction_tree(transaction_root)
@@ -3336,6 +3974,261 @@ def _recover_metadata_journal_locked(
     )
 
 
+def _recover_git_journal_locked(
+    transaction_root: Path,
+    journal: _GitJournal,
+) -> TransactionOutcome:
+    if journal.legacy_state is not None:
+        return _recover_legacy_git_v3_journal(transaction_root, journal)
+    evidence = journal.git_evidence
+    state = journal.writable_state
+    if evidence is None or state is None:
+        raise AgentSkillUpdaterError(f"Invalid decoded Git journal: {transaction_root}")
+    _validate_skill_root(journal.skill_dir)
+
+    if journal.phase == COORDINATOR_PHASE_COMMITTED:
+        try:
+            _validate_git_identity(
+                journal.skill_dir,
+                evidence,
+                expected=True,
+                require_configuration=True,
+            )
+            _validate_transaction_metadata(
+                journal.skill_dir,
+                journal.metadata_evidence,
+                expected=True,
+            )
+        except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+            return _uncertain_recovery_outcome(transaction_root, exc)
+        try:
+            _cleanup_git_transaction(journal.skill_dir, transaction_root, evidence)
+        except (AgentSkillUpdaterError, OSError) as exc:
+            return TransactionOutcome(
+                name=journal.skill_name,
+                status="error",
+                installed_state="committed",
+                applied=True,
+                action="fast_forwarded",
+                version=journal.target_version,
+                error_message=(
+                    f"Committed Git update is valid, but cleanup failed at "
+                    f"{transaction_root}: {exc}"
+                ),
+                cleanup_residue=transaction_root,
+            )
+        return TransactionOutcome(
+            name=journal.skill_name,
+            status="recovered",
+            installed_state="committed",
+            applied=True,
+            action="fast_forwarded",
+            version=journal.target_version,
+        )
+
+    _establish_git_temporary_refs(journal.skill_dir, evidence)
+    original_metadata, expected_metadata = _read_verified_transaction_metadata_snapshots(
+        transaction_root,
+        journal.metadata_evidence,
+    )
+
+    if journal.phase not in {
+        COORDINATOR_PHASE_PREPARED,
+        COORDINATOR_PHASE_ROLLED_BACK,
+    }:
+        try:
+            _validate_git_identity(
+                journal.skill_dir,
+                evidence,
+                expected=True,
+                require_configuration=True,
+            )
+            _validate_transaction_metadata(
+                journal.skill_dir,
+                journal.metadata_evidence,
+                expected=True,
+            )
+        except (AgentSkillUpdaterError, OSError, ValueError):
+            pass
+        else:
+            _set_coordinator_phase(
+                transaction_root,
+                state,
+                COORDINATOR_PHASE_COMMITTED,
+            )
+            return _recover_git_journal_locked(
+                transaction_root,
+                _decode_coordinator_git_journal(state),
+            )
+
+    try:
+        _establish_git_identity(journal.skill_dir, evidence, expected=False)
+        recovery_path = _rollback_transaction_metadata(
+            transaction_root,
+            journal.phase,
+            journal.skill_dir / ".openskills.json",
+            original_metadata,
+            expected_metadata,
+        )
+        if recovery_path is not None:
+            raise AgentSkillUpdaterError(
+                f"Concurrent metadata was preserved at {recovery_path}."
+            )
+        _validate_transaction_metadata(
+            journal.skill_dir,
+            journal.metadata_evidence,
+            expected=False,
+        )
+        if journal.phase != COORDINATOR_PHASE_PREPARED:
+            _set_coordinator_phase(
+                transaction_root,
+                state,
+                COORDINATOR_PHASE_ROLLED_BACK,
+            )
+    except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+        return _uncertain_recovery_outcome(transaction_root, exc)
+    installed_state = (
+        "unchanged"
+        if journal.phase == COORDINATOR_PHASE_PREPARED
+        else "rolled_back"
+    )
+    try:
+        _cleanup_git_transaction(journal.skill_dir, transaction_root, evidence)
+    except (AgentSkillUpdaterError, OSError) as exc:
+        return TransactionOutcome(
+            name=journal.skill_name,
+            status="error",
+            installed_state=installed_state,
+            applied=False,
+            action="none",
+            version=journal.target_version,
+            error_message=(
+                f"Git recovery established {installed_state}, but cleanup failed at "
+                f"{transaction_root}: {exc}"
+            ),
+            cleanup_residue=transaction_root,
+        )
+    return TransactionOutcome(
+        name=journal.skill_name,
+        status="recovered",
+        installed_state=installed_state,
+        applied=False,
+        action="none",
+        version=journal.target_version,
+    )
+
+
+def _recover_legacy_git_v3_journal(
+    transaction_root: Path,
+    journal: _GitJournal,
+) -> TransactionOutcome:
+    state = journal.legacy_state
+    if state is None:
+        raise AgentSkillUpdaterError(f"Invalid Git v3 journal: {transaction_root}")
+    skill_dir = journal.skill_dir
+    _validate_transaction_root(transaction_root, skill_dir.parent)
+    _validate_skill_root(skill_dir)
+    phase = state["phase"]
+    if phase == GIT_TRANSACTION_PHASE_COMMITTED:
+        _validate_git_worktree_revision(
+            skill_dir,
+            state["originalBranch"],
+            state["expectedHead"],
+            state["expectedSignature"],
+            state["entryType"],
+        )
+        _validate_transaction_metadata(skill_dir, state, expected=True)
+        try:
+            _remove_transaction_tree(transaction_root)
+        except (AgentSkillUpdaterError, OSError) as exc:
+            return TransactionOutcome(
+                name=journal.skill_name,
+                status="error",
+                installed_state="committed",
+                applied=True,
+                action="fast_forwarded",
+                version=journal.target_version,
+                error_message=(
+                    f"Committed legacy Git update is valid, but cleanup failed at "
+                    f"{transaction_root}: {exc}"
+                ),
+                cleanup_residue=transaction_root,
+            )
+        return TransactionOutcome(
+            name=journal.skill_name,
+            status="recovered",
+            installed_state="committed",
+            applied=True,
+            action="fast_forwarded",
+            version=journal.target_version,
+        )
+
+    original_metadata, expected_metadata = _read_verified_transaction_metadata_snapshots(
+        transaction_root,
+        state,
+    )
+    if phase == GIT_TRANSACTION_PHASE_PREPARED:
+        _validate_git_worktree_revision(
+            skill_dir,
+            state["originalBranch"],
+            state["originalHead"],
+            state["originalSignature"],
+            state["entryType"],
+        )
+        _validate_transaction_metadata(skill_dir, state, expected=False)
+        _remove_transaction_tree(transaction_root)
+        installed_state = "unchanged"
+    elif phase == GIT_TRANSACTION_PHASE_ROLLED_BACK:
+        _validate_git_worktree_revision(
+            skill_dir,
+            state["originalBranch"],
+            state["originalHead"],
+            state["originalSignature"],
+            state["entryType"],
+        )
+        _validate_transaction_metadata(skill_dir, state, expected=False)
+        _remove_transaction_tree(transaction_root)
+        installed_state = "rolled_back"
+    else:
+        original_payload = _transaction_subdirectory(transaction_root, "original")
+        incoming_payload = _transaction_subdirectory(transaction_root, "incoming")
+        recovery_path = _rollback_git_fast_forward(
+            skill_dir,
+            state["originalHead"],
+            state["expectedHead"],
+            state["originalBranch"],
+            original_payload,
+            incoming_payload,
+            transaction_root,
+            state["originalSignature"],
+            state["incomingSignature"],
+            state["entryType"],
+        )
+        metadata_recovery = _rollback_transaction_metadata(
+            transaction_root,
+            _decode_legacy_metadata_phase(state["metadataPhase"]),
+            skill_dir / ".openskills.json",
+            original_metadata,
+            expected_metadata,
+        )
+        if recovery_path is not None or metadata_recovery is not None:
+            raise AgentSkillUpdaterError(
+                "Legacy Git recovery encountered concurrent data; the Diagnostic Journal "
+                "was preserved."
+            )
+        _validate_transaction_metadata(skill_dir, state, expected=False)
+        _remove_transaction_tree(transaction_root)
+        installed_state = "rolled_back"
+    return TransactionOutcome(
+        name=journal.skill_name,
+        status="recovered",
+        installed_state=installed_state,
+        applied=False,
+        action="none",
+        version=journal.target_version,
+    )
+
+
 def _legacy_recovery_outcome(state: dict, original_phase: str) -> TransactionOutcome:
     committed = original_phase in {
         TRANSACTION_PHASE_COMMITTED,
@@ -3358,10 +4251,10 @@ def _transaction_skill_name_hint(transaction_root: Path) -> str:
     return transaction_root.name
 
 
-def _is_metadata_journal_name(transaction_root: Path) -> bool:
+def _uses_structured_recovery_outcome(transaction_root: Path) -> bool:
     return any(
         marker in transaction_root.name
-        for marker in (".transaction-", ".metadata-update-")
+        for marker in (".transaction-", ".metadata-update-", ".git-update-")
     )
 
 
@@ -3380,113 +4273,6 @@ def _uncertain_recovery_outcome(
         ),
         diagnostic_journal=transaction_root,
     )
-
-
-def _recover_git_transaction_from_state(transaction_root: Path, state: dict) -> None:
-    skill_dir = Path(state["skillDir"])
-    _validate_transaction_root(transaction_root, skill_dir.parent)
-    _validate_skill_root(skill_dir)
-    phase = state["phase"]
-    if phase == GIT_TRANSACTION_PHASE_COMMITTED:
-        _validate_git_worktree_revision(
-            skill_dir,
-            state["originalBranch"],
-            state["expectedHead"],
-            state["expectedSignature"],
-            state["entryType"],
-        )
-        _validate_safe_metadata_path(skill_dir)
-        _remove_transaction_tree(transaction_root)
-        return
-
-    if phase == GIT_TRANSACTION_PHASE_PREPARED:
-        _validate_git_worktree_revision(
-            skill_dir,
-            state["originalBranch"],
-            state["originalHead"],
-            state["originalSignature"],
-            state["entryType"],
-        )
-        _validate_safe_metadata_path(skill_dir)
-        _remove_transaction_tree(transaction_root)
-        return
-
-    if phase == GIT_TRANSACTION_PHASE_ROLLED_BACK:
-        _validate_git_worktree_revision(
-            skill_dir,
-            state["originalBranch"],
-            state["originalHead"],
-            state["originalSignature"],
-            state["entryType"],
-        )
-        if state.get("recoveryPath"):
-            _validate_safe_metadata_path(skill_dir)
-        else:
-            _validate_transaction_metadata(skill_dir, state, expected=False)
-        recovery_path = _safe_recovery_directory(
-            skill_dir,
-            transaction_root,
-            create=False,
-        )
-        has_recovery_data = recovery_path is not None and any(recovery_path.iterdir())
-        _remove_transaction_tree(transaction_root)
-        if has_recovery_data:
-            raise AgentSkillUpdaterError(
-                f"Interrupted Git update for '{skill_dir.name}' was rolled back; concurrent data "
-                f"was preserved at {recovery_path}."
-            )
-        return
-
-    original_payload = _transaction_subdirectory(transaction_root, "original")
-    incoming_payload = _transaction_subdirectory(transaction_root, "incoming")
-    original_metadata, expected_metadata = _read_verified_transaction_metadata_snapshots(
-        transaction_root,
-        state,
-    )
-    _safe_recovery_directory(skill_dir, transaction_root, create=False)
-    recovery_path = _rollback_git_fast_forward(
-        skill_dir,
-        state["originalHead"],
-        state["expectedHead"],
-        state["originalBranch"],
-        original_payload,
-        incoming_payload,
-        transaction_root,
-        state["originalSignature"],
-        state["incomingSignature"],
-        state["entryType"],
-    )
-    metadata_path = skill_dir / ".openskills.json"
-    metadata_recovery = _rollback_transaction_metadata(
-        transaction_root,
-        _decode_legacy_metadata_phase(state["metadataPhase"]),
-        metadata_path,
-        original_metadata,
-        expected_metadata,
-    )
-    recovery_path = recovery_path or metadata_recovery
-    _validate_git_worktree_revision(
-        skill_dir,
-        state["originalBranch"],
-        state["originalHead"],
-        state["originalSignature"],
-        state["entryType"],
-    )
-    if metadata_recovery is None:
-        _validate_transaction_metadata(skill_dir, state, expected=False)
-    if recovery_path is not None:
-        state["recoveryPath"] = str(recovery_path)
-    _set_git_transaction_phase(
-        transaction_root,
-        state,
-        GIT_TRANSACTION_PHASE_ROLLED_BACK,
-    )
-    _remove_transaction_tree(transaction_root)
-    if recovery_path is not None:
-        raise AgentSkillUpdaterError(
-            f"Interrupted Git update for '{skill_dir.name}' was rolled back; concurrent data "
-            f"was preserved at {recovery_path}."
-        )
 
 
 def _read_verified_transaction_metadata_snapshots(
@@ -3523,23 +4309,6 @@ def _read_verified_transaction_metadata_snapshots(
             f"Transaction metadata snapshot verification failed: {expected_path}"
         )
     return original_content, expected_content
-
-
-def _validate_git_transaction_worktree(
-    skill_dir: Path,
-    state: dict,
-    *,
-    expected: bool,
-) -> None:
-    prefix = "expected" if expected else "original"
-    _validate_git_worktree_revision(
-        skill_dir,
-        state["originalBranch"],
-        state[f"{prefix}Head"],
-        state[f"{prefix}Signature"],
-        state["entryType"],
-    )
-    _validate_transaction_metadata(skill_dir, state, expected=expected)
 
 
 def _validate_git_worktree_revision(
@@ -3992,15 +4761,6 @@ def _set_transaction_phase(transaction_root: Path, state: dict, phase: str) -> N
     state.update(next_state)
 
 
-def _set_git_transaction_phase(transaction_root: Path, state: dict, phase: str) -> None:
-    if phase not in GIT_TRANSACTION_PHASES:
-        raise AgentSkillUpdaterError(f"Invalid Git transaction phase: {phase}")
-    next_state = {**state, "phase": phase}
-    _write_json_atomic(transaction_root / TRANSACTION_STATE_FILENAME, next_state)
-    state.clear()
-    state.update(next_state)
-
-
 def _set_transaction_metadata_phase(
     transaction_root: Path,
     state: dict,
@@ -4051,17 +4811,6 @@ COORDINATOR_METADATA_PHASES = _MetadataPhaseProtocol(
     publish_failed=COORDINATOR_PHASE_METADATA_PUBLISH_FAILED,
     published=COORDINATOR_PHASE_METADATA_PUBLISHED,
 )
-
-
-def _set_git_transaction_expected_signature(
-    transaction_root: Path,
-    state: dict,
-    expected_signature: str,
-) -> None:
-    next_state = {**state, "expectedSignature": expected_signature}
-    _write_json_atomic(transaction_root / TRANSACTION_STATE_FILENAME, next_state)
-    state.clear()
-    state.update(next_state)
 
 
 def _read_git_transaction_state(transaction_root: Path, skills_root: Path) -> dict:
