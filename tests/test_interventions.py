@@ -1,5 +1,6 @@
 import json
 import hashlib
+import os
 import tempfile
 import unittest
 import shutil
@@ -391,6 +392,93 @@ class InterventionTests(unittest.TestCase):
             )
             self.assertEqual(resumed["status"], "cleaned")
             self.assertFalse(residue.exists())
+
+    def test_final_tombstone_removal_failure_keeps_completion_receipt_and_resumes(self):
+        from scripts.interventions import cleanup_intervention, inventory_interventions
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "interventions"
+            artifact_id = "demo-content-conflict-final-rmdir"
+            record = root / artifact_id
+            record.mkdir(parents=True)
+            (record / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "artifactId": artifact_id,
+                        "recordType": "content-conflict",
+                        "skillName": "demo",
+                        "createdAt": "2026-07-31T00:00:00Z",
+                        "resolutionState": "resolved",
+                        "recoveryState": None,
+                        "retentionStartedAt": "2026-08-01T00:00:00Z",
+                        "retentionExpiresAt": "2026-08-16T00:00:00Z",
+                        "retentionGroup": [
+                            {"role": "intervention-record", "path": artifact_id},
+                        ],
+                        "diagnosticReferences": ["conflicts/SKILL.md"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            tombstone = root / f".tombstone-{artifact_id}"
+            completion = Path(f"{tombstone}.complete.json")
+            real_rmdir = os.rmdir
+
+            def fail_final_rmdir(path, *args, **kwargs):
+                if Path(path) == tombstone:
+                    raise OSError("injected final tombstone removal failure")
+                return real_rmdir(path, *args, **kwargs)
+
+            with mock.patch("scripts.interventions.os.rmdir", side_effect=fail_final_rmdir):
+                failed = cleanup_intervention(
+                    root,
+                    artifact_id,
+                    now=datetime(2026, 8, 17, tzinfo=timezone.utc),
+                )
+
+            self.assertEqual(failed["status"], "error")
+            self.assertTrue(tombstone.is_dir())
+            self.assertTrue(completion.is_file())
+            self.assertFalse((tombstone / "tombstone.json").exists())
+
+            inventory = inventory_interventions(root)
+            self.assertEqual(len(inventory), 1)
+            self.assertEqual(inventory[0]["artifact_id"], artifact_id)
+            self.assertEqual(inventory[0]["cleanup_status"], "residue")
+
+            resumed = cleanup_intervention(
+                root,
+                artifact_id,
+                now=datetime(2026, 8, 17, tzinfo=timezone.utc),
+            )
+            self.assertEqual(resumed["status"], "cleaned")
+            self.assertFalse(tombstone.exists())
+            self.assertFalse(completion.exists())
+
+    def test_inventory_rejects_tombstone_identity_mismatch(self):
+        from scripts.interventions import InterventionError, inventory_interventions
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "interventions"
+            tombstone = root / ".tombstone-wrong-artifact"
+            tombstone.mkdir(parents=True)
+            (tombstone / "tombstone.json").write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "artifactId": "right-artifact",
+                        "recordType": "content-conflict",
+                        "installedState": "unchanged",
+                        "inventory": {},
+                        "members": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(InterventionError, "identity mismatch"):
+                inventory_interventions(root)
 
     def test_cleanup_rejects_recovery_group_when_journal_is_missing(self):
         from scripts.interventions import (

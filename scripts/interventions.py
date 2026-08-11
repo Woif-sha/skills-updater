@@ -49,6 +49,11 @@ def inventory_interventions(
     observed_at = _utc_datetime(now or datetime.now(timezone.utc), "inventory time")
     inventory: list[dict[str, object]] = []
     for record_path in sorted(interventions_root.iterdir(), key=lambda path: path.name):
+        if record_path.name.endswith(".complete.json"):
+            tombstone = Path(str(record_path)[: -len(".complete.json")])
+            if not os.path.lexists(tombstone):
+                inventory.append(_inventory_tombstone(tombstone))
+            continue
         if record_path.name.startswith(".tombstone-"):
             inventory.append(_inventory_tombstone(record_path))
             continue
@@ -202,7 +207,7 @@ def cleanup_intervention(
         return _cleanup_result(artifact_id, status="already_cleaned", cleaned=True)
     _require_regular_directory(interventions_root, "Intervention root")
     tombstone = interventions_root / f".tombstone-{artifact_id}"
-    if os.path.lexists(tombstone):
+    if os.path.lexists(tombstone) or os.path.lexists(_tombstone_completion(tombstone)):
         return _resume_tombstone(tombstone)
     record_path = interventions_root / artifact_id
     if not os.path.lexists(record_path):
@@ -236,18 +241,10 @@ def cleanup_intervention(
 
 
 def _resume_tombstone(tombstone: Path) -> dict[str, object]:
-    _require_regular_directory(tombstone, "Intervention tombstone")
+    if os.path.lexists(tombstone):
+        _require_regular_directory(tombstone, "Intervention tombstone")
     intent = _read_tombstone_intent(tombstone)
-    artifact_id = _validate_artifact_id(intent.get("artifactId"))
-    expected_tombstone = tombstone.parent / f".tombstone-{artifact_id}"
-    if tombstone != expected_tombstone or intent.get("schemaVersion") != INTERVENTION_SCHEMA_VERSION:
-        raise InterventionError(f"Intervention tombstone identity mismatch: {tombstone}")
-    installed_state = intent.get("installedState")
-    if (
-        not isinstance(installed_state, str)
-        or installed_state not in {"unchanged", "committed", "rolled_back"}
-    ):
-        raise InterventionError(f"Invalid Installed State in tombstone: {tombstone}")
+    artifact_id, installed_state = _validate_tombstone_envelope(tombstone, intent)
     members = intent.get("members")
     if not isinstance(members, list) or not members:
         raise InterventionError(f"Intervention tombstone has no retention group: {tombstone}")
@@ -263,7 +260,7 @@ def _resume_tombstone(tombstone: Path) -> dict[str, object]:
             cleaned=False,
             installed_state=installed_state,
             error_message=f"Intervention cleanup failed at {tombstone}: {exc}",
-            cleanup_residue=str(tombstone),
+            cleanup_residue=str(_tombstone_residue(tombstone)),
         )
     return _cleanup_result(
         artifact_id,
@@ -275,6 +272,7 @@ def _resume_tombstone(tombstone: Path) -> dict[str, object]:
 
 def _inventory_tombstone(tombstone: Path) -> dict[str, object]:
     intent = _read_tombstone_intent(tombstone)
+    _validate_tombstone_envelope(tombstone, intent)
     _validate_tombstone_members(tombstone, intent)
     item = intent.get("inventory")
     required = {
@@ -294,12 +292,14 @@ def _inventory_tombstone(tombstone: Path) -> dict[str, object]:
     return {
         **item,
         "cleanup_status": "residue",
-        "cleanup_residue": str(tombstone),
+        "cleanup_residue": str(_tombstone_residue(tombstone)),
     }
 
 
 def _read_tombstone_intent(tombstone: Path) -> dict:
     intent_path = tombstone / "tombstone.json"
+    if not os.path.lexists(intent_path):
+        intent_path = _tombstone_completion(tombstone)
     if intent_path.is_symlink() or not intent_path.is_file():
         raise InterventionError(f"Intervention tombstone intent is missing: {intent_path}")
     try:
@@ -309,6 +309,26 @@ def _read_tombstone_intent(tombstone: Path) -> dict:
     if not isinstance(intent, dict):
         raise InterventionError(f"Intervention tombstone intent must be an object: {intent_path}")
     return intent
+
+
+def _validate_tombstone_envelope(
+    tombstone: Path,
+    intent: dict,
+) -> tuple[str, str]:
+    artifact_id = _validate_artifact_id(intent.get("artifactId"))
+    expected_tombstone = tombstone.parent / f".tombstone-{artifact_id}"
+    if (
+        tombstone != expected_tombstone
+        or intent.get("schemaVersion") != INTERVENTION_SCHEMA_VERSION
+    ):
+        raise InterventionError(f"Intervention tombstone identity mismatch: {tombstone}")
+    installed_state = intent.get("installedState")
+    if (
+        not isinstance(installed_state, str)
+        or installed_state not in {"unchanged", "committed", "rolled_back"}
+    ):
+        raise InterventionError(f"Invalid Installed State in tombstone: {tombstone}")
+    return artifact_id, installed_state
 
 
 def _validate_tombstone_members(tombstone: Path, intent: dict) -> None:
@@ -544,8 +564,21 @@ def _remove_tombstone(tombstone: Path) -> None:
             member["state"] = "deleted"
             _write_tombstone_intent(tombstone, intent)
     _validate_tombstone_members(tombstone, intent)
-    (tombstone / "tombstone.json").unlink()
-    tombstone.rmdir()
+    intent_path = tombstone / "tombstone.json"
+    completion = _tombstone_completion(tombstone)
+    if os.path.lexists(intent_path):
+        os.rename(intent_path, completion)
+    if os.path.lexists(tombstone):
+        tombstone.rmdir()
+    completion.unlink()
+
+
+def _tombstone_completion(tombstone: Path) -> Path:
+    return Path(f"{tombstone}.complete.json")
+
+
+def _tombstone_residue(tombstone: Path) -> Path:
+    return tombstone if os.path.lexists(tombstone) else _tombstone_completion(tombstone)
 
 
 def _inventory_item(manifest: dict, observed_at: datetime) -> dict[str, object]:
