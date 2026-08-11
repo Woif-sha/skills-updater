@@ -17,6 +17,7 @@ if __package__:
         AgentSkillRecoveryUncertainError,
         AgentSkillUpdateCommittedError,
         AgentSkillUpdaterError,
+        GitIdentityEvidence,
         RemoteObservation,
         TransactionOutcome,
         apply_observed_update,
@@ -26,7 +27,6 @@ if __package__:
         probe_git_worktree,
         registry_entry_uses_git_worktree,
         resolve_skill_update,
-        update_git_worktree_skill,
         update_skill_from_staged,
         versions_match,
     )
@@ -41,6 +41,7 @@ else:
         AgentSkillRecoveryUncertainError,
         AgentSkillUpdateCommittedError,
         AgentSkillUpdaterError,
+        GitIdentityEvidence,
         RemoteObservation,
         TransactionOutcome,
         apply_observed_update,
@@ -50,7 +51,6 @@ else:
         probe_git_worktree,
         registry_entry_uses_git_worktree,
         resolve_skill_update,
-        update_git_worktree_skill,
         update_skill_from_staged,
         versions_match,
     )
@@ -158,23 +158,30 @@ def main() -> None:
 
                 source = agent_skill_source_from_registry_entry(entry)
                 if registry_entry_uses_git_worktree(entry):
-                    result = update_git_worktree_skill(source)
-                    item["status"] = result.status
-                    item["local_version"] = result.local_version
-                    item["remote_version"] = result.remote_version
-                    item["git_relation"] = result.relation
-                    item["working_tree_dirty"] = result.working_tree_dirty
-                    item["error_message"] = result.error_message
-                    item["applied"] = result.applied
-                    item["action"] = result.action
-                    item["installed_state"] = result.installed_state
-                    if result.diagnostic_journal is not None:
-                        item["diagnostic_journal"] = str(result.diagnostic_journal)
-                    if result.cleanup_residue is not None:
-                        item["cleanup_residue"] = str(result.cleanup_residue)
-                    if result.action in {"metadata_refreshed", "fast_forwarded"}:
-                        item["installed_base_version"] = result.remote_version
-                    if result.applied:
+                    remote_version = probe.remote_version
+                    if remote_version is None:
+                        raise AgentSkillUpdaterError(
+                            f"Git probe for '{name}' is missing its expected revision."
+                        )
+                    if (
+                        probe.status == "up_to_date"
+                        and entry.get("installedBaseVersion") == remote_version
+                    ):
+                        payload.append(item)
+                        continue
+                    outcome = apply_observed_update(
+                        source,
+                        _require_probe_observation(name, probe),
+                        installed_base_version=str(entry["installedBaseVersion"]),
+                    )
+                    _apply_transaction_outcome(item, outcome)
+                    if outcome.action == "fast_forwarded" and outcome.version is not None:
+                        item["local_version"] = outcome.version
+                        item["git_relation"] = "equal"
+                        item["working_tree_dirty"] = False
+                    if outcome.installed_state == "committed" and outcome.version is not None:
+                        item["installed_base_version"] = outcome.version
+                    if outcome.applied:
                         updated_names.append(name)
                     payload.append(item)
                     continue
@@ -446,6 +453,16 @@ def _probe_entry(entry: dict) -> EntryProbe:
             result = probe_git_worktree(source)
         except (AgentSkillUpdaterError, OSError, ValueError) as exc:
             return EntryProbe("error", local_version, None, str(exc))
+        observation = RemoteObservation.from_source(
+            source,
+            revision=result.remote_version,
+            version=result.remote_version,
+            git_identity=GitIdentityEvidence(
+                local_revision=result.local_version,
+                branch=result.branch,
+                remote_ref=result.remote_ref,
+            ),
+        )
         return EntryProbe(
             status=result.status,
             local_version=result.local_version,
@@ -453,6 +470,7 @@ def _probe_entry(entry: dict) -> EntryProbe:
             error_message=result.error_message,
             git_relation=result.relation,
             working_tree_dirty=result.working_tree_dirty,
+            remote_observation=observation,
         )
 
     try:

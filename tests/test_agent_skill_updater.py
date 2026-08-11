@@ -618,18 +618,13 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                 "skillsRoot": str(skills_root),
                 "entries": {"demo-pack": entry},
             }
-            result = SimpleNamespace(
+            result = updater.TransactionOutcome(
+                name="demo-pack",
                 status="up_to_date",
-                local_version=version_b,
-                remote_version=version_b,
-                relation="equal",
-                working_tree_dirty=False,
-                error_message=None,
+                installed_state="committed",
                 applied=True,
                 action="fast_forwarded",
-                installed_state="committed",
-                diagnostic_journal=None,
-                cleanup_residue=None,
+                version=version_b,
             )
             stdout = io.StringIO()
             with mock.patch.object(
@@ -647,10 +642,11 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                                 version_b,
                                 git_relation="behind",
                                 working_tree_dirty=False,
+                                remote_observation=mock.sentinel.observation,
                             ),
                         ):
                             with mock.patch(
-                                "scripts.update_agent_skills.update_git_worktree_skill",
+                                "scripts.update_agent_skills.apply_observed_update",
                                 return_value=result,
                             ) as git_update:
                                 with self.assertRaises(SystemExit) as exit_info:
