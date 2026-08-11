@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Iterator, Optional
@@ -95,8 +95,12 @@ METADATA_TRANSACTION_PHASES = frozenset(
 COORDINATOR_TRANSACTION_STATE_VERSION = 1
 COORDINATOR_TRANSACTION_TYPE = "coordinator"
 METADATA_ONLY_TRANSACTION_KIND = "metadata-only"
+SNAPSHOT_TRANSACTION_KIND = "snapshot"
+SNAPSHOT_INTERVENTION_TRANSACTION_KIND = "snapshot-intervention"
 GIT_WORKTREE_TRANSACTION_KIND = "git-worktree"
 COORDINATOR_PHASE_PREPARED = "prepared"
+COORDINATOR_PHASE_MOVING_PAYLOAD = "moving_payload"
+COORDINATOR_PHASE_INSTALLING_PAYLOAD = "installing_payload"
 COORDINATOR_PHASE_APPLYING_PAYLOAD = "applying_payload"
 COORDINATOR_PHASE_PAYLOAD_APPLIED = "payload_applied"
 COORDINATOR_PHASE_CAPTURING_METADATA = "capturing_metadata"
@@ -106,9 +110,13 @@ COORDINATOR_PHASE_METADATA_PUBLISH_FAILED = "metadata_publish_failed"
 COORDINATOR_PHASE_METADATA_PUBLISHED = "metadata_published"
 COORDINATOR_PHASE_COMMITTED = "committed"
 COORDINATOR_PHASE_ROLLED_BACK = "rolled_back"
+COORDINATOR_PHASE_INTERVENTION_READY = "intervention_ready"
+COORDINATOR_PHASE_PUBLISHING_INTERVENTION = "publishing_intervention"
 COORDINATOR_PHASES = frozenset(
     {
         COORDINATOR_PHASE_PREPARED,
+        COORDINATOR_PHASE_MOVING_PAYLOAD,
+        COORDINATOR_PHASE_INSTALLING_PAYLOAD,
         COORDINATOR_PHASE_APPLYING_PAYLOAD,
         COORDINATOR_PHASE_PAYLOAD_APPLIED,
         COORDINATOR_PHASE_CAPTURING_METADATA,
@@ -118,8 +126,37 @@ COORDINATOR_PHASES = frozenset(
         COORDINATOR_PHASE_METADATA_PUBLISHED,
         COORDINATOR_PHASE_COMMITTED,
         COORDINATOR_PHASE_ROLLED_BACK,
+        COORDINATOR_PHASE_INTERVENTION_READY,
+        COORDINATOR_PHASE_PUBLISHING_INTERVENTION,
     }
 )
+COORDINATOR_METADATA_LIFECYCLE_PHASES = frozenset(
+    {
+        COORDINATOR_PHASE_PREPARED,
+        COORDINATOR_PHASE_CAPTURING_METADATA,
+        COORDINATOR_PHASE_METADATA_CAPTURED,
+        COORDINATOR_PHASE_PUBLISHING_METADATA,
+        COORDINATOR_PHASE_METADATA_PUBLISH_FAILED,
+        COORDINATOR_PHASE_METADATA_PUBLISHED,
+        COORDINATOR_PHASE_COMMITTED,
+        COORDINATOR_PHASE_ROLLED_BACK,
+    }
+)
+COORDINATOR_KIND_PHASES = {
+    METADATA_ONLY_TRANSACTION_KIND: COORDINATOR_METADATA_LIFECYCLE_PHASES,
+    SNAPSHOT_TRANSACTION_KIND: COORDINATOR_METADATA_LIFECYCLE_PHASES
+    | {COORDINATOR_PHASE_MOVING_PAYLOAD, COORDINATOR_PHASE_INSTALLING_PAYLOAD},
+    SNAPSHOT_INTERVENTION_TRANSACTION_KIND: frozenset(
+        {
+            COORDINATOR_PHASE_PREPARED,
+            COORDINATOR_PHASE_INTERVENTION_READY,
+            COORDINATOR_PHASE_PUBLISHING_INTERVENTION,
+            COORDINATOR_PHASE_COMMITTED,
+        }
+    ),
+    GIT_WORKTREE_TRANSACTION_KIND: COORDINATOR_METADATA_LIFECYCLE_PHASES
+    | {COORDINATOR_PHASE_APPLYING_PAYLOAD, COORDINATOR_PHASE_PAYLOAD_APPLIED},
+}
 METADATA_PHASE_PREPARED = "prepared"
 METADATA_PHASE_CAPTURING = "capturing"
 METADATA_PHASE_CAPTURED = "captured"
@@ -167,6 +204,10 @@ class AgentSkillRecoveryUncertainError(AgentSkillUpdaterError):
 
 class AgentSkillMergeConflictError(AgentSkillUpdaterError):
     """Raised when local and remote payload edits require explicit resolution."""
+
+    def __init__(self, message: str, conflicts: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.conflicts = conflicts
 
 
 class _GitConcurrentChangeError(AgentSkillUpdaterError):
@@ -274,6 +315,23 @@ class RemoteObservation:
 
 
 @dataclass(frozen=True)
+class PreparedPayload:
+    payload_dir: Optional[Path]
+    payload_signature: Optional[str]
+    original_signature: str
+    exact_base_revision: str
+    remote_observation: Optional[RemoteObservation] = None
+    base_signature: Optional[str] = None
+    remote_signature: Optional[str] = None
+    base_dir: Optional[Path] = None
+    local_dir: Optional[Path] = None
+    remote_dir: Optional[Path] = None
+    conflict_dir: Optional[Path] = None
+    conflicts: tuple[str, ...] = ()
+    workspace_root: Optional[Path] = None
+
+
+@dataclass(frozen=True)
 class TransactionOutcome:
     name: str
     status: str
@@ -284,6 +342,7 @@ class TransactionOutcome:
     error_message: Optional[str] = None
     diagnostic_journal: Optional[Path] = None
     cleanup_residue: Optional[Path] = None
+    intervention_record: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -352,8 +411,41 @@ class _PayloadNode:
 ABSENT_PAYLOAD_NODE = _PayloadNode("absent")
 
 
+@dataclass
+class _SnapshotTransaction:
+    update: AgentSkillUpdate
+    root: Path
+    state: dict[str, object]
+    metadata_path: Path
+    original_metadata: bytes
+    expected_metadata: bytes
+    original_signature: str
+    expected_signature: str
+    state_written: bool = False
+
+    @property
+    def incoming_dir(self) -> Path:
+        return self.root / "incoming"
+
+    @property
+    def original_dir(self) -> Path:
+        return self.root / "original"
+
+    @property
+    def displaced_dir(self) -> Path:
+        return self.root / "displaced"
+
+    @property
+    def failed_dir(self) -> Path:
+        return self.root / "failed"
+
+
 def get_agent_skills_dir() -> Path:
     return Path.home() / ".agents" / "skills"
+
+
+def get_interventions_dir() -> Path:
+    return Path.home() / ".agents" / "interventions"
 
 
 def load_agent_skill_source(skill_dir: Path) -> AgentSkillSource:
@@ -731,8 +823,6 @@ def resolve_skill_update(
             raise AgentSkillUpdaterError(f"Skill '{source.name}' is missing repo metadata.")
 
         _require_remote_updates_enabled(source, installed_base_version)
-        local_signature = directory_signature(source.local_dir)
-        remote_signature = directory_signature(staged_dir)
     except (AgentSkillUpdaterError, OSError, ValueError) as exc:
         return AgentSkillUpdate(
             source=source,
@@ -744,15 +834,10 @@ def resolve_skill_update(
             error_message=str(exc),
         )
 
-    if local_signature == remote_signature:
-        status = "up_to_date"
-    else:
-        status = "update_available"
-
     return AgentSkillUpdate(
         source=source,
         staged_dir=staged_dir,
-        status=status,
+        status="update_available",
         installed_base_version=installed_base_version,
         local_version=local_version,
         remote_version=remote_version,
@@ -760,67 +845,90 @@ def resolve_skill_update(
     )
 
 
-def update_skill_from_staged(
-    update: AgentSkillUpdate,
-    backup_root: Path,
-) -> None:
+def prepare_snapshot_payload(update: AgentSkillUpdate) -> PreparedPayload:
     _require_remote_updates_enabled(update.source, update.installed_base_version)
     if update.status != "update_available" or update.staged_dir is None:
         raise AgentSkillUpdaterError(
-            f"Skill '{update.source.name}' has no staged update to apply."
+            f"Skill '{update.source.name}' has no staged update to prepare."
         )
-    if not update.remote_version:
+    if update.remote_observation is None or not update.remote_version:
         raise AgentSkillUpdaterError(
-            f"Skill '{update.source.name}' has no exact remote version to apply."
+            f"Skill '{update.source.name}' requires Remote Observation evidence for preparation."
         )
-    if is_git_worktree_skill(update.source.local_dir):
-        raise AgentSkillUpdaterError(
-            f"Skill '{update.source.name}' is a Git worktree; refusing file-level replacement."
+    _validate_remote_observation(update.source, update.remote_observation)
+    workspace_root = Path(
+        tempfile.mkdtemp(
+            prefix=f".{update.source.name}.prepare-",
+            dir=update.source.local_dir.parent,
         )
-
-    local_signature = _validate_skill_payload(
-        update.source.local_dir,
-        entry_type=update.source.entry_type,
     )
-    _validate_backup_root(backup_root)
-    backup_dir = backup_root / update.source.name
-    conflict_dir = backup_root / f"{update.source.name}.merge-conflicts"
-    for destination in (backup_dir, conflict_dir):
-        if os.path.lexists(destination):
-            raise AgentSkillUpdaterError(
-                f"Refusing to overwrite existing update evidence: {destination}"
-            )
-
-    with tempfile.TemporaryDirectory(
-        prefix=f".{update.source.name}.merge-",
-        dir=backup_root,
-    ) as temp_dir:
-        temp_root = Path(temp_dir)
-        base_dir = _stage_update_base(update, temp_root / "base")
-        merged_dir = temp_root / "merged"
-        temporary_conflicts = temp_root / "conflicts"
+    local_dir = workspace_root / "local"
+    remote_dir = workspace_root / "remote"
+    merged_dir = workspace_root / "expected"
+    conflict_dir = workspace_root / "conflicts"
+    try:
+        original_signature = _copy_skill_payload_with_signature(
+            update.source.local_dir,
+            local_dir,
+            entry_type=update.source.entry_type,
+        )
+        remote_signature = _copy_skill_payload_with_signature(
+            update.staged_dir,
+            remote_dir,
+            entry_type=update.source.entry_type,
+        )
+        base_dir = _stage_update_base(update, workspace_root / "exact-base")
+        base_signature = directory_signature(base_dir) if base_dir is not None else None
         try:
             _merge_skill_directories(
                 base_dir=base_dir,
-                local_dir=update.source.local_dir,
-                remote_dir=update.staged_dir,
+                local_dir=local_dir,
+                remote_dir=remote_dir,
                 merged_dir=merged_dir,
-                conflict_root=temporary_conflicts,
+                conflict_root=conflict_dir,
             )
         except AgentSkillMergeConflictError as exc:
-            _require_remote_updates_enabled(update.source, update.installed_base_version)
-            _rename_directory_exclusive(temporary_conflicts, conflict_dir)
-            message = str(exc).replace(str(temporary_conflicts), str(conflict_dir))
-            raise AgentSkillMergeConflictError(message) from exc
-
-        _require_remote_updates_enabled(update.source, update.installed_base_version)
-        _validate_skill_payload(merged_dir, entry_type=update.source.entry_type)
-        _apply_payload_transaction(
-            update,
+            return PreparedPayload(
+                payload_dir=None,
+                payload_signature=None,
+                original_signature=original_signature,
+                exact_base_revision=update.installed_base_version,
+                remote_observation=update.remote_observation,
+                base_signature=base_signature,
+                remote_signature=remote_signature,
+                base_dir=base_dir,
+                local_dir=local_dir,
+                remote_dir=remote_dir,
+                conflict_dir=conflict_dir,
+                conflicts=exc.conflicts,
+                workspace_root=workspace_root,
+            )
+        expected_signature = _validate_skill_payload(
             merged_dir,
-            expected_original_signature=local_signature,
-            backup_dir=backup_dir,
+            entry_type=update.source.entry_type,
         )
+        return PreparedPayload(
+            payload_dir=merged_dir,
+            payload_signature=expected_signature,
+            original_signature=original_signature,
+            exact_base_revision=update.installed_base_version,
+            remote_observation=update.remote_observation,
+            base_signature=base_signature,
+            remote_signature=remote_signature,
+            base_dir=base_dir,
+            local_dir=local_dir,
+            remote_dir=remote_dir,
+            workspace_root=workspace_root,
+        )
+    except BaseException as preparation_error:
+        try:
+            shutil.rmtree(workspace_root)
+        except (OSError, AgentSkillUpdaterError) as cleanup_error:
+            raise AgentSkillUpdaterError(
+                f"Snapshot preparation failed: {preparation_error}. Prepared Payload cleanup "
+                f"also failed at {workspace_root}: {cleanup_error}"
+            ) from preparation_error
+        raise
 
 
 def apply_observed_update(
@@ -828,6 +936,7 @@ def apply_observed_update(
     observation: RemoteObservation,
     *,
     installed_base_version: str,
+    prepared_payload: Optional[PreparedPayload] = None,
 ) -> TransactionOutcome:
     if not observation.revision or not observation.version:
         raise AgentSkillUpdaterError(
@@ -835,6 +944,38 @@ def apply_observed_update(
         )
     _validate_remote_observation(source, observation)
     _require_remote_updates_enabled(source, installed_base_version)
+    if prepared_payload is not None:
+        workspace_root = prepared_payload.workspace_root
+        try:
+            outcome = _apply_prepared_snapshot_update(
+                source,
+                observation,
+                installed_base_version,
+                prepared_payload,
+            )
+        except BaseException as apply_error:
+            try:
+                _remove_prepared_workspace(workspace_root)
+            except (OSError, AgentSkillUpdaterError) as cleanup_error:
+                raise AgentSkillUpdaterError(
+                    f"Snapshot update failed: {apply_error}. Prepared Payload cleanup also "
+                    f"failed at {workspace_root}: {cleanup_error}"
+                ) from apply_error
+            raise
+        try:
+            _remove_prepared_workspace(workspace_root)
+        except (OSError, AgentSkillUpdaterError) as cleanup_error:
+            cleanup_path = outcome.cleanup_residue or workspace_root
+            return replace(
+                outcome,
+                status="error",
+                error_message=(
+                    f"{outcome.error_message + ' ' if outcome.error_message else ''}"
+                    f"Prepared Payload cleanup failed at {workspace_root}: {cleanup_error}"
+                ),
+                cleanup_residue=cleanup_path,
+            )
+        return outcome
     commit_state_validator = _metadata_commit_state_validator(source, observation)
     if observation.git_identity is None:
         commit_state_validator(installed_base_version)
@@ -854,6 +995,96 @@ def apply_observed_update(
             installed_base_version,
             commit_state_validator,
         )
+
+
+def _remove_prepared_workspace(workspace_root: Optional[Path]) -> None:
+    if workspace_root is not None and workspace_root.exists():
+        shutil.rmtree(workspace_root)
+
+
+def _apply_prepared_snapshot_update(
+    source: AgentSkillSource,
+    observation: RemoteObservation,
+    installed_base_version: str,
+    prepared: PreparedPayload,
+) -> TransactionOutcome:
+    if prepared.exact_base_revision != installed_base_version:
+        raise AgentSkillUpdaterError(
+            f"Prepared Payload Exact Base does not match Skill '{source.name}'."
+        )
+    if prepared.remote_observation != observation:
+        raise AgentSkillUpdaterError(
+            f"Prepared Payload Remote Observation does not match Skill '{source.name}'."
+        )
+    if prepared.conflicts:
+        with skill_update_lock(source.local_dir):
+            _recover_skill_transactions_locked(source.local_dir)
+            _require_remote_updates_enabled(source, installed_base_version)
+            current_signature = _validate_skill_payload(
+                source.local_dir,
+                entry_type=source.entry_type,
+            )
+            if current_signature != prepared.original_signature:
+                return TransactionOutcome(
+                    name=source.name,
+                    status="error",
+                    installed_state="unchanged",
+                    applied=False,
+                    action="none",
+                    version=observation.version,
+                    error_message=(
+                        f"Concurrent Change cancelled the update for '{source.name}' before "
+                        "content-conflict promotion."
+                    ),
+                )
+            return _apply_content_conflict_transaction(source, observation, prepared)
+    if prepared.payload_dir is None or prepared.payload_signature is None or prepared.local_dir is None:
+        raise AgentSkillUpdaterError(
+            f"Prepared Payload for '{source.name}' contains neither payload nor conflicts."
+        )
+    _validate_skill_payload(
+        prepared.local_dir,
+        prepared.original_signature,
+        entry_type=source.entry_type,
+    )
+    _validate_skill_payload(
+        prepared.payload_dir,
+        prepared.payload_signature,
+        entry_type=source.entry_type,
+    )
+    if prepared.payload_signature == prepared.original_signature:
+        metadata_validator = _metadata_commit_state_validator(source, observation)
+
+        def validate_unchanged_payload(expected_base: str) -> None:
+            metadata_validator(expected_base)
+            current_signature = _validate_skill_payload(
+                source.local_dir,
+                entry_type=source.entry_type,
+            )
+            if current_signature != prepared.original_signature:
+                raise AgentSkillUpdaterError(
+                    f"Concurrent Change cancelled metadata publication for '{source.name}'."
+                )
+
+        with skill_update_lock(source.local_dir):
+            _recover_skill_transactions_locked(source.local_dir)
+            _require_remote_updates_enabled(source, installed_base_version)
+            return _apply_metadata_only_transaction_locked(
+                source,
+                observation,
+                installed_base_version,
+                validate_unchanged_payload,
+            )
+    update = AgentSkillUpdate(
+        source=source,
+        staged_dir=prepared.payload_dir,
+        status="update_available",
+        installed_base_version=installed_base_version,
+        local_version=installed_base_version,
+        remote_version=observation.version,
+        remote_observation=observation,
+    )
+    return _apply_payload_transaction(update, prepared)
 
 
 def refresh_skill_metadata_version(
@@ -951,41 +1182,360 @@ def _metadata_commit_state_validator(
     )
 
 
-def make_backup_root(skills_root: Optional[Path] = None) -> Path:
-    root = skills_root or get_agent_skills_dir()
-    backup_root = root / f".backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    backup_root.mkdir(parents=True, exist_ok=False)
-    return backup_root
-
-
-def _validate_backup_root(backup_root: Path) -> None:
-    if _is_filesystem_link(backup_root) or not backup_root.is_dir():
-        raise AgentSkillUpdaterError(f"Backup root must be a regular directory: {backup_root}")
-
-
 def _rename_directory_exclusive(source: Path, destination: Path) -> None:
     if not source.is_dir() or _is_filesystem_link(source):
-        raise AgentSkillUpdaterError(f"Backup source must be a regular directory: {source}")
+        raise AgentSkillUpdaterError(f"Promotion source must be a regular directory: {source}")
     if os.path.lexists(destination):
         raise AgentSkillUpdaterError(f"Refusing to overwrite existing directory: {destination}")
     os.rename(source, destination)
 
 
-def _publish_payload_backup(
-    original_dir: Path,
-    staging_dir: Path,
-    backup_dir: Path,
-    expected_signature: str,
-    entry_type: str,
-) -> None:
-    staging_dir.mkdir(exist_ok=False)
-    _copy_directory_contents(original_dir, staging_dir)
-    _validate_skill_payload(
-        staging_dir,
-        expected_signature,
-        entry_type=entry_type,
+def _content_conflict_manifest(
+    source: AgentSkillSource,
+    observation: RemoteObservation,
+    prepared: PreparedPayload,
+) -> tuple[dict[str, object], dict[str, Path]]:
+    materials = {
+        "base": prepared.base_dir,
+        "local": prepared.local_dir,
+        "remote": prepared.remote_dir,
+        "conflicts": prepared.conflict_dir,
+    }
+    if any(path is None for path in materials.values()):
+        raise AgentSkillUpdaterError(
+            f"Prepared content conflict for '{source.name}' is missing required materials."
+        )
+    if prepared.base_signature is None or prepared.remote_signature is None:
+        raise AgentSkillUpdaterError(
+            f"Prepared content conflict for '{source.name}' is missing verified identities."
+        )
+    if (
+        directory_signature(prepared.base_dir) != prepared.base_signature
+        or directory_signature(prepared.local_dir) != prepared.original_signature
+        or directory_signature(prepared.remote_dir) != prepared.remote_signature
+    ):
+        raise AgentSkillUpdaterError(
+            f"Prepared conflict material for '{source.name}' does not match its identity."
+        )
+
+    material_signatures = {
+        "base": prepared.base_signature,
+        "local": prepared.original_signature,
+        "remote": prepared.remote_signature,
+        "conflicts": directory_signature(prepared.conflict_dir),
+    }
+
+    manifest: dict[str, object] = {
+        "kind": "content-conflict",
+        "skillName": source.name,
+        "installedState": "unchanged",
+        "exactBaseRevision": prepared.exact_base_revision,
+        "targetRevision": observation.revision,
+        "targetVersion": observation.version,
+        "sourceContract": {
+            "source": observation.source_contract.source,
+            "sourceType": observation.source_contract.source_type,
+            "repoUrl": observation.source_contract.repo_url,
+            "subpath": observation.source_contract.subpath,
+            "generator": observation.source_contract.generator,
+            "workflowId": observation.source_contract.workflow_id,
+        },
+        "conflicts": list(prepared.conflicts),
+        "materialSignatures": material_signatures,
+    }
+    manifest_bytes = _json_payload_bytes(manifest)
+    artifact_id = f"{source.name}-content-conflict-{hashlib.sha256(manifest_bytes).hexdigest()[:16]}"
+    manifest["artifactId"] = artifact_id
+    return manifest, {name: path for name, path in materials.items() if path is not None}
+
+
+def _apply_content_conflict_transaction(
+    source: AgentSkillSource,
+    observation: RemoteObservation,
+    prepared: PreparedPayload,
+) -> TransactionOutcome:
+    manifest, materials = _content_conflict_manifest(source, observation, prepared)
+    manifest_bytes = _json_payload_bytes(manifest)
+    artifact_id = str(manifest["artifactId"])
+    intervention_root = get_interventions_dir()
+    destination = intervention_root / artifact_id
+    _, original_metadata = _require_remote_updates_enabled(
+        source,
+        prepared.exact_base_revision,
     )
-    _rename_directory_exclusive(staging_dir, backup_dir)
+    if original_metadata is None:
+        raise AgentSkillUpdaterError(
+            f"Remotely managed skill '{source.name}' requires canonical metadata."
+        )
+    transaction_root = Path(
+        tempfile.mkdtemp(prefix=f".{source.name}.transaction-", dir=source.local_dir.parent)
+    )
+    state = {
+        "version": COORDINATOR_TRANSACTION_STATE_VERSION,
+        "transactionType": COORDINATOR_TRANSACTION_TYPE,
+        "transactionKind": SNAPSHOT_INTERVENTION_TRANSACTION_KIND,
+        "skillName": source.name,
+        "skillDir": str(source.local_dir.resolve()),
+        "phase": COORDINATOR_PHASE_PREPARED,
+        "targetRevision": observation.revision,
+        "targetVersion": observation.version,
+        "evidence": {
+            "beforeMetadata": {
+                "present": True,
+                "sha256": _sha256_bytes(original_metadata),
+            },
+            "expectedMetadata": {
+                "present": True,
+                "sha256": _sha256_bytes(original_metadata),
+            },
+            "intervention": {
+                "artifactId": artifact_id,
+                "destination": str(destination.resolve()),
+                "manifestSha256": _sha256_bytes(manifest_bytes),
+                "originalSignature": prepared.original_signature,
+            },
+        },
+    }
+    try:
+        _write_transaction_state(transaction_root, state)
+        _write_bytes_atomic(transaction_root / TRANSACTION_MARKER_FILENAME, b"1\n")
+        draft = transaction_root / "intervention"
+        for name, material in materials.items():
+            _copy_directory_contents(material, draft / name)
+        _write_bytes_atomic(draft / "manifest.json", manifest_bytes)
+        _validate_content_conflict_record(draft, state)
+        _set_coordinator_phase(
+            transaction_root,
+            state,
+            COORDINATOR_PHASE_INTERVENTION_READY,
+        )
+        _ensure_intervention_root(intervention_root)
+        _set_coordinator_phase(
+            transaction_root,
+            state,
+            COORDINATOR_PHASE_PUBLISHING_INTERVENTION,
+        )
+        _require_conflict_original_payload(state)
+        _rename_directory_exclusive(draft, destination)
+        _validate_content_conflict_record(destination, state)
+        _set_coordinator_phase(transaction_root, state, COORDINATOR_PHASE_COMMITTED)
+    except Exception as error:  # noqa: BLE001 - journal makes publication restartable
+        return _settle_content_conflict_transaction(transaction_root, state, error)
+    return _finish_content_conflict_transaction(transaction_root, state)
+
+
+def _ensure_intervention_root(intervention_root: Path) -> None:
+    intervention_root.mkdir(parents=True, exist_ok=True)
+    if _is_filesystem_link(intervention_root) or not intervention_root.is_dir():
+        raise AgentSkillUpdaterError(
+            f"Intervention root must be a regular directory: {intervention_root}"
+        )
+
+
+def _content_conflict_destination(state: dict[str, object]) -> Path:
+    evidence = state["evidence"]
+    if not isinstance(evidence, dict) or not isinstance(evidence.get("intervention"), dict):
+        raise AgentSkillUpdaterError("Content-conflict journal is missing Intervention evidence.")
+    intervention = evidence["intervention"]
+    destination = Path(intervention["destination"])
+    artifact_id = intervention["artifactId"]
+    intervention_root = get_interventions_dir()
+    if not isinstance(artifact_id, str) or destination.name != artifact_id:
+        raise AgentSkillUpdaterError("Content-conflict journal has an invalid artifact identity.")
+    if not _same_path(destination.parent, intervention_root):
+        raise AgentSkillUpdaterError(
+            f"Content-conflict destination points outside Intervention root: {destination}"
+        )
+    return destination
+
+
+def _require_conflict_original_payload(state: dict[str, object]) -> None:
+    skill_dir = Path(str(state["skillDir"]))
+    intervention = state["evidence"]["intervention"]
+    current_signature = _validate_skill_payload(
+        skill_dir,
+        entry_type=detect_skill_entry_type(skill_dir) or "single-skill",
+    )
+    if current_signature != intervention["originalSignature"]:
+        raise AgentSkillUpdaterError(
+            f"Concurrent Change cancelled stale Intervention publication for "
+            f"'{state['skillName']}'."
+        )
+
+
+def _validate_content_conflict_record(record: Path, state: dict[str, object]) -> None:
+    destination = _content_conflict_destination(state)
+    if record.name not in {"intervention", destination.name}:
+        raise AgentSkillUpdaterError(f"Unexpected content-conflict record path: {record}")
+    manifest_path = record / "manifest.json"
+    if not manifest_path.is_file() or _is_filesystem_link(manifest_path):
+        raise AgentSkillUpdaterError(f"Content-conflict manifest is missing at {record}.")
+    manifest_bytes = manifest_path.read_bytes()
+    intervention = state["evidence"]["intervention"]
+    if _sha256_bytes(manifest_bytes) != intervention["manifestSha256"]:
+        raise AgentSkillUpdaterError(f"Content-conflict manifest identity mismatch at {record}.")
+    manifest = _decode_json_object(manifest_bytes, manifest_path, "Intervention manifest")
+    if manifest.get("artifactId") != intervention["artifactId"]:
+        raise AgentSkillUpdaterError(f"Content-conflict artifact identity mismatch at {record}.")
+    required = {"base", "local", "remote", "conflicts"}
+    if {path.name for path in record.iterdir()} != required | {"manifest.json"}:
+        raise AgentSkillUpdaterError(f"Content-conflict record is incomplete at {record}.")
+    for name in required:
+        if not (record / name).is_dir() or _is_filesystem_link(record / name):
+            raise AgentSkillUpdaterError(f"Content-conflict material is invalid at {record / name}.")
+    material_signatures = manifest.get("materialSignatures")
+    if not isinstance(material_signatures, dict) or set(material_signatures) != required:
+        raise AgentSkillUpdaterError(
+            f"Content-conflict material identities are missing at {record}."
+        )
+    for name in required:
+        expected_signature = material_signatures[name]
+        if not isinstance(expected_signature, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", expected_signature
+        ):
+            raise AgentSkillUpdaterError(
+                f"Content-conflict material identity is invalid for {record / name}."
+            )
+        if directory_signature(record / name) != expected_signature:
+            raise AgentSkillUpdaterError(
+                f"Content-conflict material identity mismatch at {record / name}."
+            )
+
+
+def _settle_content_conflict_transaction(
+    transaction_root: Path,
+    state: dict[str, object],
+    error: Exception,
+) -> TransactionOutcome:
+    try:
+        destination = _content_conflict_destination(state)
+        draft = transaction_root / "intervention"
+        if destination.exists():
+            _validate_content_conflict_record(destination, state)
+            return _finish_content_conflict_transaction(transaction_root, state)
+        try:
+            _require_conflict_original_payload(state)
+        except AgentSkillUpdaterError as concurrent_error:
+            _remove_transaction_tree(transaction_root)
+            return TransactionOutcome(
+                name=str(state["skillName"]),
+                status="error",
+                installed_state="unchanged",
+                applied=False,
+                action="none",
+                version=str(state["targetVersion"]),
+                error_message=str(concurrent_error),
+            )
+        if state["phase"] in {
+            COORDINATOR_PHASE_INTERVENTION_READY,
+            COORDINATOR_PHASE_PUBLISHING_INTERVENTION,
+        }:
+            _validate_content_conflict_record(draft, state)
+            _ensure_intervention_root(destination.parent)
+            _rename_directory_exclusive(draft, destination)
+            _validate_content_conflict_record(destination, state)
+            _set_coordinator_phase(transaction_root, state, COORDINATOR_PHASE_COMMITTED)
+            return _finish_content_conflict_transaction(transaction_root, state)
+        _remove_transaction_tree(transaction_root)
+    except (AgentSkillUpdaterError, OSError) as settlement_error:
+        return TransactionOutcome(
+            name=str(state["skillName"]),
+            status="error",
+            installed_state="unchanged",
+            applied=False,
+            action="none",
+            version=str(state["targetVersion"]),
+            error_message=(
+                f"Content conflict Intervention failed: {error}. Settlement also failed: "
+                f"{settlement_error}."
+            ),
+            diagnostic_journal=transaction_root,
+        )
+    return TransactionOutcome(
+        name=str(state["skillName"]),
+        status="error",
+        installed_state="unchanged",
+        applied=False,
+        action="none",
+        version=str(state["targetVersion"]),
+        error_message=f"Content conflict Intervention promotion failed: {error}",
+    )
+
+
+def _finish_content_conflict_transaction(
+    transaction_root: Path,
+    state: dict[str, object],
+) -> TransactionOutcome:
+    destination = _content_conflict_destination(state)
+    try:
+        _remove_transaction_tree(transaction_root)
+    except (AgentSkillUpdaterError, OSError) as cleanup_error:
+        return TransactionOutcome(
+            name=str(state["skillName"]),
+            status="error",
+            installed_state="unchanged",
+            applied=False,
+            action="intervention_required",
+            version=str(state["targetVersion"]),
+            error_message=(
+                f"Content conflict Intervention was published, but transaction cleanup failed "
+                f"at {transaction_root}: {cleanup_error}"
+            ),
+            cleanup_residue=transaction_root,
+            intervention_record=destination,
+        )
+    return TransactionOutcome(
+        name=str(state["skillName"]),
+        status="error",
+        installed_state="unchanged",
+        applied=False,
+        action="intervention_required",
+        version=str(state["targetVersion"]),
+        error_message=(
+            f"Local changes conflict with the observed update for '{state['skillName']}'."
+        ),
+        intervention_record=destination,
+    )
+
+
+def _promote_recovery_required(skill_name: str, diagnostic_journal: Path) -> Path:
+    manifest = {
+        "kind": "recovery-required",
+        "skillName": skill_name,
+        "installedState": "uncertain",
+        "diagnosticJournal": str(diagnostic_journal.resolve()),
+    }
+    artifact_id = (
+        f"{skill_name}-recovery-required-"
+        f"{hashlib.sha256(_json_payload_bytes(manifest)).hexdigest()[:16]}"
+    )
+    manifest["artifactId"] = artifact_id
+    intervention_root = get_interventions_dir()
+    intervention_root.mkdir(parents=True, exist_ok=True)
+    if _is_filesystem_link(intervention_root) or not intervention_root.is_dir():
+        raise AgentSkillUpdaterError(
+            f"Intervention root must be a regular directory: {intervention_root}"
+        )
+    destination = intervention_root / artifact_id
+    draft = Path(tempfile.mkdtemp(prefix=".draft-", dir=intervention_root))
+    try:
+        _write_json_atomic(draft / "manifest.json", manifest)
+        _rename_directory_exclusive(draft, destination)
+    except BaseException:
+        if draft.exists():
+            shutil.rmtree(draft)
+        raise
+    return destination
+
+
+def _try_promote_recovery_required(
+    skill_name: str,
+    diagnostic_journal: Path,
+) -> tuple[Optional[Path], Optional[str]]:
+    try:
+        return _promote_recovery_required(skill_name, diagnostic_journal), None
+    except (AgentSkillUpdaterError, OSError) as exc:
+        return None, f"Recovery-required Intervention promotion failed: {exc}"
 
 
 def fetch_remote_commit_sha(repo_url: str) -> str:
@@ -2694,7 +3244,8 @@ def _merge_skill_directories(
         conflict_list = "\n".join(f"- {item}" for item in conflicts)
         raise AgentSkillMergeConflictError(
             "Local skill changes conflict with the remote update. "
-            f"No files were overwritten. Review {conflict_root} and resolve:\n{conflict_list}"
+            f"No files were overwritten. Review {conflict_root} and resolve:\n{conflict_list}",
+            tuple(conflicts),
         )
     _write_payload_node(merged_node, merged_dir)
 
@@ -2916,12 +3467,51 @@ def _copy_directory_contents(source_dir: Path, destination_dir: Path) -> None:
         shutil.copy2(source, destination)
 
 
+def _copy_skill_payload_with_signature(
+    source_dir: Path,
+    destination_dir: Path,
+    *,
+    entry_type: str,
+) -> str:
+    _require_skill_payload_contract(source_dir, entry_type)
+    digest = hashlib.sha256()
+    destination_dir.mkdir(parents=True, exist_ok=False)
+    for directory in iter_skill_payload_directories(source_dir):
+        relative_path = directory.relative_to(source_dir)
+        destination = destination_dir / relative_path
+        destination.mkdir(parents=True, exist_ok=False)
+        shutil.copystat(directory, destination, follow_symlinks=False)
+        _update_signature_record(digest, b"directory", relative_path.as_posix())
+    for file_path in iter_skill_payload_files(source_dir):
+        relative_path = file_path.relative_to(source_dir)
+        content = file_path.read_bytes()
+        destination = destination_dir / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+        shutil.copystat(file_path, destination, follow_symlinks=False)
+        _update_signature_record(
+            digest,
+            b"file",
+            relative_path.as_posix(),
+            hashlib.sha256(content).digest(),
+        )
+    return digest.hexdigest()
+
+
 def _validate_skill_payload(
     payload_dir: Path,
     expected_signature: Optional[str] = None,
     *,
     entry_type: str,
 ) -> str:
+    _require_skill_payload_contract(payload_dir, entry_type)
+    signature = directory_signature(payload_dir)
+    if expected_signature is not None and signature != expected_signature:
+        raise AgentSkillUpdaterError(f"Skill payload verification failed at '{payload_dir}'.")
+    return signature
+
+
+def _require_skill_payload_contract(payload_dir: Path, entry_type: str) -> None:
     required_name, required_kind = _payload_contract(entry_type)
     required_path = payload_dir / required_name
     required_type_matches = (
@@ -2931,250 +3521,379 @@ def _validate_skill_payload(
         raise AgentSkillUpdaterError(
             f"{entry_type} payload at '{payload_dir}' is missing its required content root."
         )
-    signature = directory_signature(payload_dir)
-    if expected_signature is not None and signature != expected_signature:
-        raise AgentSkillUpdaterError(f"Skill payload verification failed at '{payload_dir}'.")
-    return signature
 
 
 def _apply_payload_transaction(
     update: AgentSkillUpdate,
-    merged_dir: Path,
-    expected_original_signature: Optional[str] = None,
-    backup_dir: Optional[Path] = None,
-) -> None:
+    prepared: PreparedPayload,
+) -> TransactionOutcome:
+    if (
+        prepared.payload_dir is None
+        or prepared.payload_signature is None
+        or prepared.local_dir is None
+    ):
+        raise AgentSkillUpdaterError(
+            f"Prepared Payload for '{update.source.name}' is incomplete."
+        )
     skill_dir = update.source.local_dir
-    expected_signature = _validate_skill_payload(
-        merged_dir,
-        entry_type=update.source.entry_type,
-    )
     with skill_update_lock(skill_dir):
         _recover_skill_transactions_locked(skill_dir)
-        metadata_snapshot_object, original_metadata = _require_remote_updates_enabled(
-            update.source,
-            update.installed_base_version,
-        )
-        _validate_skill_root(skill_dir)
-        if is_git_worktree_skill(skill_dir):
-            raise AgentSkillUpdaterError(
-                f"Skill '{update.source.name}' became a Git worktree during staging; "
-                "refusing snapshot replacement."
-            )
-        original_signature = _validate_skill_payload(
-            skill_dir,
-            entry_type=update.source.entry_type,
-        )
-        if (
-            expected_original_signature is not None
-            and original_signature != expected_original_signature
-        ):
-            raise AgentSkillUpdaterError(
-                f"Skill '{update.source.name}' changed after backup/merge; refusing to overwrite it."
-            )
-        metadata_path = update.source.metadata_path
-        if metadata_path is None or metadata_snapshot_object is None or original_metadata is None:
-            raise AgentSkillUpdaterError(
-                f"Remotely managed skill '{update.source.name}' requires canonical metadata."
-            )
-        expected_metadata, metadata_changed = _build_refreshed_metadata(
-            update,
-            metadata_snapshot_object,
-        )
-        expected_metadata_bytes = (
-            _json_payload_bytes(expected_metadata)
-            if metadata_changed or original_metadata is None
-            else original_metadata
-        )
-        transaction_root = Path(
-            tempfile.mkdtemp(prefix=f".{update.source.name}.update-", dir=skill_dir.parent)
-        )
-        incoming_dir = transaction_root / "incoming"
-        original_dir = transaction_root / "original"
-        displaced_dir = transaction_root / "displaced"
-        failed_dir = transaction_root / "failed"
-        state = {
-            "version": TRANSACTION_STATE_VERSION,
-            "transactionType": SNAPSHOT_TRANSACTION_TYPE,
-            "skillName": update.source.name,
-            "skillDir": str(skill_dir.resolve()),
-            "phase": TRANSACTION_PHASE_PREPARING,
-            "metadataPhase": METADATA_PHASE_PREPARED,
-            "originalSignature": original_signature,
-            "expectedSignature": expected_signature,
-            "originalMetadataPresent": original_metadata is not None,
-            "originalMetadataSha256": _sha256_bytes(original_metadata),
-            "expectedMetadataPresent": True,
-            "expectedMetadataSha256": _sha256_bytes(expected_metadata_bytes),
-        }
-        state_written = False
-
+        captured = _capture_snapshot_transaction(update, prepared)
+        if isinstance(captured, TransactionOutcome):
+            return captured
+        transaction = captured
         try:
-            _write_transaction_state(transaction_root, state)
-            state_written = True
-            _write_bytes_atomic(transaction_root / TRANSACTION_MARKER_FILENAME, b"1\n")
-            incoming_dir.mkdir()
-            original_dir.mkdir()
-            displaced_dir.mkdir()
-            failed_dir.mkdir()
-            _copy_directory_contents(skill_dir, original_dir)
-            _validate_skill_payload(
-                original_dir,
-                original_signature,
-                entry_type=update.source.entry_type,
-            )
-            _copy_directory_contents(merged_dir, incoming_dir)
-            _validate_skill_payload(
-                incoming_dir,
-                expected_signature,
-                entry_type=update.source.entry_type,
-            )
-            _prepare_transaction_metadata_files(
-                transaction_root,
-                original_metadata,
-                expected_metadata_bytes,
-            )
-            _set_transaction_phase(transaction_root, state, TRANSACTION_PHASE_PREPARED)
+            _materialize_snapshot_transaction(transaction, prepared)
+            _commit_snapshot_transaction(transaction)
+        except Exception as exc:  # noqa: BLE001 - coordinator settles every apply failure
+            return _settle_snapshot_transaction_failure(transaction, exc)
+        return _settle_committed_snapshot_transaction(transaction)
 
-            _set_transaction_phase(transaction_root, state, TRANSACTION_PHASE_MOVING_ORIGINAL)
-            _require_remote_updates_enabled(
-                update.source,
-                update.installed_base_version,
-            )
-            if is_git_worktree_skill(skill_dir):
-                raise AgentSkillUpdaterError(
-                    f"Skill '{update.source.name}' became a Git worktree during apply; "
-                    "refusing snapshot replacement."
-                )
-            _move_payload_files(skill_dir, displaced_dir)
-            if directory_signature(displaced_dir) != original_signature:
-                raise AgentSkillUpdaterError(
-                    f"Skill '{update.source.name}' changed while its update was being applied."
-                )
-            original_directories = _relative_directory_paths(original_dir)
-            remaining_files = _relative_file_paths(skill_dir)
-            remaining_directories = _relative_directory_paths(skill_dir) - original_directories
-            if remaining_files or remaining_directories:
-                raise AgentSkillUpdaterError(
-                    f"Skill '{update.source.name}' gained payload entries while its update was being applied."
-                )
-            _prune_empty_payload_directories(skill_dir)
 
-            _set_transaction_phase(transaction_root, state, TRANSACTION_PHASE_INSTALLING)
-            _install_payload_without_overwrite(incoming_dir, skill_dir)
-            _validate_skill_payload(
-                skill_dir,
-                expected_signature,
-                entry_type=update.source.entry_type,
-            )
+def _capture_snapshot_transaction(
+    update: AgentSkillUpdate,
+    prepared: PreparedPayload,
+) -> _SnapshotTransaction | TransactionOutcome:
+    skill_dir = update.source.local_dir
+    metadata_object, original_metadata = _require_remote_updates_enabled(
+        update.source,
+        update.installed_base_version,
+    )
+    _validate_skill_root(skill_dir)
+    if is_git_worktree_skill(skill_dir):
+        raise AgentSkillUpdaterError(
+            f"Skill '{update.source.name}' became a Git worktree during staging; "
+            "refusing snapshot replacement."
+        )
+    original_signature = _validate_skill_payload(
+        skill_dir,
+        entry_type=update.source.entry_type,
+    )
+    if original_signature != prepared.original_signature:
+        return TransactionOutcome(
+            name=update.source.name,
+            status="error",
+            installed_state="unchanged",
+            applied=False,
+            action="none",
+            version=update.remote_version,
+            error_message=(
+                f"Concurrent Change cancelled the update for '{update.source.name}' before "
+                "mutation."
+            ),
+        )
+    metadata_path = update.source.metadata_path
+    if metadata_path is None or metadata_object is None or original_metadata is None:
+        raise AgentSkillUpdaterError(
+            f"Remotely managed skill '{update.source.name}' requires canonical metadata."
+        )
+    expected_metadata_object, metadata_changed = _build_refreshed_metadata(
+        update,
+        metadata_object,
+    )
+    expected_metadata = (
+        _json_payload_bytes(expected_metadata_object) if metadata_changed else original_metadata
+    )
+    expected_signature = prepared.payload_signature
+    if expected_signature is None:
+        raise AgentSkillUpdaterError(
+            f"Prepared Payload for '{update.source.name}' has no expected signature."
+        )
+    root = Path(
+        tempfile.mkdtemp(prefix=f".{update.source.name}.transaction-", dir=skill_dir.parent)
+    )
+    state = {
+        "version": COORDINATOR_TRANSACTION_STATE_VERSION,
+        "transactionType": COORDINATOR_TRANSACTION_TYPE,
+        "transactionKind": SNAPSHOT_TRANSACTION_KIND,
+        "skillName": update.source.name,
+        "skillDir": str(skill_dir.resolve()),
+        "phase": COORDINATOR_PHASE_PREPARED,
+        "targetRevision": update.remote_observation.revision,
+        "targetVersion": update.remote_observation.version,
+        "evidence": {
+            "beforeMetadata": {
+                "present": True,
+                "sha256": _sha256_bytes(original_metadata),
+            },
+            "expectedMetadata": {
+                "present": True,
+                "sha256": _sha256_bytes(expected_metadata),
+            },
+            "snapshot": {
+                "entryType": update.source.entry_type,
+                "originalSignature": original_signature,
+                "expectedSignature": expected_signature,
+            },
+        },
+    }
+    return _SnapshotTransaction(
+        update=update,
+        root=root,
+        state=state,
+        metadata_path=metadata_path,
+        original_metadata=original_metadata,
+        expected_metadata=expected_metadata,
+        original_signature=original_signature,
+        expected_signature=expected_signature,
+    )
 
-            _set_transaction_phase(
-                transaction_root,
-                state,
-                TRANSACTION_PHASE_COMMITTING_METADATA,
-            )
-            _require_remote_updates_enabled(
-                update.source,
-                update.installed_base_version,
-            )
-            if is_git_worktree_skill(skill_dir):
-                raise AgentSkillUpdaterError(
-                    f"Skill '{update.source.name}' became a Git worktree before metadata commit; "
-                    "rolling back snapshot replacement."
-                )
-            _validate_transaction_metadata(skill_dir, state, expected=False)
-            _commit_transaction_metadata(
-                transaction_root,
-                state,
-                metadata_path,
-                expected_metadata_bytes,
-                original_metadata,
-                phases=LEGACY_METADATA_PHASES,
-            )
-            _validate_snapshot_commit_state(update, state, expected_signature)
-            if backup_dir is not None:
-                _publish_payload_backup(
-                    original_dir,
-                    transaction_root / "backup",
-                    backup_dir,
-                    original_signature,
-                    update.source.entry_type,
-                )
-            _validate_snapshot_commit_state(update, state, expected_signature)
-            _set_transaction_phase(transaction_root, state, TRANSACTION_PHASE_COMMITTED)
-        except Exception as exc:  # noqa: BLE001 - all apply failures share one rollback contract
-            if not state_written:
-                try:
-                    _remove_transaction_tree(transaction_root)
-                except (OSError, AgentSkillUpdaterError) as cleanup_exc:
-                    raise AgentSkillUpdaterError(
-                        f"Failed to prepare update for '{update.source.name}': {exc}. "
-                        f"Temporary transaction cleanup also failed at {transaction_root}: "
-                        f"{cleanup_exc}"
-                    ) from exc
-                raise AgentSkillUpdaterError(
-                    f"Failed to prepare update for '{update.source.name}': {exc}"
-                ) from exc
-            try:
-                if state["phase"] in {
-                    TRANSACTION_PHASE_PREPARING,
-                    TRANSACTION_PHASE_PREPARED,
-                }:
-                    _validate_skill_payload(
-                        skill_dir,
-                        state["originalSignature"],
-                        entry_type=update.source.entry_type,
-                    )
-                    recovery_path = _rollback_transaction_metadata(
-                        transaction_root,
-                        _decode_legacy_metadata_phase(state["metadataPhase"]),
-                        metadata_path,
-                        original_metadata,
-                        expected_metadata_bytes,
-                    )
-                    if recovery_path is None:
-                        _validate_transaction_metadata(skill_dir, state, expected=False)
-                    else:
-                        state["recoveryPath"] = str(recovery_path)
-                    _set_transaction_phase(
-                        transaction_root,
-                        state,
-                        TRANSACTION_PHASE_ROLLED_BACK,
-                    )
-                else:
-                    recovery_path = _restore_payload_transaction(transaction_root, state)
-            except Exception as rollback_exc:  # noqa: BLE001 - retain durable recovery data
-                raise AgentSkillUpdaterError(
-                    f"Failed to apply update for '{update.source.name}': {exc}. "
-                    f"Rollback also failed: {rollback_exc}. Recovery data remains at {transaction_root}."
-                ) from exc
-            try:
-                _remove_transaction_tree(transaction_root)
-            except (OSError, AgentSkillUpdaterError) as cleanup_exc:
-                raise AgentSkillUpdaterError(
-                    f"Failed to apply update for '{update.source.name}'; the original payload was "
-                    f"restored, but transaction cleanup failed at {transaction_root}: {cleanup_exc}"
-                ) from exc
-            recovery_suffix = (
-                f" Unexpected concurrent files were preserved at {recovery_path}."
-                if recovery_path is not None
-                else ""
-            )
-            raise AgentSkillUpdaterError(
-                f"Failed to apply update for '{update.source.name}'; the original payload was "
-                f"restored: {exc}.{recovery_suffix}"
-            ) from exc
 
-        # The payload and metadata are committed before cleanup. If cleanup is interrupted,
-        # the durable committed phase lets the next registry sync verify and remove it safely.
-        try:
-            _remove_transaction_tree(transaction_root)
-        except (OSError, AgentSkillUpdaterError) as cleanup_exc:
-            raise AgentSkillUpdateCommittedError(
-                f"Update for '{update.source.name}' committed, but transaction cleanup failed "
-                f"at {transaction_root}: {cleanup_exc}",
-                action="payload_merged",
-                version=update.remote_version,
-            ) from cleanup_exc
+def _materialize_snapshot_transaction(
+    transaction: _SnapshotTransaction,
+    prepared: PreparedPayload,
+) -> None:
+    if prepared.local_dir is None or prepared.payload_dir is None:
+        raise AgentSkillUpdaterError("Prepared Payload ownership material is missing.")
+    _write_transaction_state(transaction.root, transaction.state)
+    transaction.state_written = True
+    _write_bytes_atomic(transaction.root / TRANSACTION_MARKER_FILENAME, b"1\n")
+    transaction.displaced_dir.mkdir()
+    transaction.failed_dir.mkdir()
+    _rename_directory_exclusive(prepared.local_dir, transaction.original_dir)
+    _validate_skill_payload(
+        transaction.original_dir,
+        transaction.original_signature,
+        entry_type=transaction.update.source.entry_type,
+    )
+    _rename_directory_exclusive(prepared.payload_dir, transaction.incoming_dir)
+    _validate_skill_payload(
+        transaction.incoming_dir,
+        transaction.expected_signature,
+        entry_type=transaction.update.source.entry_type,
+    )
+    _prepare_transaction_metadata_files(
+        transaction.root,
+        transaction.original_metadata,
+        transaction.expected_metadata,
+    )
+
+
+def _commit_snapshot_transaction(transaction: _SnapshotTransaction) -> None:
+    update = transaction.update
+    skill_dir = update.source.local_dir
+    _set_coordinator_phase(
+        transaction.root,
+        transaction.state,
+        COORDINATOR_PHASE_MOVING_PAYLOAD,
+    )
+    _require_remote_updates_enabled(update.source, update.installed_base_version)
+    if is_git_worktree_skill(skill_dir):
+        raise AgentSkillUpdaterError(
+            f"Skill '{update.source.name}' became a Git worktree during apply; "
+            "refusing snapshot replacement."
+        )
+    _move_payload_files(skill_dir, transaction.displaced_dir)
+    if directory_signature(transaction.displaced_dir) != transaction.original_signature:
+        raise AgentSkillUpdaterError(
+            f"Skill '{update.source.name}' changed while its update was being applied."
+        )
+    original_directories = _relative_directory_paths(transaction.original_dir)
+    remaining_files = _relative_file_paths(skill_dir)
+    remaining_directories = _relative_directory_paths(skill_dir) - original_directories
+    if remaining_files or remaining_directories:
+        raise AgentSkillUpdaterError(
+            f"Skill '{update.source.name}' gained payload entries while its update was being applied."
+        )
+    _prune_empty_payload_directories(skill_dir)
+    _set_coordinator_phase(
+        transaction.root,
+        transaction.state,
+        COORDINATOR_PHASE_INSTALLING_PAYLOAD,
+    )
+    _install_payload_without_overwrite(transaction.incoming_dir, skill_dir)
+    _validate_skill_payload(
+        skill_dir,
+        transaction.expected_signature,
+        entry_type=update.source.entry_type,
+    )
+    _require_remote_updates_enabled(update.source, update.installed_base_version)
+    if is_git_worktree_skill(skill_dir):
+        raise AgentSkillUpdaterError(
+            f"Skill '{update.source.name}' became a Git worktree before metadata commit; "
+            "rolling back snapshot replacement."
+        )
+    _validate_transaction_metadata(skill_dir, transaction.state, expected=False)
+    _commit_transaction_metadata(
+        transaction.root,
+        transaction.state,
+        transaction.metadata_path,
+        transaction.expected_metadata,
+        transaction.original_metadata,
+        phases=COORDINATOR_METADATA_PHASES,
+    )
+    _validate_snapshot_commit_state(update, transaction.state, transaction.expected_signature)
+    _set_coordinator_phase(
+        transaction.root,
+        transaction.state,
+        COORDINATOR_PHASE_COMMITTED,
+    )
+
+
+def _settle_snapshot_transaction_failure(
+    transaction: _SnapshotTransaction,
+    apply_error: Exception,
+) -> TransactionOutcome:
+    if not transaction.state_written:
+        return _settle_snapshot_preparation_failure(transaction, apply_error)
+    try:
+        recovery_path = _restore_snapshot_transaction(transaction)
+    except Exception as rollback_error:  # noqa: BLE001 - retain durable recovery data
+        return _snapshot_uncertain_outcome(
+            transaction,
+            f"Failed to apply update for '{transaction.update.source.name}': {apply_error}. "
+            f"Rollback also failed: {rollback_error}. Recovery data remains at "
+            f"{transaction.root}.",
+        )
+    if recovery_path is not None:
+        return _snapshot_uncertain_outcome(
+            transaction,
+            f"Failed to apply update for '{transaction.update.source.name}'; exact restoration "
+            f"could not be proved. Concurrent data was preserved at {recovery_path}.",
+        )
+    try:
+        _remove_transaction_tree(transaction.root)
+    except (OSError, AgentSkillUpdaterError) as cleanup_error:
+        return TransactionOutcome(
+            name=transaction.update.source.name,
+            status="error",
+            installed_state="rolled_back",
+            applied=False,
+            action="none",
+            version=transaction.update.remote_version,
+            error_message=(
+                f"Failed to apply update for '{transaction.update.source.name}'; the original "
+                f"payload was restored, but transaction cleanup failed at {transaction.root}: "
+                f"{cleanup_error}"
+            ),
+            cleanup_residue=transaction.root,
+        )
+    return TransactionOutcome(
+        name=transaction.update.source.name,
+        status="error",
+        installed_state="rolled_back",
+        applied=False,
+        action="none",
+        version=transaction.update.remote_version,
+        error_message=(
+            f"Failed to apply update for '{transaction.update.source.name}'; the original "
+            f"payload was restored: {apply_error}."
+        ),
+    )
+
+
+def _restore_snapshot_transaction(transaction: _SnapshotTransaction) -> Optional[Path]:
+    if transaction.state["phase"] != COORDINATOR_PHASE_PREPARED:
+        return _restore_payload_transaction(transaction.root, transaction.state)
+    _validate_skill_payload(
+        transaction.update.source.local_dir,
+        transaction.original_signature,
+        entry_type=transaction.update.source.entry_type,
+    )
+    recovery_path = _rollback_transaction_metadata(
+        transaction.root,
+        transaction.state["phase"],
+        transaction.metadata_path,
+        transaction.original_metadata,
+        transaction.expected_metadata,
+    )
+    if recovery_path is None:
+        _validate_transaction_metadata(
+            transaction.update.source.local_dir,
+            transaction.state,
+            expected=False,
+        )
+    else:
+        transaction.state["recoveryPath"] = str(recovery_path)
+    _set_coordinator_phase(
+        transaction.root,
+        transaction.state,
+        COORDINATOR_PHASE_ROLLED_BACK,
+    )
+    return recovery_path
+
+
+def _settle_snapshot_preparation_failure(
+    transaction: _SnapshotTransaction,
+    apply_error: Exception,
+) -> TransactionOutcome:
+    try:
+        _remove_transaction_tree(transaction.root)
+    except (OSError, AgentSkillUpdaterError) as cleanup_error:
+        return TransactionOutcome(
+            name=transaction.update.source.name,
+            status="error",
+            installed_state="unchanged",
+            applied=False,
+            action="none",
+            version=transaction.update.remote_version,
+            error_message=(
+                f"Failed to prepare update for '{transaction.update.source.name}': {apply_error}. "
+                f"Temporary transaction cleanup also failed at {transaction.root}: {cleanup_error}"
+            ),
+            cleanup_residue=transaction.root,
+        )
+    return TransactionOutcome(
+        name=transaction.update.source.name,
+        status="error",
+        installed_state="unchanged",
+        applied=False,
+        action="none",
+        version=transaction.update.remote_version,
+        error_message=(
+            f"Failed to prepare update for '{transaction.update.source.name}': {apply_error}"
+        ),
+    )
+
+
+def _snapshot_uncertain_outcome(
+    transaction: _SnapshotTransaction,
+    message: str,
+) -> TransactionOutcome:
+    intervention_record, intervention_error = _try_promote_recovery_required(
+        transaction.update.source.name,
+        transaction.root,
+    )
+    return TransactionOutcome(
+        name=transaction.update.source.name,
+        status="error",
+        installed_state="uncertain",
+        applied=False,
+        action="intervention_required",
+        version=transaction.update.remote_version,
+        error_message=message + (f" {intervention_error}" if intervention_error else ""),
+        diagnostic_journal=transaction.root,
+        intervention_record=intervention_record,
+    )
+
+
+def _settle_committed_snapshot_transaction(
+    transaction: _SnapshotTransaction,
+) -> TransactionOutcome:
+    try:
+        _remove_transaction_tree(transaction.root)
+    except (OSError, AgentSkillUpdaterError) as cleanup_error:
+        return TransactionOutcome(
+            name=transaction.update.source.name,
+            status="error",
+            installed_state="committed",
+            applied=True,
+            action="payload_merged",
+            version=transaction.update.remote_version,
+            error_message=(
+                f"Update for '{transaction.update.source.name}' committed, but transaction "
+                f"cleanup failed at {transaction.root}: {cleanup_error}"
+            ),
+            cleanup_residue=transaction.root,
+        )
+    return TransactionOutcome(
+        name=transaction.update.source.name,
+        status="up_to_date",
+        installed_state="committed",
+        applied=True,
+        action="payload_merged",
+        version=transaction.update.remote_version,
+    )
 
 
 def _validate_snapshot_commit_state(
@@ -3576,8 +4295,10 @@ def _read_recovery_state(
         )
         if coordinator_state["transactionKind"] == GIT_WORKTREE_TRANSACTION_KIND:
             state = _decode_coordinator_git_journal(coordinator_state)
-        else:
+        elif coordinator_state["transactionKind"] == METADATA_ONLY_TRANSACTION_KIND:
             state = _decode_coordinator_metadata_journal(coordinator_state)
+        else:
+            state = coordinator_state
     elif transaction_type == METADATA_TRANSACTION_TYPE:
         state = _decode_legacy_metadata_journal(
             _read_metadata_transaction_state(transaction_root, skills_root)
@@ -3606,6 +4327,10 @@ def _recover_decoded_transaction_locked(
     transaction_type: str,
     state: dict | _MetadataJournal | _GitJournal,
 ) -> TransactionOutcome:
+    if transaction_type == COORDINATOR_TRANSACTION_TYPE and isinstance(state, dict):
+        if state["transactionKind"] == SNAPSHOT_INTERVENTION_TRANSACTION_KIND:
+            return _recover_snapshot_intervention_locked(transaction_root, state)
+        return _recover_coordinator_snapshot_locked(transaction_root, state)
     if isinstance(state, _MetadataJournal):
         return _recover_metadata_journal_locked(transaction_root, state)
     if isinstance(state, _GitJournal):
@@ -3613,7 +4338,7 @@ def _recover_decoded_transaction_locked(
     if not isinstance(state, dict):
         raise AgentSkillUpdaterError(f"Invalid decoded transaction journal: {transaction_root}")
     original_phase = state["phase"]
-    _recover_transaction_from_state(transaction_root, state)
+    _settle_legacy_snapshot_v4(transaction_root, state)
     return _legacy_recovery_outcome(state, original_phase)
 
 
@@ -3657,23 +4382,22 @@ def _read_coordinator_transaction_state(
         or state["transactionType"] != COORDINATOR_TRANSACTION_TYPE
         or state["transactionKind"] not in {
             METADATA_ONLY_TRANSACTION_KIND,
+            SNAPSHOT_TRANSACTION_KIND,
+            SNAPSHOT_INTERVENTION_TRANSACTION_KIND,
             GIT_WORKTREE_TRANSACTION_KIND,
         }
-        or state["phase"] not in COORDINATOR_PHASES
-        or (
-            state["transactionKind"] == METADATA_ONLY_TRANSACTION_KIND
-            and state["phase"] in {
-                COORDINATOR_PHASE_APPLYING_PAYLOAD,
-                COORDINATOR_PHASE_PAYLOAD_APPLIED,
-            }
-        )
+        or state["phase"] not in COORDINATOR_KIND_PHASES[state["transactionKind"]]
     ):
         raise AgentSkillUpdaterError(
             f"Unsupported Transaction Coordinator journal at {transaction_root}."
         )
     evidence = state["evidence"]
     expected_evidence_keys = {"beforeMetadata", "expectedMetadata"}
-    if state["transactionKind"] == GIT_WORKTREE_TRANSACTION_KIND:
+    if state["transactionKind"] == SNAPSHOT_TRANSACTION_KIND:
+        expected_evidence_keys.add("snapshot")
+    elif state["transactionKind"] == SNAPSHOT_INTERVENTION_TRANSACTION_KIND:
+        expected_evidence_keys.add("intervention")
+    elif state["transactionKind"] == GIT_WORKTREE_TRANSACTION_KIND:
         expected_evidence_keys.add("git")
     if not isinstance(evidence, dict) or set(evidence) != expected_evidence_keys:
         raise AgentSkillUpdaterError(
@@ -3699,7 +4423,47 @@ def _read_coordinator_transaction_state(
             raise AgentSkillUpdaterError(
                 f"Invalid {label} Transaction Evidence at {transaction_root}."
             )
-    if state["transactionKind"] == GIT_WORKTREE_TRANSACTION_KIND:
+    if state["transactionKind"] == SNAPSHOT_TRANSACTION_KIND:
+        snapshot = evidence["snapshot"]
+        if not isinstance(snapshot, dict) or set(snapshot) != {
+            "entryType",
+            "originalSignature",
+            "expectedSignature",
+        }:
+            raise AgentSkillUpdaterError(
+                f"Invalid Snapshot Transaction Evidence at {transaction_root}."
+            )
+        if snapshot["entryType"] not in PAYLOAD_CONTRACTS or not all(
+            isinstance(snapshot[key], str) and re.fullmatch(r"[0-9a-f]{64}", snapshot[key])
+            for key in ("originalSignature", "expectedSignature")
+        ):
+            raise AgentSkillUpdaterError(
+                f"Invalid Snapshot Transaction Evidence at {transaction_root}."
+            )
+    elif state["transactionKind"] == SNAPSHOT_INTERVENTION_TRANSACTION_KIND:
+        intervention = evidence["intervention"]
+        if not isinstance(intervention, dict) or set(intervention) != {
+            "artifactId",
+            "destination",
+            "manifestSha256",
+            "originalSignature",
+        }:
+            raise AgentSkillUpdaterError(
+                f"Invalid Intervention Transaction Evidence at {transaction_root}."
+            )
+        if not all(isinstance(intervention[key], str) for key in intervention):
+            raise AgentSkillUpdaterError(
+                f"Invalid Intervention Transaction Evidence at {transaction_root}."
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", intervention["manifestSha256"]):
+            raise AgentSkillUpdaterError(
+                f"Invalid Intervention Transaction Evidence at {transaction_root}."
+            )
+        if not re.fullmatch(r"[0-9a-f]{64}", intervention["originalSignature"]):
+            raise AgentSkillUpdaterError(
+                f"Invalid Intervention Transaction Evidence at {transaction_root}."
+            )
+    elif state["transactionKind"] == GIT_WORKTREE_TRANSACTION_KIND:
         _validate_coordinator_git_evidence(state, transaction_root)
     skill_dir = Path(state["skillDir"])
     if not _same_path(skill_dir.parent, skills_root):
@@ -3714,6 +4478,128 @@ def _read_coordinator_transaction_state(
             f"Transaction identity mismatch at {transaction_root}."
         )
     return state
+
+
+def _recover_snapshot_intervention_locked(
+    transaction_root: Path,
+    state: dict[str, object],
+) -> TransactionOutcome:
+    return _settle_content_conflict_transaction(
+        transaction_root,
+        state,
+        AgentSkillUpdaterError("Content conflict publication was interrupted."),
+    )
+
+
+def _recover_coordinator_snapshot_locked(
+    transaction_root: Path,
+    state: dict,
+) -> TransactionOutcome:
+    skill_dir = Path(state["skillDir"])
+    _validate_skill_root(skill_dir)
+    evidence = _snapshot_transaction_evidence(state)
+    phase = state["phase"]
+    if phase == COORDINATOR_PHASE_COMMITTED:
+        _validate_skill_payload(
+            skill_dir,
+            evidence["expectedSignature"],
+            entry_type=evidence["entryType"],
+        )
+        _validate_transaction_metadata(skill_dir, state, expected=True)
+        try:
+            _remove_transaction_tree(transaction_root)
+        except (AgentSkillUpdaterError, OSError) as exc:
+            return TransactionOutcome(
+                name=state["skillName"],
+                status="error",
+                installed_state="committed",
+                applied=True,
+                action="payload_merged",
+                version=state["targetVersion"],
+                error_message=(
+                    f"Committed Snapshot update is valid, but cleanup failed at "
+                    f"{transaction_root}: {exc}"
+                ),
+                cleanup_residue=transaction_root,
+            )
+        return TransactionOutcome(
+            name=state["skillName"],
+            status="recovered",
+            installed_state="committed",
+            applied=True,
+            action="payload_merged",
+            version=state["targetVersion"],
+        )
+    if phase in {COORDINATOR_PHASE_PREPARED, COORDINATOR_PHASE_ROLLED_BACK}:
+        _validate_skill_payload(
+            skill_dir,
+            evidence["originalSignature"],
+            entry_type=evidence["entryType"],
+        )
+        _validate_transaction_metadata(skill_dir, state, expected=False)
+        _remove_transaction_tree(transaction_root)
+        return TransactionOutcome(
+            name=state["skillName"],
+            status="recovered",
+            installed_state=(
+                "unchanged" if phase == COORDINATOR_PHASE_PREPARED else "rolled_back"
+            ),
+            applied=False,
+            action="none",
+            version=state["targetVersion"],
+        )
+
+    try:
+        recovery_path = _restore_payload_transaction(transaction_root, state)
+    except Exception as recovery_error:  # noqa: BLE001 - retain journal for another recovery pass
+        intervention_record, intervention_error = _try_promote_recovery_required(
+            state["skillName"],
+            transaction_root,
+        )
+        return TransactionOutcome(
+            name=state["skillName"],
+            status="error",
+            installed_state="uncertain",
+            applied=False,
+            action="intervention_required",
+            version=state["targetVersion"],
+            error_message=(
+                f"Snapshot recovery failed: {recovery_error}. Recovery data remains at "
+                f"{transaction_root}."
+                + (f" {intervention_error}" if intervention_error else "")
+            ),
+            diagnostic_journal=transaction_root,
+            intervention_record=intervention_record,
+        )
+    if recovery_path is not None:
+        intervention_record, intervention_error = _try_promote_recovery_required(
+            state["skillName"],
+            transaction_root,
+        )
+        return TransactionOutcome(
+            name=state["skillName"],
+            status="error",
+            installed_state="uncertain",
+            applied=False,
+            action="intervention_required",
+            version=state["targetVersion"],
+            error_message=(
+                f"Snapshot recovery could not prove exact restoration; concurrent payload was "
+                f"preserved at {recovery_path}."
+                + (f" {intervention_error}" if intervention_error else "")
+            ),
+            diagnostic_journal=transaction_root,
+            intervention_record=intervention_record,
+        )
+    _remove_transaction_tree(transaction_root)
+    return TransactionOutcome(
+        name=state["skillName"],
+        status="recovered",
+        installed_state="rolled_back",
+        applied=False,
+        action="none",
+        version=state["targetVersion"],
+    )
 
 
 def _decode_coordinator_metadata_journal(state: dict) -> _MetadataJournal:
@@ -4333,7 +5219,7 @@ def _validate_git_worktree_revision(
     return current_head
 
 
-def _recover_transaction_from_state(transaction_root: Path, state: dict) -> None:
+def _settle_legacy_snapshot_v4(transaction_root: Path, state: dict) -> None:
     skill_dir = Path(state["skillDir"])
     _validate_transaction_root(transaction_root, skill_dir.parent)
     _validate_skill_root(skill_dir)
@@ -4391,7 +5277,6 @@ def _recover_transaction_from_state(transaction_root: Path, state: dict) -> None
             entry_type="single-skill",
         )
         _validate_safe_metadata_path(skill_dir)
-        _set_transaction_phase(transaction_root, state, TRANSACTION_PHASE_ROLLED_BACK)
         try:
             _remove_transaction_tree(transaction_root)
         except (OSError, AgentSkillUpdaterError) as exc:
@@ -4410,16 +5295,52 @@ def _recover_transaction_from_state(transaction_root: Path, state: dict) -> None
         )
 
 
+def _snapshot_transaction_evidence(state: dict) -> dict:
+    if state.get("transactionType") == COORDINATOR_TRANSACTION_TYPE:
+        evidence = state.get("evidence", {}).get("snapshot")
+        if not isinstance(evidence, dict):
+            raise AgentSkillUpdaterError("Snapshot Transaction Evidence is missing.")
+        return evidence
+    return {
+        "entryType": "single-skill",
+        "originalSignature": state["originalSignature"],
+        "expectedSignature": state["expectedSignature"],
+    }
+
+
+def _snapshot_metadata_phase(state: dict) -> str:
+    if state.get("transactionType") == COORDINATOR_TRANSACTION_TYPE:
+        return state["phase"]
+    return _decode_legacy_metadata_phase(state["metadataPhase"])
+
+
+def _record_snapshot_recovery_path(
+    transaction_root: Path,
+    state: dict,
+    recovery_path: Path,
+) -> None:
+    if state.get("transactionType") != COORDINATOR_TRANSACTION_TYPE:
+        return
+    state["recoveryPath"] = str(recovery_path)
+    _write_transaction_state(transaction_root, state)
+
+
+def _mark_snapshot_rolled_back(transaction_root: Path, state: dict) -> None:
+    if state.get("transactionType") == COORDINATOR_TRANSACTION_TYPE:
+        _set_coordinator_phase(transaction_root, state, COORDINATOR_PHASE_ROLLED_BACK)
+
+
 def _restore_payload_transaction(transaction_root: Path, state: dict) -> Optional[Path]:
     skill_dir = Path(state["skillDir"])
+    snapshot_evidence = _snapshot_transaction_evidence(state)
     original_dir = _transaction_subdirectory(transaction_root, "original")
     incoming_dir = _transaction_subdirectory(transaction_root, "incoming")
     failed_root = _transaction_subdirectory(transaction_root, "failed", create=True)
-    if directory_signature(original_dir) != state["originalSignature"]:
+    if directory_signature(original_dir) != snapshot_evidence["originalSignature"]:
         raise AgentSkillUpdaterError(
             f"Original payload snapshot is incomplete at {transaction_root}."
         )
-    if directory_signature(incoming_dir) != state["expectedSignature"]:
+    if directory_signature(incoming_dir) != snapshot_evidence["expectedSignature"]:
         raise AgentSkillUpdaterError(
             f"Incoming payload snapshot is incomplete at {transaction_root}."
         )
@@ -4476,29 +5397,27 @@ def _restore_payload_transaction(transaction_root: Path, state: dict) -> Optiona
     ):
         recovery_path = durable_recovery_path
     if recovery_path is not None:
-        state["recoveryPath"] = str(recovery_path)
-        _write_transaction_state(transaction_root, state)
+        _record_snapshot_recovery_path(transaction_root, state, recovery_path)
     _install_payload_without_overwrite(original_dir, skill_dir)
     _validate_skill_payload(
         skill_dir,
-        state["originalSignature"],
-        entry_type="single-skill",
+        snapshot_evidence["originalSignature"],
+        entry_type=snapshot_evidence["entryType"],
     )
 
     metadata_recovery = _rollback_transaction_metadata(
         transaction_root,
-        _decode_legacy_metadata_phase(state["metadataPhase"]),
+        _snapshot_metadata_phase(state),
         metadata_path,
         original_metadata,
         expected_metadata,
     )
     recovery_path = recovery_path or metadata_recovery
     if recovery_path is not None:
-        state["recoveryPath"] = str(recovery_path)
-        _write_transaction_state(transaction_root, state)
+        _record_snapshot_recovery_path(transaction_root, state, recovery_path)
     if metadata_recovery is None:
         _validate_transaction_metadata(skill_dir, state, expected=False)
-    _set_transaction_phase(transaction_root, state, TRANSACTION_PHASE_ROLLED_BACK)
+    _mark_snapshot_rolled_back(transaction_root, state)
     return recovery_path
 
 
@@ -4733,6 +5652,14 @@ def _control_metadata_evidence(
 ) -> _ControlMetadataEvidence:
     if isinstance(value, _ControlMetadataEvidence):
         return value
+    if "evidence" in value:
+        before = value["evidence"]["beforeMetadata"]
+        expected = value["evidence"]["expectedMetadata"]
+        return _ControlMetadataEvidence(
+            before_present=before["present"],
+            before_sha256=before["sha256"],
+            expected_sha256=expected["sha256"],
+        )
     return _ControlMetadataEvidence(
         before_present=value["originalMetadataPresent"],
         before_sha256=value["originalMetadataSha256"],
@@ -4750,15 +5677,6 @@ def _validate_safe_metadata_path(skill_dir: Path) -> None:
 
 def _write_transaction_state(transaction_root: Path, state: dict) -> None:
     _write_json_atomic(transaction_root / TRANSACTION_STATE_FILENAME, state)
-
-
-def _set_transaction_phase(transaction_root: Path, state: dict, phase: str) -> None:
-    if phase not in TRANSACTION_PHASES:
-        raise AgentSkillUpdaterError(f"Invalid transaction phase: {phase}")
-    next_state = {**state, "phase": phase}
-    _write_transaction_state(transaction_root, next_state)
-    state.clear()
-    state.update(next_state)
 
 
 def _set_transaction_metadata_phase(
@@ -4892,7 +5810,7 @@ def _read_git_transaction_state(transaction_root: Path, skills_root: Path) -> di
     return state
 
 
-def _read_transaction_state(transaction_root: Path, skills_root: Path) -> dict:
+def _decode_legacy_snapshot_v4_journal(transaction_root: Path, skills_root: Path) -> dict:
     try:
         state_path = _transaction_file(
             transaction_root,
@@ -4991,7 +5909,7 @@ def _read_typed_transaction_state(
     if transaction_type == GIT_TRANSACTION_TYPE:
         return _read_git_transaction_state(transaction_root, skills_root)
     if transaction_type == SNAPSHOT_TRANSACTION_TYPE:
-        return _read_transaction_state(transaction_root, skills_root)
+        return _decode_legacy_snapshot_v4_journal(transaction_root, skills_root)
     return _read_metadata_transaction_state(transaction_root, skills_root)
 
 

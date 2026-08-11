@@ -312,133 +312,6 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                 with self.assertRaisesRegex(updater.AgentSkillUpdaterError, "not available on PATH"):
                     updater._resolve_command(["npm", "ci"])
 
-    def test_update_skill_from_staged_merges_local_and_remote_text_changes(self):
-        from scripts.agent_skill_updater import AgentSkillSource, AgentSkillUpdate, update_skill_from_staged
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            local = root / "local" / "demo-skill"
-            remote = root / "remote"
-            base = root / "base"
-            backup_root = root / "backup"
-            local.mkdir(parents=True)
-            remote.mkdir()
-            base.mkdir()
-            backup_root.mkdir()
-
-            base_text = "# Demo\n\n## Remote Section\n\nOriginal remote line.\n\n## Local Section\n\nOriginal local line.\n"
-            local_text = "# Demo\n\n## Remote Section\n\nOriginal remote line.\n\n## Local Section\n\nKeep this local rule.\n"
-            remote_text = "# Demo\n\n## Remote Section\n\nRemote changed line.\n\n## Local Section\n\nOriginal local line.\n"
-
-            (base / "SKILL.md").write_text(base_text, encoding="utf-8")
-            (local / "SKILL.md").write_text(local_text, encoding="utf-8")
-            (remote / "SKILL.md").write_text(remote_text, encoding="utf-8")
-            (local / ".openskills.json").write_text(
-                json.dumps(
-                    {
-                        "source": "example/demo-skill",
-                        "sourceType": "git",
-                        "repoUrl": "https://github.com/example/demo-skill",
-                        "subpath": ".",
-                        "installedBaseVersion": "a" * 40,
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            source = AgentSkillSource(
-                name="demo-skill",
-                local_dir=local,
-                source="example/demo-skill",
-                source_type="git",
-                repo_url="https://github.com/example/demo-skill",
-                subpath=".",
-                generator=None,
-                workflow_id=None,
-                metadata_path=local / ".openskills.json",
-                entry_type="single-skill",
-            )
-            update = AgentSkillUpdate(
-                source=source,
-                staged_dir=remote,
-                status="update_available",
-                installed_base_version="a" * 40,
-                local_version="a" * 40,
-                remote_version="b" * 40,
-            )
-
-            with mock.patch("scripts.agent_skill_updater._stage_git_skill_at_ref", return_value=base):
-                update_skill_from_staged(update, backup_root)
-
-            merged = (local / "SKILL.md").read_text(encoding="utf-8")
-            self.assertIn("Remote changed line.", merged)
-            self.assertIn("Keep this local rule.", merged)
-            self.assertTrue((backup_root / "demo-skill" / "SKILL.md").exists())
-
-    def test_update_skill_from_staged_blocks_conflicting_local_and_remote_changes(self):
-        from scripts.agent_skill_updater import (
-            AgentSkillSource,
-            AgentSkillUpdate,
-            AgentSkillUpdaterError,
-            update_skill_from_staged,
-        )
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            local = root / "local" / "demo-skill"
-            remote = root / "remote"
-            base = root / "base"
-            backup_root = root / "backup"
-            local.mkdir(parents=True)
-            remote.mkdir()
-            base.mkdir()
-            backup_root.mkdir()
-
-            (base / "SKILL.md").write_text("# Demo\n\nOriginal line.\n", encoding="utf-8")
-            (local / "SKILL.md").write_text("# Demo\n\nLocal changed line.\n", encoding="utf-8")
-            (remote / "SKILL.md").write_text("# Demo\n\nRemote changed line.\n", encoding="utf-8")
-            (local / ".openskills.json").write_text(
-                json.dumps(
-                    {
-                        "source": "example/demo-skill",
-                        "sourceType": "git",
-                        "repoUrl": "https://github.com/example/demo-skill",
-                        "subpath": ".",
-                        "installedBaseVersion": "a" * 40,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            source = AgentSkillSource(
-                name="demo-skill",
-                local_dir=local,
-                source="example/demo-skill",
-                source_type="git",
-                repo_url="https://github.com/example/demo-skill",
-                subpath=".",
-                generator=None,
-                workflow_id=None,
-                metadata_path=local / ".openskills.json",
-                entry_type="single-skill",
-            )
-            update = AgentSkillUpdate(
-                source=source,
-                staged_dir=remote,
-                status="update_available",
-                installed_base_version="a" * 40,
-                local_version="a" * 40,
-                remote_version="b" * 40,
-            )
-
-            with mock.patch("scripts.agent_skill_updater._stage_git_skill_at_ref", return_value=base):
-                with self.assertRaises(AgentSkillUpdaterError):
-                    update_skill_from_staged(update, backup_root)
-
-            self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "# Demo\n\nLocal changed line.\n")
-            conflict_dir = backup_root / "demo-skill.merge-conflicts"
-            self.assertTrue((conflict_dir / "SKILL.md.local").exists())
-            self.assertTrue((conflict_dir / "SKILL.md.remote").exists())
-
     def test_update_agent_skills_updates_only_requested_registry_entry(self):
         import scripts.update_agent_skills as updater
 
@@ -501,8 +374,21 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                         ),
                     ):
                         with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
-                            with mock.patch("scripts.update_agent_skills.make_backup_root", return_value=Path(r"C:\backup-root")):
-                                with mock.patch("scripts.update_agent_skills.update_skill_from_staged") as update_from_staged:
+                            with mock.patch(
+                                "scripts.update_agent_skills.prepare_snapshot_payload",
+                                return_value=mock.sentinel.prepared_payload,
+                            ) as prepare:
+                                with mock.patch(
+                                    "scripts.update_agent_skills.apply_observed_update",
+                                    return_value=updater.TransactionOutcome(
+                                        name="demo-skill",
+                                        status="up_to_date",
+                                        installed_state="committed",
+                                        applied=True,
+                                        action="payload_merged",
+                                        version="new123456789",
+                                    ),
+                                ) as apply:
                                     with self.assertRaises(SystemExit) as exit_info:
                                         with redirect_stdout(stdout):
                                             updater.main()
@@ -512,7 +398,8 @@ class AgentSkillUpdaterTests(unittest.TestCase):
         self.assertEqual(len(payload), 1)
         self.assertEqual(payload[0]["name"], "demo-skill")
         self.assertTrue(payload[0]["applied"])
-        update_from_staged.assert_called_once()
+        prepare.assert_called_once_with(resolved)
+        apply.assert_called_once()
 
     def test_update_agent_skills_refreshes_metadata_when_staged_content_matches(self):
         import scripts.update_agent_skills as updater
@@ -576,6 +463,7 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                                     error_message=None,
                                     diagnostic_journal=None,
                                     cleanup_residue=None,
+                                    intervention_record=None,
                                 ),
                             ) as apply_observed:
                                 with self.assertRaises(SystemExit) as exit_info:
