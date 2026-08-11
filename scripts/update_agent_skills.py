@@ -22,12 +22,11 @@ if __package__:
         apply_observed_update,
         agent_skill_source_from_registry_entry,
         fetch_source_remote_observation,
-        make_backup_root,
+        prepare_snapshot_payload,
         probe_git_worktree,
         registry_entry_uses_git_worktree,
         resolve_skill_update,
         update_git_worktree_skill,
-        update_skill_from_staged,
         versions_match,
     )
     from .i18n import get_i18n, t
@@ -46,12 +45,11 @@ else:
         apply_observed_update,
         agent_skill_source_from_registry_entry,
         fetch_source_remote_observation,
-        make_backup_root,
+        prepare_snapshot_payload,
         probe_git_worktree,
         registry_entry_uses_git_worktree,
         resolve_skill_update,
         update_git_worktree_skill,
-        update_skill_from_staged,
         versions_match,
     )
     from i18n import get_i18n, t  # noqa: E402
@@ -109,8 +107,6 @@ def main() -> None:
         raise SystemExit(1)
     payload: list[dict[str, object]] = []
     updated_names: list[str] = []
-    backup_root: Path | None = None
-
     with tempfile.TemporaryDirectory(prefix="skills-updater-apply-") as temp_dir:
         stage_root = Path(temp_dir)
         for name, entry in registry["entries"].items():
@@ -209,18 +205,24 @@ def main() -> None:
                 item["local_version"] = resolved.local_version
                 resolved_remote_version = resolved.remote_version or probe.remote_version
                 if resolved.status == "update_available":
-                    if backup_root is None:
-                        backup_root = make_backup_root(Path(registry["skillsRoot"]))
-                    update_skill_from_staged(resolved, backup_root)
-                    item["status"] = "up_to_date"
+                    if resolved.remote_observation is None:
+                        raise AgentSkillUpdaterError(
+                            f"Resolved update for '{name}' is missing its Remote Observation."
+                        )
+                    prepared_payload = prepare_snapshot_payload(resolved)
+                    outcome = apply_observed_update(
+                        source,
+                        resolved.remote_observation,
+                        installed_base_version=resolved.installed_base_version,
+                        prepared_payload=prepared_payload,
+                    )
+                    _apply_transaction_outcome(item, outcome)
                     item["remote_version"] = resolved.remote_version
-                    item["installed_base_version"] = resolved.remote_version
-                    item["local_version"] = resolved.remote_version
-                    item["applied"] = True
-                    item["action"] = "payload_merged"
-                    item["installed_state"] = "committed"
-                    item["backup_root"] = str(backup_root)
-                    updated_names.append(name)
+                    if outcome.version is not None and outcome.installed_state == "committed":
+                        item["installed_base_version"] = outcome.version
+                        item["local_version"] = outcome.version
+                    if outcome.applied:
+                        updated_names.append(name)
                 elif resolved.status == "up_to_date" and resolved_remote_version:
                     if resolved.remote_observation is None:
                         raise AgentSkillUpdaterError(
@@ -252,27 +254,11 @@ def main() -> None:
                     item["remote_version"] = exc.version
                 if name not in updated_names:
                     updated_names.append(name)
-                if backup_root is not None:
-                    item["backup_root"] = str(backup_root)
             except (AgentSkillUpdaterError, OSError, ValueError) as exc:
                 item["status"] = "error"
                 item["error_message"] = str(exc)
                 item["applied"] = False
                 item["installed_state"] = "unchanged"
-                if backup_root is not None:
-                    try:
-                        removed = _remove_empty_backup_root(backup_root)
-                    except OSError as cleanup_exc:
-                        item["error_message"] = (
-                            f"{exc}. Empty backup-root cleanup failed at "
-                            f"{backup_root}: {cleanup_exc}"
-                        )
-                        item["backup_root"] = str(backup_root)
-                    else:
-                        if removed:
-                            backup_root = None
-                        else:
-                            item["backup_root"] = str(backup_root)
 
             payload.append(item)
 
@@ -350,8 +336,6 @@ def main() -> None:
         ]
         if updated_names:
             print(f"Updated {len(updated_names)} item(s): {', '.join(updated_names)}")
-            if backup_root is not None:
-                print(f"Backup: {backup_root}")
         else:
             print("No skill updates were applied.")
         if local_only_names:
@@ -363,13 +347,6 @@ def main() -> None:
         raise SystemExit(1)
 
     raise SystemExit(0)
-
-
-def _remove_empty_backup_root(backup_root: Path) -> bool:
-    if any(backup_root.iterdir()):
-        return False
-    backup_root.rmdir()
-    return True
 
 
 def _apply_transaction_outcome(
@@ -385,6 +362,8 @@ def _apply_transaction_outcome(
         item["diagnostic_journal"] = str(outcome.diagnostic_journal)
     if outcome.cleanup_residue is not None:
         item["cleanup_residue"] = str(outcome.cleanup_residue)
+    if outcome.intervention_record is not None:
+        item["intervention_record"] = str(outcome.intervention_record)
 
 
 def _require_probe_observation(
