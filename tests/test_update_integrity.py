@@ -25,6 +25,23 @@ def run_git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def stage_git_revision_payload(
+    repo_dir: Path,
+    revision: str,
+    destination: Path,
+    entry_type: str,
+) -> None:
+    from scripts.agent_skill_updater import _validate_skill_payload
+
+    archive_path = destination.parent / "incoming.zip"
+    run_git(repo_dir, "archive", "--format=zip", f"--output={archive_path}", revision)
+    extract_root = destination.parent / "incoming-archive"
+    extract_root.mkdir(parents=True)
+    shutil.unpack_archive(archive_path, extract_root, "zip")
+    shutil.copytree(extract_root, destination)
+    _validate_skill_payload(destination, entry_type=entry_type)
+
+
 def configure_git(repo: Path) -> None:
     run_git(repo, "config", "user.name", "Skills Updater Tests")
     run_git(repo, "config", "user.email", "skills-updater@example.invalid")
@@ -1334,18 +1351,13 @@ class PayloadIntegrityTests(unittest.TestCase):
             "skillsRoot": r"C:\skills",
             "entries": {"demo": entry},
         }
-        result = SimpleNamespace(
+        result = updater.TransactionOutcome(
+            name="demo",
             status="up_to_date",
-            local_version=new_sha,
-            remote_version=new_sha,
-            relation="equal",
-            working_tree_dirty=False,
-            error_message=None,
+            installed_state="committed",
             applied=True,
             action="metadata_refreshed",
-            installed_state="committed",
-            diagnostic_journal=None,
-            cleanup_residue=None,
+            version=new_sha,
         )
         stdout = io.StringIO()
         with mock.patch.object(
@@ -1358,11 +1370,16 @@ class PayloadIntegrityTests(unittest.TestCase):
                     with mock.patch(
                         "scripts.update_agent_skills._probe_entry",
                         return_value=updater.EntryProbe(
-                            "up_to_date", new_sha, new_sha, git_relation="equal", working_tree_dirty=False
+                            "up_to_date",
+                            new_sha,
+                            new_sha,
+                            git_relation="equal",
+                            working_tree_dirty=False,
+                            remote_observation=mock.sentinel.observation,
                         ),
                     ):
                         with mock.patch(
-                            "scripts.update_agent_skills.update_git_worktree_skill",
+                            "scripts.update_agent_skills.apply_observed_update",
                             return_value=result,
                         ):
                             with mock.patch(
@@ -1765,49 +1782,53 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             entry_type="single-skill",
         )
 
-    def test_git_probe_and_update_recheck_local_only_after_lock_acquisition(self):
+    def test_git_probe_prepares_remote_observation_without_transaction_lock(self):
         import scripts.agent_skill_updater as updater
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             remote, _, local, version = self.create_remote_and_clone(root)
             metadata_path = self.write_metadata(local, remote, version)
+            source = self.source_for(local, metadata_path)
+
+            with mock.patch(
+                "scripts.agent_skill_updater.skill_update_lock",
+                side_effect=AssertionError("probe acquired Transaction lock"),
+            ):
+                result = updater.probe_git_worktree(source)
+
+            self.assertEqual(result.relation, "equal")
+
+    def test_git_update_rechecks_local_only_after_coordinator_lock_acquisition(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, _, local, version = self.create_remote_and_clone(root)
+            metadata_path = self.write_metadata(local, remote, version[:12])
             original = json.loads(metadata_path.read_text(encoding="utf-8"))
             concurrent = {**original, "updatePolicy": "local-only"}
             concurrent_bytes = json.dumps(concurrent).encode("utf-8")
+            source = self.source_for(local, metadata_path)
 
-            for operation_name in ("probe", "update"):
-                with self.subTest(operation=operation_name):
-                    metadata_path.write_text(json.dumps(original), encoding="utf-8")
-                    source = self.source_for(local, metadata_path)
+            class PolicyChangingLock:
+                def __enter__(self):
+                    metadata_path.write_bytes(concurrent_bytes)
 
-                    class PolicyChangingLock:
-                        def __enter__(self):
-                            metadata_path.write_bytes(concurrent_bytes)
+                def __exit__(self, exc_type, exc_value, traceback):
+                    return False
 
-                        def __exit__(self, exc_type, exc_value, traceback):
-                            return False
+            with mock.patch(
+                "scripts.agent_skill_updater.skill_update_lock",
+                return_value=PolicyChangingLock(),
+            ):
+                with self.assertRaisesRegex(
+                    updater.AgentSkillUpdaterError,
+                    "updatePolicy changed",
+                ):
+                    updater.update_git_worktree_skill(source)
 
-                    operation = (
-                        updater.probe_git_worktree
-                        if operation_name == "probe"
-                        else updater.update_git_worktree_skill
-                    )
-                    with mock.patch(
-                        "scripts.agent_skill_updater.skill_update_lock",
-                        return_value=PolicyChangingLock(),
-                    ):
-                        with mock.patch(
-                            "scripts.agent_skill_updater._git_fetch_remote_branch"
-                        ) as fetch:
-                            with self.assertRaisesRegex(
-                                updater.AgentSkillUpdaterError,
-                                "updatePolicy changed",
-                            ):
-                                operation(source)
-
-                    fetch.assert_not_called()
-                    self.assertEqual(metadata_path.read_bytes(), concurrent_bytes)
+            self.assertEqual(metadata_path.read_bytes(), concurrent_bytes)
 
     def test_registry_separates_installed_base_from_git_head(self):
         from scripts.skills_registry import sync_registry
@@ -1943,6 +1964,68 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertTrue((local / ".git").exists())
             run_git(local, "fsck", "--full")
 
+    def test_interrupted_git_update_uses_transaction_evidence_without_worktree_snapshots(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, seed, local, version_a = self.create_remote_and_clone(root)
+            version_b = self.advance_remote(seed)
+            metadata_path = self.write_metadata(local, remote, version_a)
+            original_metadata = metadata_path.read_bytes()
+            real_set_phase = updater._set_coordinator_phase
+
+            def interrupt_at_payload_intent(transaction_root, state, phase):
+                real_set_phase(transaction_root, state, phase)
+                if phase == updater.COORDINATOR_PHASE_APPLYING_PAYLOAD:
+                    raise KeyboardInterrupt()
+
+            with mock.patch(
+                "scripts.agent_skill_updater._set_coordinator_phase",
+                side_effect=interrupt_at_payload_intent,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    updater.update_git_worktree_skill(
+                        self.source_for(local, metadata_path)
+                    )
+
+            transaction = next(local.parent.glob(".demo.transaction-*"))
+            state = json.loads((transaction / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["transactionType"], "coordinator")
+            self.assertEqual(state["transactionKind"], "git-worktree")
+            self.assertEqual(state["phase"], updater.COORDINATOR_PHASE_APPLYING_PAYLOAD)
+            self.assertEqual(
+                set(state["evidence"]),
+                {"beforeMetadata", "expectedMetadata", "git"},
+            )
+            git_evidence = state["evidence"]["git"]
+            self.assertEqual(git_evidence["originalCommit"], version_a)
+            self.assertEqual(git_evidence["expectedCommit"], version_b)
+            self.assertFalse((transaction / "original").exists())
+            self.assertFalse((transaction / "incoming").exists())
+            self.assertEqual(
+                run_git(local, "rev-parse", git_evidence["temporaryRefs"]["original"]),
+                version_a,
+            )
+            self.assertEqual(
+                run_git(local, "rev-parse", git_evidence["temporaryRefs"]["expected"]),
+                version_b,
+            )
+
+            outcome = updater.recover_updates(local.parent)[0]
+
+            self.assertEqual(outcome.installed_state, "rolled_back")
+            self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
+            self.assertEqual(metadata_path.read_bytes(), original_metadata)
+            self.assertFalse(transaction.exists())
+            for ref in git_evidence["temporaryRefs"].values():
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "-C", str(local), "show-ref", "--verify", "--quiet", ref]
+                    ).returncode,
+                    1,
+                )
+
     def test_git_cleanup_failure_reports_committed_update_state(self):
         import scripts.agent_skill_updater as updater
 
@@ -1956,15 +2039,226 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._remove_transaction_tree",
                 side_effect=updater.AgentSkillUpdaterError("cleanup failed"),
             ):
-                with self.assertRaises(updater.AgentSkillUpdateCommittedError) as raised:
-                    updater.update_git_worktree_skill(self.source_for(local, metadata_path))
+                result = updater.update_git_worktree_skill(
+                    self.source_for(local, metadata_path)
+                )
 
-            self.assertEqual(raised.exception.action, "fast_forwarded")
-            self.assertEqual(raised.exception.version, version_b)
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.installed_state, "committed")
+            self.assertTrue(result.applied)
+            self.assertEqual(result.action, "fast_forwarded")
+            self.assertIsNotNone(result.cleanup_residue)
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             self.assertEqual(metadata["installedBaseVersion"], version_b)
-            self.assertEqual(len(list(local.parent.glob(".demo.git-update-*"))), 1)
+            self.assertEqual(len(list(local.parent.glob(".demo.transaction-*"))), 1)
+
+    def test_committed_git_recovery_survives_partially_removed_metadata_evidence(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, seed, local, version_a = self.create_remote_and_clone(root)
+            version_b = self.advance_remote(seed)
+            metadata_path = self.write_metadata(local, remote, version_a)
+            real_remove = updater._remove_transaction_tree
+            failed = {"value": False}
+
+            def remove_metadata_evidence_then_fail(transaction_root):
+                if not failed["value"]:
+                    failed["value"] = True
+                    (transaction_root / "metadata.before").unlink()
+                    (transaction_root / "metadata.expected").unlink()
+                    raise OSError("partial cleanup failure")
+                return real_remove(transaction_root)
+
+            with mock.patch(
+                "scripts.agent_skill_updater._remove_transaction_tree",
+                side_effect=remove_metadata_evidence_then_fail,
+            ):
+                result = updater.update_git_worktree_skill(
+                    self.source_for(local, metadata_path)
+                )
+
+            transaction = next(local.parent.glob(".demo.transaction-*"))
+            self.assertEqual(result.installed_state, "committed")
+            self.assertFalse((transaction / "metadata.before").exists())
+            self.assertFalse((transaction / "metadata.expected").exists())
+
+            outcome = updater.recover_updates(local.parent)[0]
+
+            self.assertEqual(outcome.installed_state, "committed")
+            self.assertTrue(outcome.applied)
+            self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
+            self.assertFalse(transaction.exists())
+
+    def test_committed_git_recovery_preserves_committed_installed_state_when_temporary_ref_changed(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, seed, local, version_a = self.create_remote_and_clone(root)
+            version_b = self.advance_remote(seed)
+            metadata_path = self.write_metadata(local, remote, version_a)
+            real_cleanup = updater._cleanup_git_transaction
+            changed_ref = {"value": None}
+
+            def change_original_temporary_ref(repo_dir, transaction_root, evidence):
+                if changed_ref["value"] is None:
+                    changed_ref["value"] = evidence.original_temporary_ref
+                    run_git(
+                        repo_dir,
+                        "update-ref",
+                        evidence.original_temporary_ref,
+                        version_b,
+                        version_a,
+                    )
+                return real_cleanup(repo_dir, transaction_root, evidence)
+
+            with mock.patch(
+                "scripts.agent_skill_updater._cleanup_git_transaction",
+                side_effect=change_original_temporary_ref,
+            ):
+                result = updater.update_git_worktree_skill(
+                    self.source_for(local, metadata_path)
+                )
+
+            transaction = next(local.parent.glob(".demo.transaction-*"))
+            self.assertEqual(result.installed_state, "committed")
+            self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
+
+            outcome = updater.recover_updates(local.parent)[0]
+
+            self.assertEqual(outcome.installed_state, "committed")
+            self.assertTrue(outcome.applied)
+            self.assertEqual(outcome.cleanup_residue, transaction)
+            self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
+            self.assertEqual(run_git(local, "rev-parse", changed_ref["value"]), version_b)
+            self.assertTrue(transaction.exists())
+
+    def test_git_adapter_establishes_original_and_expected_idempotently(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, seed, local, version_a = self.create_remote_and_clone(root)
+            version_b = self.advance_remote(seed)
+            metadata_path = self.write_metadata(local, remote, version_a)
+            real_set_phase = updater._set_coordinator_phase
+
+            def interrupt_at_payload_intent(transaction_root, state, phase):
+                real_set_phase(transaction_root, state, phase)
+                if phase == updater.COORDINATOR_PHASE_APPLYING_PAYLOAD:
+                    raise KeyboardInterrupt()
+
+            with mock.patch(
+                "scripts.agent_skill_updater._set_coordinator_phase",
+                side_effect=interrupt_at_payload_intent,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    updater.update_git_worktree_skill(
+                        self.source_for(local, metadata_path)
+                    )
+
+            transaction = next(local.parent.glob(".demo.transaction-*"))
+            state = updater._read_coordinator_transaction_state(
+                transaction,
+                local.parent,
+            )
+            evidence = updater._decode_coordinator_git_journal(state).git_evidence
+            self.assertIsNotNone(evidence)
+
+            updater._establish_git_identity(local, evidence, expected=True)
+            updater._establish_git_identity(local, evidence, expected=True)
+            self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
+            updater._establish_git_identity(local, evidence, expected=False)
+            updater._establish_git_identity(local, evidence, expected=False)
+            self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
+
+            outcome = updater.recover_updates(local.parent)[0]
+            self.assertEqual(outcome.installed_state, "rolled_back")
+            self.assertFalse(transaction.exists())
+
+    def test_damaged_git_evidence_preserves_diagnostic_journal(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, seed, local, version_a = self.create_remote_and_clone(root)
+            self.advance_remote(seed)
+            metadata_path = self.write_metadata(local, remote, version_a)
+            real_set_phase = updater._set_coordinator_phase
+
+            def interrupt_at_payload_intent(transaction_root, state, phase):
+                real_set_phase(transaction_root, state, phase)
+                if phase == updater.COORDINATOR_PHASE_APPLYING_PAYLOAD:
+                    raise KeyboardInterrupt()
+
+            with mock.patch(
+                "scripts.agent_skill_updater._set_coordinator_phase",
+                side_effect=interrupt_at_payload_intent,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    updater.update_git_worktree_skill(
+                        self.source_for(local, metadata_path)
+                    )
+
+            transaction = next(local.parent.glob(".demo.transaction-*"))
+            state_path = transaction / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["evidence"]["git"]["expectedSignature"] = "damaged"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            outcome = updater.recover_updates(local.parent)[0]
+
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.diagnostic_journal, transaction)
+            self.assertTrue(transaction.exists())
+
+    def test_foreign_git_temporary_refs_preserve_diagnostic_journal(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, seed, local, version_a = self.create_remote_and_clone(root)
+            version_b = self.advance_remote(seed)
+            metadata_path = self.write_metadata(local, remote, version_a)
+            real_set_phase = updater._set_coordinator_phase
+
+            def interrupt_at_payload_intent(transaction_root, state, phase):
+                real_set_phase(transaction_root, state, phase)
+                if phase == updater.COORDINATOR_PHASE_APPLYING_PAYLOAD:
+                    raise KeyboardInterrupt()
+
+            with mock.patch(
+                "scripts.agent_skill_updater._set_coordinator_phase",
+                side_effect=interrupt_at_payload_intent,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    updater.update_git_worktree_skill(
+                        self.source_for(local, metadata_path)
+                    )
+
+            transaction = next(local.parent.glob(".demo.transaction-*"))
+            state_path = transaction / "state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            foreign_prefix = f"refs/skills-updater/transactions/{'f' * 24}"
+            foreign_refs = {
+                "original": f"{foreign_prefix}/original",
+                "expected": f"{foreign_prefix}/expected",
+            }
+            run_git(local, "update-ref", foreign_refs["original"], version_a)
+            run_git(local, "update-ref", foreign_refs["expected"], version_b)
+            state["evidence"]["git"]["temporaryRefs"] = foreign_refs
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            outcome = updater.recover_updates(local.parent)[0]
+
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.diagnostic_journal, transaction)
+            self.assertTrue(transaction.exists())
+            self.assertEqual(run_git(local, "rev-parse", foreign_refs["original"]), version_a)
+            self.assertEqual(run_git(local, "rev-parse", foreign_refs["expected"]), version_b)
 
     def test_skill_pack_uses_the_transactional_git_worktree_engine(self):
         from scripts.agent_skill_updater import update_git_worktree_skill
@@ -2013,16 +2307,17 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._commit_transaction_metadata",
                 side_effect=PermissionError("pack metadata failure"),
             ):
-                with self.assertRaisesRegex(updater.AgentSkillUpdaterError, "were restored"):
-                    updater.update_git_worktree_skill(source)
+                result = updater.update_git_worktree_skill(source)
 
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.installed_state, "rolled_back")
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
             self.assertEqual(
                 (local / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8"),
                 "pack-a\n",
             )
             self.assertEqual(metadata_path.read_bytes(), original_metadata)
-            self.assertEqual(list(local.parent.glob(".demo-pack.git-update-*")), [])
+            self.assertEqual(list(local.parent.glob(".demo-pack.transaction-*")), [])
 
     def test_skill_pack_remote_without_skills_directory_is_rejected_before_apply(self):
         from scripts.agent_skill_updater import AgentSkillUpdaterError, update_git_worktree_skill
@@ -2054,38 +2349,37 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             metadata_path = self.write_metadata(local, remote, version_a)
             run_git(local, "branch", "topic", version_a)
             original_metadata = metadata_path.read_bytes()
-            real_run = updater._run
+            real_compare_and_swap = updater._git_compare_and_swap_ref
             switched = {"value": False}
 
-            def switch_branch_after_forward_cas(command, cwd):
-                real_run(command, cwd)
+            def switch_branch_after_forward_cas(repo_dir, ref, new_commit, old_commit):
+                real_compare_and_swap(repo_dir, ref, new_commit, old_commit)
                 if (
                     not switched["value"]
-                    and "update-ref" in command
-                    and command[-2:] == [version_b, version_a]
+                    and ref == "refs/heads/main"
+                    and new_commit == version_b
+                    and old_commit == version_a
                 ):
                     switched["value"] = True
                     run_git(local, "checkout", "topic")
 
             with mock.patch(
-                "scripts.agent_skill_updater._run",
+                "scripts.agent_skill_updater._git_compare_and_swap_ref",
                 side_effect=switch_branch_after_forward_cas,
             ):
-                with self.assertRaisesRegex(updater.AgentSkillUpdaterError, "Rollback also failed"):
-                    updater.update_git_worktree_skill(self.source_for(local, metadata_path))
+                result = updater.update_git_worktree_skill(
+                    self.source_for(local, metadata_path)
+                )
 
             self.assertTrue(switched["value"])
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.installed_state, "unchanged")
+            self.assertIn("Concurrent Change cancelled", result.error_message)
             self.assertEqual(run_git(local, "symbolic-ref", "--short", "HEAD"), "topic")
             self.assertEqual(run_git(local, "rev-parse", "refs/heads/main"), version_a)
             self.assertEqual(run_git(local, "rev-parse", "refs/heads/topic"), version_a)
             self.assertEqual(metadata_path.read_bytes(), original_metadata)
-            transactions = list(local.parent.glob(".demo.git-update-*"))
-            self.assertEqual(len(transactions), 1)
-
-            run_git(local, "checkout", "main")
-            updater.recover_incomplete_skill_transactions(local.parent)
-            self.assertFalse(transactions[0].exists())
-            self.assertFalse(updater._git_worktree_has_payload_changes(local))
+            self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
 
     def test_dirty_behind_refuses_pull_and_preserves_head(self):
         from scripts.agent_skill_updater import AgentSkillUpdaterError, probe_git_worktree, update_git_worktree_skill
@@ -2133,6 +2427,40 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
             self.assertEqual(ignored_path.read_text(encoding="utf-8"), "local secret\n")
 
+    def test_ignored_payload_becoming_untracked_is_preserved_during_fast_forward(self):
+        from scripts.agent_skill_updater import update_git_worktree_skill
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, seed, local, _ = self.create_remote_and_clone(root)
+            (seed / ".gitignore").write_text("local-secret.txt\n", encoding="utf-8")
+            run_git(seed, "add", ".gitignore")
+            run_git(seed, "commit", "-m", "ignore local secret")
+            run_git(seed, "push", "origin", "main")
+            run_git(local, "pull", "--ff-only")
+            version_a = run_git(local, "rev-parse", "HEAD")
+            metadata_path = self.write_metadata(local, remote, version_a)
+            secret = local / "local-secret.txt"
+            secret.write_text("preserve me\n", encoding="utf-8")
+
+            (seed / ".gitignore").unlink()
+            run_git(seed, "add", "-A")
+            run_git(seed, "commit", "-m", "stop ignoring local secret")
+            run_git(seed, "push", "origin", "main")
+            version_b = run_git(seed, "rev-parse", "HEAD")
+
+            result = update_git_worktree_skill(self.source_for(local, metadata_path))
+
+            self.assertEqual(result.status, "up_to_date")
+            self.assertEqual(result.installed_state, "committed")
+            self.assertEqual(result.action, "fast_forwarded")
+            self.assertTrue(result.working_tree_dirty)
+            self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
+            self.assertEqual(secret.read_text(encoding="utf-8"), "preserve me\n")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["installedBaseVersion"], version_b)
+            self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
+
     def test_ahead_is_safe_and_diverged_fails_closed(self):
         from scripts.agent_skill_updater import AgentSkillUpdaterError, probe_git_worktree, update_git_worktree_skill
 
@@ -2179,10 +2507,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
 
     def test_metadata_failure_after_fast_forward_restores_head_and_metadata(self):
-        from scripts.agent_skill_updater import (
-            AgentSkillUpdaterError,
-            update_git_worktree_skill,
-        )
+        from scripts.agent_skill_updater import update_git_worktree_skill
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2201,12 +2526,11 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._commit_transaction_metadata",
                 side_effect=fail_metadata_write,
             ):
-                with self.assertRaisesRegex(
-                    AgentSkillUpdaterError,
-                    "HEAD, payload, and metadata were restored",
-                ):
-                    update_git_worktree_skill(source)
+                result = update_git_worktree_skill(source)
 
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.installed_state, "rolled_back")
+            self.assertIn("original state was restored", result.error_message)
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
             self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "version-a\n")
             self.assertEqual(metadata_path.read_bytes(), original_metadata)
@@ -2240,24 +2564,21 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._verify_git_source_configuration",
                 side_effect=change_origin_after_metadata_publish,
             ):
-                with self.assertRaisesRegex(
-                    updater.AgentSkillUpdaterError,
-                    "HEAD, payload, and metadata were restored",
-                ):
-                    updater.update_git_worktree_skill(source)
+                result = updater.update_git_worktree_skill(source)
 
             self.assertTrue(injected["value"])
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.installed_state, "rolled_back")
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
             self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "version-a\n")
             self.assertEqual(metadata_path.read_bytes(), original_metadata)
             self.assertEqual(run_git(local, "config", "--get", "remote.origin.url"), changed_origin)
-            self.assertEqual(list(local.parent.glob(".demo.git-update-*")), [])
+            self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
 
     def test_git_rollback_restores_tracked_residue_even_when_head_never_moved(self):
         from scripts.agent_skill_updater import (
             _copy_directory_contents,
             _rollback_git_fast_forward,
-            _stage_git_revision_payload,
             directory_signature,
         )
 
@@ -2278,7 +2599,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             incoming_payload = transaction / "incoming"
             original_payload.mkdir(parents=True)
             _copy_directory_contents(local, original_payload)
-            _stage_git_revision_payload(local, version_b, incoming_payload, "single-skill")
+            stage_git_revision_payload(local, version_b, incoming_payload, "single-skill")
 
             (local / "SKILL.md").write_text("partial checkout residue\n", encoding="utf-8")
             (local / "new" / "nested").mkdir(parents=True)
@@ -2319,7 +2640,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             incoming_payload = transaction / "incoming"
             original_payload.mkdir(parents=True)
             updater._copy_directory_contents(local, original_payload)
-            updater._stage_git_revision_payload(
+            stage_git_revision_payload(
                 local,
                 version_b,
                 incoming_payload,
@@ -2566,12 +2887,8 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
             self.assertEqual(metadata_path.read_bytes(), original_metadata)
 
-    def test_branch_change_during_snapshot_cancels_before_apply(self):
-        from scripts.agent_skill_updater import (
-            AgentSkillUpdaterError,
-            _stage_git_revision_payload,
-            update_git_worktree_skill,
-        )
+    def test_branch_change_before_git_mutation_is_a_concurrent_change(self):
+        import scripts.agent_skill_updater as updater
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2579,31 +2896,143 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.advance_remote(seed)
             metadata_path = self.write_metadata(local, seed, version_a)
             source = self.source_for(local, metadata_path)
+            real_set_phase = updater._set_coordinator_phase
+            switched = {"value": False}
 
-            def switch_branch_after_snapshot(repo_dir, revision, destination, entry_type):
-                _stage_git_revision_payload(
-                    repo_dir,
-                    revision,
-                    destination,
-                    entry_type,
-                )
-                run_git(local, "checkout", "-b", "topic")
+            def switch_branch_before_payload_mutation(transaction_root, state, phase):
+                if (
+                    phase == updater.COORDINATOR_PHASE_APPLYING_PAYLOAD
+                    and not switched["value"]
+                ):
+                    switched["value"] = True
+                    run_git(local, "checkout", "-b", "topic")
+                real_set_phase(transaction_root, state, phase)
 
             with mock.patch(
-                "scripts.agent_skill_updater._stage_git_revision_payload",
-                side_effect=switch_branch_after_snapshot,
+                "scripts.agent_skill_updater._set_coordinator_phase",
+                side_effect=switch_branch_before_payload_mutation,
             ):
-                with self.assertRaisesRegex(AgentSkillUpdaterError, "cancelled before apply"):
-                    update_git_worktree_skill(source)
+                result = updater.update_git_worktree_skill(source)
 
+            self.assertTrue(switched["value"])
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.installed_state, "unchanged")
+            self.assertIn("Concurrent Change cancelled", result.error_message)
             self.assertEqual(run_git(local, "branch", "--show-current"), "topic")
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
             self.assertEqual(run_git(local, "rev-parse", "main"), version_a)
-            self.assertEqual(list(local.parent.glob(".demo.git-update-*")), [])
+            self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
+
+    def test_payload_change_before_git_cas_is_a_concurrent_change(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, seed, local, version_a = self.create_remote_and_clone(root)
+            self.advance_remote(seed)
+            metadata_path = self.write_metadata(local, remote, version_a)
+            original_metadata = metadata_path.read_bytes()
+            real_set_phase = updater._set_coordinator_phase
+            changed = {"value": False}
+
+            def change_payload_before_cas(transaction_root, state, phase):
+                real_set_phase(transaction_root, state, phase)
+                if (
+                    phase == updater.COORDINATOR_PHASE_APPLYING_PAYLOAD
+                    and not changed["value"]
+                ):
+                    changed["value"] = True
+                    (local / "SKILL.md").write_text(
+                        "concurrent payload\n",
+                        encoding="utf-8",
+                    )
+
+            with mock.patch(
+                "scripts.agent_skill_updater._set_coordinator_phase",
+                side_effect=change_payload_before_cas,
+            ):
+                result = updater.update_git_worktree_skill(
+                    self.source_for(local, metadata_path)
+                )
+
+            self.assertTrue(changed["value"])
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.installed_state, "unchanged")
+            self.assertIn("Concurrent Change cancelled", result.error_message)
+            self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
+            self.assertEqual(
+                (local / "SKILL.md").read_text(encoding="utf-8"),
+                "concurrent payload\n",
+            )
+            self.assertEqual(metadata_path.read_bytes(), original_metadata)
+            self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
+
+    def test_ref_change_during_final_pre_mutation_cas_returns_unchanged(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, seed, local, version_a = self.create_remote_and_clone(root)
+            self.advance_remote(seed)
+            metadata_path = self.write_metadata(local, remote, version_a)
+            original_metadata = metadata_path.read_bytes()
+            real_verify = updater._verify_git_apply_preconditions
+            calls = {"value": 0}
+
+            def reject_final_cas(source, result, installed_base):
+                calls["value"] += 1
+                if calls["value"] == 2:
+                    raise updater.AgentSkillUpdaterError(
+                        "remote tracking ref changed before mutation"
+                    )
+                return real_verify(source, result, installed_base)
+
+            with mock.patch(
+                "scripts.agent_skill_updater._verify_git_apply_preconditions",
+                side_effect=reject_final_cas,
+            ):
+                result = updater.update_git_worktree_skill(
+                    self.source_for(local, metadata_path)
+                )
+
+            self.assertEqual(calls["value"], 2)
+            self.assertEqual(result.status, "error")
+            self.assertEqual(result.installed_state, "unchanged")
+            self.assertIn("Concurrent Change cancelled", result.error_message)
+            self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
+            self.assertEqual(metadata_path.read_bytes(), original_metadata)
+            self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
+
+    def test_git_ref_operational_failure_is_not_reported_as_concurrent_change(self):
+        import scripts.agent_skill_updater as updater
+
+        original = "a" * 40
+        failure = SimpleNamespace(
+            returncode=128,
+            stdout="",
+            stderr="fatal: cannot lock ref: permission denied",
+        )
+        with mock.patch(
+            "scripts.agent_skill_updater.subprocess.run",
+            return_value=failure,
+        ):
+            with mock.patch(
+                "scripts.agent_skill_updater._git_optional_ref_commit",
+                return_value=original,
+            ):
+                with self.assertRaises(updater.AgentSkillUpdaterError) as caught:
+                    updater._git_compare_and_swap_ref(
+                        Path("repo"),
+                        "refs/heads/main",
+                        "b" * 40,
+                        original,
+                    )
+
+        self.assertNotIsInstance(caught.exception, updater._GitConcurrentChangeError)
+        self.assertIn("permission denied", str(caught.exception))
 
     def test_interrupted_git_rollback_is_recovered_from_durable_journal(self):
         from scripts.agent_skill_updater import (
-            AgentSkillUpdaterError,
             recover_incomplete_skill_transactions,
             update_git_worktree_skill,
         )
@@ -2618,17 +3047,13 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
 
             with mock.patch(
                 "scripts.agent_skill_updater._commit_transaction_metadata",
-                side_effect=PermissionError("metadata failed"),
+                side_effect=KeyboardInterrupt(),
             ):
-                with mock.patch(
-                    "scripts.agent_skill_updater._rollback_git_fast_forward",
-                    side_effect=KeyboardInterrupt(),
-                ):
-                    with self.assertRaisesRegex(AgentSkillUpdaterError, "Rollback also failed"):
-                        update_git_worktree_skill(source)
+                with self.assertRaises(KeyboardInterrupt):
+                    update_git_worktree_skill(source)
 
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
-            transactions = list(local.parent.glob(".demo.git-update-*"))
+            transactions = list(local.parent.glob(".demo.transaction-*"))
             self.assertEqual(len(transactions), 1)
 
             recover_incomplete_skill_transactions(local.parent)
@@ -2636,11 +3061,164 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
             self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "version-a\n")
             self.assertEqual(metadata_path.read_bytes(), original_metadata)
-            self.assertEqual(list(local.parent.glob(".demo.git-update-*")), [])
+            self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
+
+    def test_legacy_git_diagnostic_journal_is_decoded_without_rewriting_state(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, seed, local, version_a = self.create_remote_and_clone(root)
+            version_b = self.advance_remote(seed)
+            metadata_path = self.write_metadata(local, remote, version_a)
+            original_metadata = metadata_path.read_bytes()
+            source = self.source_for(local, metadata_path)
+            probe = updater.probe_git_worktree(source)
+            transaction = local.parent / ".demo.git-update-legacy"
+            original_payload = transaction / "original"
+            incoming_payload = transaction / "incoming"
+            original_payload.mkdir(parents=True)
+            updater._copy_directory_contents(local, original_payload)
+            stage_git_revision_payload(
+                local,
+                version_b,
+                incoming_payload,
+                "single-skill",
+            )
+            original_signature = updater.directory_signature(original_payload)
+            incoming_signature = updater.directory_signature(incoming_payload)
+            expected_metadata = json.dumps(
+                {
+                    "source": "local/demo",
+                    "sourceType": "git",
+                    "repoUrl": run_git(local, "config", "--get", "remote.origin.url"),
+                    "subpath": ".",
+                    "installedBaseVersion": version_b,
+                }
+            ).encode("utf-8")
+            updater._prepare_transaction_metadata_files(
+                transaction,
+                original_metadata,
+                expected_metadata,
+            )
+            legacy_state = {
+                "version": 3,
+                "transactionType": "git-worktree",
+                "skillName": "demo",
+                "skillDir": str(local.resolve()),
+                "entryType": "single-skill",
+                "phase": "applying",
+                "metadataPhase": "prepared",
+                "originalBranch": probe.branch,
+                "originalHead": version_a,
+                "expectedHead": version_b,
+                "originalSignature": original_signature,
+                "incomingSignature": incoming_signature,
+                "expectedSignature": incoming_signature,
+                "originalMetadataPresent": True,
+                "originalMetadataSha256": hashlib.sha256(original_metadata).hexdigest(),
+                "expectedMetadataPresent": True,
+                "expectedMetadataSha256": hashlib.sha256(expected_metadata).hexdigest(),
+            }
+            (transaction / "state.json").write_text(
+                json.dumps(legacy_state),
+                encoding="utf-8",
+            )
+            (transaction / ".skills-updater-transaction").write_text(
+                "1\n",
+                encoding="utf-8",
+            )
+            run_git(local, "update-ref", "refs/heads/main", version_b, version_a)
+            run_git(local, "read-tree", "--reset", "-u", version_b)
+
+            with mock.patch(
+                "scripts.agent_skill_updater._write_json_atomic",
+                side_effect=AssertionError("Git v3 decoder must not rewrite legacy state"),
+            ):
+                outcome = updater.recover_updates(local.parent)[0]
+
+            self.assertEqual(outcome.installed_state, "rolled_back")
+            self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
+            self.assertEqual(metadata_path.read_bytes(), original_metadata)
+            self.assertFalse(transaction.exists())
+
+    def test_legacy_committed_git_recovery_does_not_require_cleaned_metadata_snapshots(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            remote, seed, local, version_a = self.create_remote_and_clone(root)
+            version_b = self.advance_remote(seed)
+            metadata_path = self.write_metadata(local, remote, version_a)
+            original_metadata = metadata_path.read_bytes()
+            run_git(local, "fetch", "origin")
+            transaction = local.parent / ".demo.git-update-legacy-committed"
+            transaction.mkdir()
+            incoming_payload = transaction / "incoming"
+            stage_git_revision_payload(
+                local,
+                version_b,
+                incoming_payload,
+                "single-skill",
+            )
+            expected_signature = updater.directory_signature(incoming_payload)
+            expected_metadata = json.dumps(
+                {
+                    "source": "local/demo",
+                    "sourceType": "git",
+                    "repoUrl": run_git(local, "config", "--get", "remote.origin.url"),
+                    "subpath": ".",
+                    "installedBaseVersion": version_b,
+                }
+            ).encode("utf-8")
+            updater._prepare_transaction_metadata_files(
+                transaction,
+                original_metadata,
+                expected_metadata,
+            )
+            legacy_state = {
+                "version": 3,
+                "transactionType": "git-worktree",
+                "skillName": "demo",
+                "skillDir": str(local.resolve()),
+                "entryType": "single-skill",
+                "phase": "committed",
+                "metadataPhase": "published",
+                "originalBranch": "main",
+                "originalHead": version_a,
+                "expectedHead": version_b,
+                "originalSignature": expected_signature,
+                "incomingSignature": expected_signature,
+                "expectedSignature": expected_signature,
+                "originalMetadataPresent": True,
+                "originalMetadataSha256": hashlib.sha256(original_metadata).hexdigest(),
+                "expectedMetadataPresent": True,
+                "expectedMetadataSha256": hashlib.sha256(expected_metadata).hexdigest(),
+            }
+            (transaction / "state.json").write_text(
+                json.dumps(legacy_state),
+                encoding="utf-8",
+            )
+            (transaction / ".skills-updater-transaction").write_text(
+                "1\n",
+                encoding="utf-8",
+            )
+            run_git(local, "update-ref", "refs/heads/main", version_b, version_a)
+            run_git(local, "read-tree", "--reset", "-u", version_b)
+            metadata_path.write_bytes(expected_metadata)
+            (transaction / "metadata.before").unlink()
+            (transaction / "metadata.expected").unlink()
+
+            outcome = updater.recover_updates(local.parent)[0]
+
+            self.assertEqual(outcome.installed_state, "committed")
+            self.assertTrue(outcome.applied)
+            self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
+            self.assertEqual(metadata_path.read_bytes(), expected_metadata)
+            self.assertFalse(transaction.exists())
 
     def test_committed_git_recovery_accepts_preserved_ignored_payload(self):
         from scripts.agent_skill_updater import (
-            AgentSkillUpdaterError,
             recover_incomplete_skill_transactions,
             update_git_worktree_skill,
         )
@@ -2659,18 +3237,19 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._remove_transaction_tree",
                 side_effect=PermissionError("cleanup failed"),
             ):
-                with self.assertRaisesRegex(AgentSkillUpdaterError, "committed"):
-                    update_git_worktree_skill(source)
+                result = update_git_worktree_skill(source)
 
+            self.assertEqual(result.installed_state, "committed")
+            self.assertTrue(result.applied)
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
             self.assertEqual((local / "ignored.txt").read_text(encoding="utf-8"), "keep me\n")
-            self.assertEqual(len(list(local.parent.glob(".demo.git-update-*"))), 1)
+            self.assertEqual(len(list(local.parent.glob(".demo.transaction-*"))), 1)
 
             recover_incomplete_skill_transactions(local.parent)
 
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
             self.assertEqual((local / "ignored.txt").read_text(encoding="utf-8"), "keep me\n")
-            self.assertEqual(list(local.parent.glob(".demo.git-update-*")), [])
+            self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
 
 
 if __name__ == "__main__":
