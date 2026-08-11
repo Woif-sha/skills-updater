@@ -76,6 +76,9 @@ python "$updater\update_agent_skills.py" --check-only --json
 # 更新全部或单个 Skill
 python "$updater\update_agent_skills.py" --json
 python "$updater\update_agent_skills.py" --skill zotero-paper-updater --json
+
+# 默认只读列出 Intervention Records
+python "$updater\manage_interventions.py" --json
 ```
 
 检查和更新命令可使用 `--lang zh` 或 `--lang en` 强制指定人类可读输出语言；JSON 字段名保持稳定。
@@ -187,6 +190,19 @@ OpenSpec 生成型 Skill 使用生成器和 workflow 标识，版本来自生成
 | OpenSpec 生成型 Skill | 精确 revision 重新生成 | 只接受规定的仓库、generator 和 `workflowId` |
 
 `.git` 和 `.openskills.json` 始终是控制数据，不参与签名、合并、备份、复制或删除。载荷、Git 和元数据变更都有持久化 journal；失败时回滚，无法证明安全时保留恢复数据并返回 `error`。
+
+## Intervention Record 保留与清理
+
+内容冲突和无法证明恢复结果的更新会在 `~/.agents/interventions` 留下记录。裸调用 `manage_interventions.py` 只执行 inventory；它返回稳定 artifact ID、记录类型、resolution/recovery state、完整 retention group 和诊断引用。
+
+```powershell
+python "$updater\manage_interventions.py" --resolve <artifact-id> --json
+python "$updater\manage_interventions.py" --abandon <artifact-id> --json
+python "$updater\manage_interventions.py" --validate <artifact-id> --json
+python "$updater\manage_interventions.py" --cleanup <artifact-id> --json
+```
+
+未解决的内容冲突不会过期；标记 `resolved` 或 `abandoned` 后开始 15 天保留。recovery-required 记录只引用原 Diagnostic Journal，只有验证得到 `committed` 或 `rolled_back` 后才开始保留。cleanup 仅接受一个 artifact ID，并通过可恢复 tombstone 删除完整 retention group；路径、glob、partial、force 和默认全选都不受支持。旧 `.backup-*` 不进入 inventory，也不会被迁移或删除。
 
 ## JSON 状态和退出码
 

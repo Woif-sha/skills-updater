@@ -10,6 +10,271 @@ from unittest import mock
 
 
 class TransactionCoordinatorTests(unittest.TestCase):
+    def test_snapshot_clean_update_commits_without_successful_backup(self):
+        import scripts.agent_skill_updater as updater
+
+        base = "a" * 40
+        remote = "b" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            skill_dir = skills_root / "demo"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("old\n", encoding="utf-8")
+            metadata_path = skill_dir / ".openskills.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "source": "example/demo",
+                        "sourceType": "git",
+                        "repoUrl": "https://github.com/example/demo",
+                        "subpath": ".",
+                        "installedBaseVersion": base,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            expected_dir = Path(temp_dir) / "prepared"
+            expected_dir.mkdir()
+            (expected_dir / "SKILL.md").write_text("new\n", encoding="utf-8")
+            source = updater.load_agent_skill_source(skill_dir)
+            prepared = updater.PreparedPayload(
+                payload_dir=expected_dir,
+                payload_signature=updater.directory_signature(expected_dir),
+                original_signature=updater.directory_signature(skill_dir),
+                exact_base_revision=base,
+            )
+
+            outcome = updater.apply_observed_update(
+                source,
+                updater.RemoteObservation.from_source(
+                    source,
+                    revision=remote,
+                    version=remote,
+                ),
+                installed_base_version=base,
+                prepared_payload=prepared,
+            )
+
+            self.assertEqual(outcome.status, "up_to_date")
+            self.assertEqual(outcome.installed_state, "committed")
+            self.assertTrue(outcome.applied)
+            self.assertEqual(outcome.action, "payload_merged")
+            self.assertEqual((skill_dir / "SKILL.md").read_text(encoding="utf-8"), "new\n")
+            self.assertEqual(
+                json.loads(metadata_path.read_text(encoding="utf-8"))["installedBaseVersion"],
+                remote,
+            )
+            self.assertEqual(list(skills_root.glob(".backup-*")), [])
+            self.assertEqual(list(skills_root.glob(".demo.transaction-*")), [])
+
+    def test_snapshot_content_conflict_promotes_complete_intervention_record(self):
+        import scripts.agent_skill_updater as updater
+
+        base = "a" * 40
+        remote = "b" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skills_root = root / "skills"
+            skill_dir = skills_root / "demo"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("local\n", encoding="utf-8")
+            metadata_path = skill_dir / ".openskills.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "source": "example/demo",
+                        "sourceType": "git",
+                        "repoUrl": "https://github.com/example/demo",
+                        "subpath": ".",
+                        "installedBaseVersion": base,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            materials = root / "materials"
+            for name, content in (
+                ("base", "base\n"),
+                ("local", "local\n"),
+                ("remote", "remote\n"),
+                ("conflicts", "<<<<<<< local\n=======\n>>>>>>> remote\n"),
+            ):
+                directory = materials / name
+                directory.mkdir(parents=True)
+                (directory / "SKILL.md").write_text(content, encoding="utf-8")
+            source = updater.load_agent_skill_source(skill_dir)
+            prepared = updater.PreparedPayload(
+                payload_dir=None,
+                payload_signature=None,
+                original_signature=updater.directory_signature(skill_dir),
+                exact_base_revision=base,
+                base_dir=materials / "base",
+                local_dir=materials / "local",
+                remote_dir=materials / "remote",
+                conflict_dir=materials / "conflicts",
+                conflicts=("SKILL.md",),
+            )
+            interventions_root = root / "interventions"
+
+            with mock.patch.object(
+                updater,
+                "get_interventions_dir",
+                return_value=interventions_root,
+            ):
+                outcome = updater.apply_observed_update(
+                    source,
+                    updater.RemoteObservation.from_source(
+                        source,
+                        revision=remote,
+                        version=remote,
+                    ),
+                    installed_base_version=base,
+                    prepared_payload=prepared,
+                )
+
+            self.assertEqual(outcome.status, "error")
+            self.assertEqual(outcome.installed_state, "unchanged")
+            self.assertFalse(outcome.applied)
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIsNotNone(outcome.intervention_record)
+            self.assertEqual((skill_dir / "SKILL.md").read_text(encoding="utf-8"), "local\n")
+            record = outcome.intervention_record
+            self.assertEqual(
+                {path.name for path in record.iterdir()},
+                {"manifest.json", "base", "local", "remote", "conflicts"},
+            )
+            manifest = json.loads((record / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["kind"], "content-conflict")
+            self.assertEqual(manifest["installedState"], "unchanged")
+            self.assertEqual(manifest["exactBaseRevision"], base)
+            self.assertEqual(manifest["targetRevision"], remote)
+            self.assertEqual(manifest["conflicts"], ["SKILL.md"])
+            from scripts.interventions import inventory_interventions
+
+            inventory = inventory_interventions(interventions_root)
+            self.assertEqual(len(inventory), 1)
+            self.assertEqual(inventory[0]["artifact_id"], manifest["artifactId"])
+            self.assertEqual(inventory[0]["record_type"], "content-conflict")
+            self.assertEqual(inventory[0]["resolution_state"], "unresolved")
+            self.assertIsNone(inventory[0]["retention_expires_at"])
+            self.assertEqual(
+                inventory[0]["diagnostic_references"],
+                ["conflicts/SKILL.md"],
+            )
+            self.assertEqual(list(interventions_root.glob(".draft-*")), [])
+            self.assertEqual(list(skills_root.glob("*.merge-conflicts")), [])
+
+    def test_snapshot_concurrent_change_cancels_before_mutation(self):
+        import scripts.agent_skill_updater as updater
+
+        base = "a" * 40
+        remote = "b" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            skill_dir = skills_root / "demo"
+            skill_dir.mkdir(parents=True)
+            skill_file = skill_dir / "SKILL.md"
+            skill_file.write_text("old\n", encoding="utf-8")
+            metadata_path = skill_dir / ".openskills.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "source": "example/demo",
+                        "sourceType": "git",
+                        "repoUrl": "https://github.com/example/demo",
+                        "subpath": ".",
+                        "installedBaseVersion": base,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            expected_dir = Path(temp_dir) / "prepared"
+            expected_dir.mkdir()
+            (expected_dir / "SKILL.md").write_text("new\n", encoding="utf-8")
+            source = updater.load_agent_skill_source(skill_dir)
+            prepared = updater.PreparedPayload(
+                payload_dir=expected_dir,
+                payload_signature=updater.directory_signature(expected_dir),
+                original_signature=updater.directory_signature(skill_dir),
+                exact_base_revision=base,
+            )
+            skill_file.write_text("concurrent\n", encoding="utf-8")
+
+            outcome = updater.apply_observed_update(
+                source,
+                updater.RemoteObservation.from_source(
+                    source,
+                    revision=remote,
+                    version=remote,
+                ),
+                installed_base_version=base,
+                prepared_payload=prepared,
+            )
+
+            self.assertEqual(outcome.status, "error")
+            self.assertEqual(outcome.installed_state, "unchanged")
+            self.assertFalse(outcome.applied)
+            self.assertEqual(skill_file.read_text(encoding="utf-8"), "concurrent\n")
+            self.assertEqual(list(skills_root.glob(".demo.transaction-*")), [])
+
+    def test_snapshot_metadata_failure_returns_verified_rollback(self):
+        import scripts.agent_skill_updater as updater
+
+        base = "a" * 40
+        remote = "b" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills_root = Path(temp_dir) / "skills"
+            skill_dir = skills_root / "demo"
+            skill_dir.mkdir(parents=True)
+            skill_file = skill_dir / "SKILL.md"
+            skill_file.write_text("old\n", encoding="utf-8")
+            metadata_path = skill_dir / ".openskills.json"
+            original_metadata = json.dumps(
+                {
+                    "source": "example/demo",
+                    "sourceType": "git",
+                    "repoUrl": "https://github.com/example/demo",
+                    "subpath": ".",
+                    "installedBaseVersion": base,
+                }
+            ).encode("utf-8")
+            metadata_path.write_bytes(original_metadata)
+            expected_dir = Path(temp_dir) / "prepared"
+            expected_dir.mkdir()
+            (expected_dir / "SKILL.md").write_text("new\n", encoding="utf-8")
+            source = updater.load_agent_skill_source(skill_dir)
+            prepared = updater.PreparedPayload(
+                payload_dir=expected_dir,
+                payload_signature=updater.directory_signature(expected_dir),
+                original_signature=updater.directory_signature(skill_dir),
+                exact_base_revision=base,
+            )
+            real_link = updater.os.link
+
+            def fail_metadata_publication(source_path, destination_path):
+                if Path(source_path).name == "metadata.publish":
+                    raise OSError("injected metadata publication failure")
+                return real_link(source_path, destination_path)
+
+            with mock.patch.object(updater.os, "link", side_effect=fail_metadata_publication):
+                outcome = updater.apply_observed_update(
+                    source,
+                    updater.RemoteObservation.from_source(
+                        source,
+                        revision=remote,
+                        version=remote,
+                    ),
+                    installed_base_version=base,
+                    prepared_payload=prepared,
+                )
+
+            self.assertEqual(outcome.status, "error")
+            self.assertEqual(outcome.installed_state, "rolled_back")
+            self.assertFalse(outcome.applied)
+            self.assertIn("injected metadata publication failure", outcome.error_message)
+            self.assertEqual(skill_file.read_text(encoding="utf-8"), "old\n")
+            self.assertEqual(metadata_path.read_bytes(), original_metadata)
+            self.assertEqual(list(skills_root.glob(".demo.transaction-*")), [])
+
     def test_apply_rejects_local_only_before_lock_or_journal(self):
         import scripts.agent_skill_updater as updater
 
@@ -331,13 +596,31 @@ class TransactionCoordinatorTests(unittest.TestCase):
             )
             (transaction / ".skills-updater-transaction").write_text("1\n", encoding="utf-8")
 
-            outcomes = recover_updates(skills_root)
+            interventions_root = Path(temp_dir) / "interventions"
+            with mock.patch(
+                "scripts.agent_skill_updater.get_interventions_dir",
+                return_value=interventions_root,
+            ):
+                outcomes = recover_updates(skills_root)
 
             self.assertEqual(len(outcomes), 1)
             self.assertEqual(outcomes[0].status, "error")
             self.assertEqual(outcomes[0].installed_state, "uncertain")
             self.assertEqual(outcomes[0].diagnostic_journal, transaction)
+            self.assertIsNotNone(outcomes[0].intervention_record)
             self.assertTrue(transaction.exists())
+            record = outcomes[0].intervention_record
+            self.assertEqual({path.name for path in record.iterdir()}, {"manifest.json"})
+            from scripts.interventions import inventory_interventions
+
+            inventory = inventory_interventions(interventions_root)
+            self.assertEqual(inventory[0]["record_type"], "recovery-required")
+            self.assertEqual(inventory[0]["recovery_state"], "required")
+            self.assertIsNone(inventory[0]["retention_expires_at"])
+            self.assertEqual(
+                inventory[0]["diagnostic_references"],
+                [str(transaction.resolve())],
+            )
 
     def test_registry_recovery_maps_missing_coordinator_state_to_uncertain(self):
         import scripts.agent_skill_updater as updater

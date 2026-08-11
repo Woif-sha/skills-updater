@@ -36,3 +36,10 @@ Read this only when repairing or reviewing updater behavior. Apply the canonical
 
 - OpenSpec `git-generated` entries require the exact OpenSpec repository, subpath `.`, generator, and `workflowId`; they read `package.json` at the exact resolved revision and regenerate that workflow only.
 - A committed update whose cleanup fails reports `applied: true` with its committed action and version.
+
+## Intervention Records
+
+- Inventory is read-only. Unresolved content conflicts and recovery-required records have no retention window; `resolved`, `abandoned`, `committed`, or `rolled_back` starts exactly 15 days.
+- Recovery validation proves settled Installed State without deleting or copying its Diagnostic Journal. The journal remains in the retention group until cleanup.
+- Cleanup accepts one stable artifact ID, moves the complete validated group through a same-volume tombstone, and revalidates every tombstone source and destination before resumed mutation.
+- Cleanup residue preserves a proven Installed State. Legacy `.backup-*` directories remain outside inventory, retention, validation, and cleanup.

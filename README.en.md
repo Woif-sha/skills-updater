@@ -76,6 +76,9 @@ python "$updater\update_agent_skills.py" --check-only --json
 # Update every Skill or one named Skill
 python "$updater\update_agent_skills.py" --json
 python "$updater\update_agent_skills.py" --skill zotero-paper-updater --json
+
+# Inventory Intervention Records (read-only by default)
+python "$updater\manage_interventions.py" --json
 ```
 
 Check and update commands accept `--lang zh` or `--lang en` for human-readable output. JSON field names remain stable.
@@ -187,6 +190,19 @@ An OpenSpec-generated Skill identifies its generator and workflow; its version c
 | OpenSpec-generated Skill | Regenerate at an exact revision | Accepts only the configured repository, generator, and `workflowId` |
 
 `.git` and `.openskills.json` are always control data and never enter signatures, merges, backups, copies, or deletion. Payload, Git, and metadata mutations use durable journals. Failures roll back; ambiguous recovery retains evidence and returns `error`.
+
+## Intervention Record Retention And Cleanup
+
+Content conflicts and updates whose recovery cannot be proven create records under `~/.agents/interventions`. A bare `manage_interventions.py` call only inventories records and returns stable artifact IDs, record types, resolution/recovery states, complete retention groups, and diagnostic references.
+
+```powershell
+python "$updater\manage_interventions.py" --resolve <artifact-id> --json
+python "$updater\manage_interventions.py" --abandon <artifact-id> --json
+python "$updater\manage_interventions.py" --validate <artifact-id> --json
+python "$updater\manage_interventions.py" --cleanup <artifact-id> --json
+```
+
+Unresolved content conflicts never expire; marking one `resolved` or `abandoned` starts its 15-day retention period. A recovery-required record only references its original Diagnostic Journal and starts retention only after validation proves `committed` or `rolled_back`. Cleanup accepts one artifact ID and removes the complete retention group through a recoverable tombstone. Paths, globs, partial deletion, force, and default-all mutation are unsupported. Legacy `.backup-*` directories are never inventoried, migrated, or deleted.
 
 ## JSON Statuses And Exit Codes
 

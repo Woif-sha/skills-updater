@@ -501,8 +501,21 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                         ),
                     ):
                         with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
-                            with mock.patch("scripts.update_agent_skills.make_backup_root", return_value=Path(r"C:\backup-root")):
-                                with mock.patch("scripts.update_agent_skills.update_skill_from_staged") as update_from_staged:
+                            with mock.patch(
+                                "scripts.update_agent_skills.prepare_snapshot_payload",
+                                return_value=mock.sentinel.prepared_payload,
+                            ) as prepare:
+                                with mock.patch(
+                                    "scripts.update_agent_skills.apply_observed_update",
+                                    return_value=updater.TransactionOutcome(
+                                        name="demo-skill",
+                                        status="up_to_date",
+                                        installed_state="committed",
+                                        applied=True,
+                                        action="payload_merged",
+                                        version="new123456789",
+                                    ),
+                                ) as apply:
                                     with self.assertRaises(SystemExit) as exit_info:
                                         with redirect_stdout(stdout):
                                             updater.main()
@@ -512,7 +525,8 @@ class AgentSkillUpdaterTests(unittest.TestCase):
         self.assertEqual(len(payload), 1)
         self.assertEqual(payload[0]["name"], "demo-skill")
         self.assertTrue(payload[0]["applied"])
-        update_from_staged.assert_called_once()
+        prepare.assert_called_once_with(resolved)
+        apply.assert_called_once()
 
     def test_update_agent_skills_refreshes_metadata_when_staged_content_matches(self):
         import scripts.update_agent_skills as updater
