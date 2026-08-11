@@ -2,6 +2,7 @@ import json
 import hashlib
 import tempfile
 import unittest
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -107,6 +108,37 @@ class InterventionTests(unittest.TestCase):
                     now=datetime(2026, 8, 11, tzinfo=timezone.utc),
                 )
 
+    def test_malformed_record_type_is_a_domain_error(self):
+        from scripts.interventions import InterventionError, inventory_interventions
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "interventions"
+            record = root / "malformed-record-type"
+            record.mkdir(parents=True)
+            (record / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "artifactId": record.name,
+                        "recordType": [],
+                        "skillName": "demo",
+                        "createdAt": "2026-08-01T00:00:00Z",
+                        "resolutionState": None,
+                        "recoveryState": None,
+                        "retentionStartedAt": None,
+                        "retentionExpiresAt": None,
+                        "retentionGroup": [
+                            {"role": "intervention-record", "path": record.name},
+                        ],
+                        "diagnosticReferences": ["conflicts/SKILL.md"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(InterventionError):
+                inventory_interventions(root)
+
     def test_resolved_conflict_starts_exact_fifteen_day_retention(self):
         from scripts.interventions import mark_content_conflict
 
@@ -155,6 +187,8 @@ class InterventionTests(unittest.TestCase):
             root = Path(temp_dir) / "interventions"
             journal = Path(temp_dir) / "skills" / ".demo.transaction-uncertain"
             journal.mkdir(parents=True)
+            (journal / "state.json").write_text("{}", encoding="utf-8")
+            (journal / ".skills-updater-transaction").write_text("1\n", encoding="utf-8")
             record = publish_recovery_required(
                 root,
                 "demo",
@@ -257,6 +291,8 @@ class InterventionTests(unittest.TestCase):
             root = Path(temp_dir) / "interventions"
             journal = Path(temp_dir) / "skills" / ".demo.transaction-uncertain"
             journal.mkdir(parents=True)
+            (journal / "state.json").write_text("{}", encoding="utf-8")
+            (journal / ".skills-updater-transaction").write_text("1\n", encoding="utf-8")
             record = publish_recovery_required(
                 root,
                 "demo",
@@ -305,6 +341,93 @@ class InterventionTests(unittest.TestCase):
             self.assertEqual(resumed["status"], "cleaned")
             self.assertEqual(resumed["installed_state"], "rolled_back")
             self.assertFalse(residue.exists())
+
+    def test_partial_tombstone_deletion_keeps_intent_and_resumes(self):
+        from scripts.interventions import (
+            cleanup_intervention,
+            publish_recovery_required,
+            validate_recovery_required,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "interventions"
+            journal = Path(temp_dir) / "skills" / ".demo.transaction-partial-delete"
+            journal.mkdir(parents=True)
+            (journal / "state.json").write_text("{}", encoding="utf-8")
+            (journal / ".skills-updater-transaction").write_text("1\n", encoding="utf-8")
+            record = publish_recovery_required(
+                root,
+                "demo",
+                journal,
+                now=datetime(2026, 7, 31, tzinfo=timezone.utc),
+            )
+            validate_recovery_required(
+                root,
+                record.name,
+                lambda _: "committed",
+                now=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            )
+            real_rmtree = shutil.rmtree
+
+            def fail_on_journal(path, *args, **kwargs):
+                if Path(path).name == "diagnostic-journal":
+                    raise OSError("injected member deletion failure")
+                return real_rmtree(path, *args, **kwargs)
+
+            with mock.patch("scripts.interventions.shutil.rmtree", side_effect=fail_on_journal):
+                failed = cleanup_intervention(
+                    root,
+                    record.name,
+                    now=datetime(2026, 8, 17, tzinfo=timezone.utc),
+                )
+
+            self.assertEqual(failed["status"], "error")
+            residue = Path(failed["cleanup_residue"])
+            self.assertTrue((residue / "tombstone.json").is_file())
+            resumed = cleanup_intervention(
+                root,
+                record.name,
+                now=datetime(2026, 8, 17, tzinfo=timezone.utc),
+            )
+            self.assertEqual(resumed["status"], "cleaned")
+            self.assertFalse(residue.exists())
+
+    def test_cleanup_rejects_recovery_group_when_journal_is_missing(self):
+        from scripts.interventions import (
+            InterventionError,
+            cleanup_intervention,
+            publish_recovery_required,
+            validate_recovery_required,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "interventions"
+            journal = Path(temp_dir) / "skills" / ".demo.transaction-missing"
+            journal.mkdir(parents=True)
+            (journal / "state.json").write_text("{}", encoding="utf-8")
+            (journal / ".skills-updater-transaction").write_text("1\n", encoding="utf-8")
+            record = publish_recovery_required(
+                root,
+                "demo",
+                journal,
+                now=datetime(2026, 7, 31, tzinfo=timezone.utc),
+            )
+            validate_recovery_required(
+                root,
+                record.name,
+                lambda _: "rolled_back",
+                now=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            )
+            shutil.rmtree(journal)
+
+            with self.assertRaises(InterventionError):
+                cleanup_intervention(
+                    root,
+                    record.name,
+                    now=datetime(2026, 8, 17, tzinfo=timezone.utc),
+                )
+
+            self.assertTrue(record.is_dir())
 
     def test_forged_tombstone_cannot_delete_an_arbitrary_source(self):
         from scripts.interventions import cleanup_intervention

@@ -51,21 +51,21 @@ def main() -> None:
     args = parser.parse_args()
 
     root = get_interventions_dir()
-    if args.resolve:
+    if args.resolve is not None:
         operation = "resolve"
         payload = {
             "status": "ok",
             "operation": operation,
             "record": mark_content_conflict(root, args.resolve, "resolved"),
         }
-    elif args.abandon:
+    elif args.abandon is not None:
         operation = "abandon"
         payload = {
             "status": "ok",
             "operation": operation,
             "record": mark_content_conflict(root, args.abandon, "abandoned"),
         }
-    elif args.validate:
+    elif args.validate is not None:
         operation = "validate"
         payload = {
             "status": "ok",
@@ -76,7 +76,7 @@ def main() -> None:
                 _recover_diagnostic_journal,
             ),
         }
-    elif args.cleanup:
+    elif args.cleanup is not None:
         operation = "cleanup"
         result = cleanup_intervention(root, args.cleanup)
         payload = {"operation": operation, **result}

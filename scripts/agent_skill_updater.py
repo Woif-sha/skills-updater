@@ -947,15 +947,33 @@ def apply_observed_update(
     if prepared_payload is not None and prepared_payload.workspace_root is not None:
         workspace_root = prepared_payload.workspace_root
         try:
-            return apply_observed_update(
+            outcome = apply_observed_update(
                 source,
                 observation,
                 installed_base_version=installed_base_version,
                 prepared_payload=replace(prepared_payload, workspace_root=None),
             )
-        finally:
+        except BaseException:
             if workspace_root.exists():
                 shutil.rmtree(workspace_root)
+            raise
+        try:
+            if workspace_root.exists():
+                shutil.rmtree(workspace_root)
+        except OSError as cleanup_exc:
+            message = outcome.error_message
+            cleanup_message = (
+                f"Prepared Payload cleanup failed at {workspace_root}: {cleanup_exc}"
+            )
+            return replace(
+                outcome,
+                status="error",
+                error_message=(
+                    f"{message}. {cleanup_message}" if message else cleanup_message
+                ),
+                cleanup_residue=workspace_root,
+            )
+        return outcome
     if prepared_payload is not None:
         if prepared_payload.exact_base_revision != installed_base_version:
             raise AgentSkillUpdaterError(

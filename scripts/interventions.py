@@ -19,6 +19,13 @@ INTERVENTION_RECORD_TYPES = frozenset({"content-conflict", "recovery-required"})
 CONTENT_RESOLUTION_STATES = frozenset({"unresolved", "resolved", "abandoned"})
 RECOVERY_STATES = frozenset({"required", "committed", "rolled_back"})
 ARTIFACT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+RECORD_TYPE_ROLES = {
+    "content-conflict": ("intervention-record",),
+    "recovery-required": ("intervention-record", "diagnostic-journal"),
+}
+TOMBSTONE_MEMBER_STATES = frozenset(
+    {"pending", "moving", "tombstoned", "deleting", "deleted"}
+)
 
 
 class InterventionError(ValueError):
@@ -207,7 +214,7 @@ def cleanup_intervention(
         raise InterventionError(
             f"Intervention Record '{artifact_id}' is not eligible for cleanup."
         )
-    members = _retention_members(interventions_root, manifest)
+    members = _retention_members(interventions_root, manifest, tombstone)
     installed_state = _installed_state(manifest)
     draft = Path(tempfile.mkdtemp(prefix=".tombstone-draft-", dir=interventions_root))
     intent = {
@@ -216,15 +223,7 @@ def cleanup_intervention(
         "recordType": manifest["recordType"],
         "installedState": installed_state,
         "inventory": item,
-        "members": [
-            {
-                "role": role,
-                "source": str(source),
-                "destination": str(tombstone / role),
-                "required": required,
-            }
-            for role, source, required in members
-        ],
+        "members": members,
     }
     try:
         _write_json_atomic(draft / "tombstone.json", intent)
@@ -244,15 +243,18 @@ def _resume_tombstone(tombstone: Path) -> dict[str, object]:
     if tombstone != expected_tombstone or intent.get("schemaVersion") != INTERVENTION_SCHEMA_VERSION:
         raise InterventionError(f"Intervention tombstone identity mismatch: {tombstone}")
     installed_state = intent.get("installedState")
-    if installed_state not in {"unchanged", "committed", "rolled_back"}:
+    if (
+        not isinstance(installed_state, str)
+        or installed_state not in {"unchanged", "committed", "rolled_back"}
+    ):
         raise InterventionError(f"Invalid Installed State in tombstone: {tombstone}")
     members = intent.get("members")
     if not isinstance(members, list) or not members:
         raise InterventionError(f"Intervention tombstone has no retention group: {tombstone}")
     try:
         _validate_tombstone_members(tombstone, intent)
-        for member in members:
-            _resume_tombstone_member(tombstone, member)
+        for index in range(len(members)):
+            _resume_tombstone_member(tombstone, intent, index)
         _remove_tombstone(tombstone)
     except (InterventionError, OSError) as exc:
         return _cleanup_result(
@@ -312,14 +314,10 @@ def _read_tombstone_intent(tombstone: Path) -> dict:
 def _validate_tombstone_members(tombstone: Path, intent: dict) -> None:
     artifact_id = _validate_artifact_id(intent.get("artifactId"))
     record_type = intent.get("recordType")
-    if record_type not in INTERVENTION_RECORD_TYPES:
+    if not isinstance(record_type, str) or record_type not in INTERVENTION_RECORD_TYPES:
         raise InterventionError(f"Invalid record type in tombstone: {tombstone}")
     members = intent.get("members")
-    expected_roles = (
-        ["intervention-record"]
-        if record_type == "content-conflict"
-        else ["intervention-record", "diagnostic-journal"]
-    )
+    expected_roles = list(RECORD_TYPE_ROLES[record_type])
     if (
         not isinstance(members, list)
         or any(not isinstance(member, dict) for member in members)
@@ -333,19 +331,32 @@ def _validate_tombstone_members(tombstone: Path, intent: dict) -> None:
             "source",
             "destination",
             "required",
+            "state",
+            "evidence",
         }:
             raise InterventionError(f"Invalid retention member in tombstone: {tombstone}")
         role = member["role"]
+        if (
+            not isinstance(role, str)
+            or not isinstance(member["source"], str)
+            or not isinstance(member["destination"], str)
+            or not isinstance(member["required"], bool)
+        ):
+            raise InterventionError(f"Invalid retention member types in tombstone: {tombstone}")
         source = Path(member["source"])
+        state = member["state"]
+        if not isinstance(state, str) or state not in TOMBSTONE_MEMBER_STATES:
+            raise InterventionError(f"Invalid retention state in tombstone: {tombstone}")
         if Path(member["destination"]) != tombstone / role:
             raise InterventionError(f"Invalid retention destination in tombstone: {tombstone}")
         if role == "intervention-record":
             if source != record_source or member["required"] is not True:
                 raise InterventionError(f"Invalid record source in tombstone: {tombstone}")
-            continue
-        _validate_diagnostic_journal_path(tombstone.parent, source)
-        if member["required"] is not False:
-            raise InterventionError(f"Invalid journal member in tombstone: {tombstone}")
+        else:
+            _validate_diagnostic_journal_path(tombstone.parent, source)
+            if member["required"] is not True:
+                raise InterventionError(f"Invalid journal member in tombstone: {tombstone}")
+        _validate_tombstone_member_state(tombstone, member)
     item = intent.get("inventory")
     if not isinstance(item, dict) or item.get("artifact_id") != artifact_id:
         raise InterventionError(f"Invalid inventory identity in tombstone: {tombstone}")
@@ -361,56 +372,107 @@ def _validate_tombstone_members(tombstone: Path, intent: dict) -> None:
         raise InterventionError(f"Invalid retention inventory in tombstone: {tombstone}")
 
 
-def _resume_tombstone_member(tombstone: Path, member: object) -> None:
-    if not isinstance(member, dict) or set(member) != {
-        "role",
-        "source",
-        "destination",
-        "required",
-    }:
-        raise InterventionError(f"Invalid retention member in tombstone: {tombstone}")
-    role = member["role"]
-    if role not in {"intervention-record", "diagnostic-journal"}:
-        raise InterventionError(f"Invalid retention role in tombstone: {tombstone}")
+def _resume_tombstone_member(tombstone: Path, intent: dict, index: int) -> None:
+    member = intent["members"][index]
     source = Path(member["source"])
     destination = Path(member["destination"])
-    if destination != tombstone / role:
-        raise InterventionError(f"Invalid retention destination in tombstone: {tombstone}")
+    if member["state"] in {"tombstoned", "deleting", "deleted"}:
+        return
+    if member["state"] == "pending":
+        member["state"] = "moving"
+        _write_tombstone_intent(tombstone, intent)
+    if os.path.lexists(source):
+        os.rename(source, destination)
+    member["state"] = "tombstoned"
+    _write_tombstone_intent(tombstone, intent)
+
+
+def _validate_tombstone_member_state(tombstone: Path, member: dict) -> None:
+    source = Path(member["source"])
+    destination = Path(member["destination"])
     source_exists = os.path.lexists(source)
     destination_exists = os.path.lexists(destination)
-    if source_exists and destination_exists:
-        raise InterventionError(f"Retention member exists at both locations: {source}")
+    state = member["state"]
+    if source_exists:
+        _require_regular_directory(source, "Retention member")
     if destination_exists:
         _require_regular_directory(destination, "Tombstoned retention member")
+    if state == "pending" and (not source_exists or destination_exists):
+        raise InterventionError(f"Pending retention member is incomplete: {source}")
+    if state == "moving" and source_exists == destination_exists:
+        raise InterventionError(f"Moving retention member is ambiguous: {source}")
+    if state == "tombstoned" and (source_exists or not destination_exists):
+        raise InterventionError(f"Tombstoned retention member is incomplete: {destination}")
+    if state in {"deleting", "deleted"} and source_exists:
+        raise InterventionError(f"Deleted retention source reappeared: {source}")
+    if state == "deleted" and destination_exists:
+        raise InterventionError(f"Deleted retention member reappeared: {destination}")
+    if state in {"pending", "moving", "tombstoned"}:
+        location = source if source_exists else destination
+        _validate_member_evidence(location, member["role"], member["evidence"])
+
+
+def _validate_member_evidence(location: Path, role: str, evidence: object) -> None:
+    if not isinstance(evidence, dict):
+        raise InterventionError(f"Invalid retention evidence for {role}: {location}")
+    if role == "intervention-record":
+        if set(evidence) != {"manifestSha256"}:
+            raise InterventionError(f"Invalid record evidence at {location}")
+        observed = _sha256_file(location / "manifest.json")
+        if observed != evidence["manifestSha256"]:
+            raise InterventionError(f"Intervention manifest identity changed at {location}")
         return
-    if not source_exists:
-        if member["required"]:
-            raise InterventionError(f"Required retention member is missing: {source}")
-        return
-    _require_regular_directory(source, "Retention member")
-    os.rename(source, destination)
+    if set(evidence) != {"markerSha256", "stateSha256"}:
+        raise InterventionError(f"Invalid Diagnostic Journal evidence at {location}")
+    observed = _diagnostic_journal_evidence(location)
+    if observed != evidence:
+        raise InterventionError(f"Diagnostic Journal identity changed at {location}")
+
+
+def _diagnostic_journal_evidence(journal: Path) -> dict[str, str]:
+    return {
+        "markerSha256": _sha256_file(journal / ".skills-updater-transaction"),
+        "stateSha256": _sha256_file(journal / "state.json"),
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise InterventionError(f"Required retention evidence is missing: {path}")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_tombstone_intent(tombstone: Path, intent: dict) -> None:
+    _write_json_atomic(tombstone / "tombstone.json", intent)
 
 
 def _retention_members(
     interventions_root: Path,
     manifest: dict,
-) -> list[tuple[str, Path, bool]]:
+    tombstone: Path,
+) -> list[dict[str, object]]:
     artifact_id = manifest["artifactId"]
     group = manifest["retentionGroup"]
     roles = [member["role"] for member in group]
-    expected_roles = (
-        ["intervention-record"]
-        if manifest["recordType"] == "content-conflict"
-        else ["intervention-record", "diagnostic-journal"]
-    )
+    expected_roles = list(RECORD_TYPE_ROLES[manifest["recordType"]])
     if roles != expected_roles:
         raise InterventionError(
             f"Intervention retention group is incomplete for '{artifact_id}'."
         )
     if group[0]["path"] != artifact_id:
         raise InterventionError(f"Intervention record member mismatch for '{artifact_id}'.")
-    members: list[tuple[str, Path, bool]] = [
-        ("intervention-record", interventions_root / artifact_id, True)
+    record = interventions_root / artifact_id
+    members: list[dict[str, object]] = [
+        {
+            "role": "intervention-record",
+            "source": str(record),
+            "destination": str(tombstone / "intervention-record"),
+            "required": True,
+            "state": "pending",
+            "evidence": {
+                "manifestSha256": _sha256_file(record / "manifest.json"),
+            },
+        }
     ]
     if manifest["recordType"] == "recovery-required":
         journal = Path(group[1]["path"])
@@ -419,7 +481,16 @@ def _retention_members(
             raise InterventionError(
                 f"Diagnostic Journal reference mismatch for '{artifact_id}'."
             )
-        members.append(("diagnostic-journal", journal, False))
+        members.append(
+            {
+                "role": "diagnostic-journal",
+                "source": str(journal),
+                "destination": str(tombstone / "diagnostic-journal"),
+                "required": True,
+                "state": "pending",
+                "evidence": _diagnostic_journal_evidence(journal),
+            }
+        )
     return members
 
 
@@ -460,7 +531,21 @@ def _cleanup_result(
 
 
 def _remove_tombstone(tombstone: Path) -> None:
-    shutil.rmtree(tombstone)
+    intent = _read_tombstone_intent(tombstone)
+    _validate_tombstone_members(tombstone, intent)
+    for member in intent["members"]:
+        destination = Path(member["destination"])
+        if member["state"] == "tombstoned":
+            member["state"] = "deleting"
+            _write_tombstone_intent(tombstone, intent)
+        if member["state"] == "deleting":
+            if os.path.lexists(destination):
+                shutil.rmtree(destination)
+            member["state"] = "deleted"
+            _write_tombstone_intent(tombstone, intent)
+    _validate_tombstone_members(tombstone, intent)
+    (tombstone / "tombstone.json").unlink()
+    tombstone.rmdir()
 
 
 def _inventory_item(manifest: dict, observed_at: datetime) -> dict[str, object]:
@@ -516,7 +601,10 @@ def _read_manifest(record_path: Path) -> dict:
     _validate_artifact_id(artifact_id)
     if artifact_id != record_path.name:
         raise InterventionError(f"Intervention artifact identity mismatch at {record_path}")
-    if manifest["recordType"] not in INTERVENTION_RECORD_TYPES:
+    if (
+        not isinstance(manifest["recordType"], str)
+        or manifest["recordType"] not in INTERVENTION_RECORD_TYPES
+    ):
         raise InterventionError(f"Unsupported Intervention record type at {manifest_path}")
     if not isinstance(manifest["skillName"], str) or not manifest["skillName"]:
         raise InterventionError(f"Invalid Intervention skill name at {manifest_path}")
@@ -573,12 +661,17 @@ def _validate_artifact_id(artifact_id: object) -> str:
 def _validate_record_states(manifest: dict, manifest_path: Path) -> None:
     if manifest["recordType"] == "content-conflict":
         if (
-            manifest["resolutionState"] not in CONTENT_RESOLUTION_STATES
+            not isinstance(manifest["resolutionState"], str)
+            or manifest["resolutionState"] not in CONTENT_RESOLUTION_STATES
             or manifest["recoveryState"] is not None
         ):
             raise InterventionError(f"Invalid content-conflict state at {manifest_path}")
         return
-    if manifest["resolutionState"] is not None or manifest["recoveryState"] not in RECOVERY_STATES:
+    if (
+        manifest["resolutionState"] is not None
+        or not isinstance(manifest["recoveryState"], str)
+        or manifest["recoveryState"] not in RECOVERY_STATES
+    ):
         raise InterventionError(f"Invalid recovery-required state at {manifest_path}")
 
 
@@ -586,10 +679,14 @@ def _validate_retention(manifest: dict, manifest_path: Path) -> None:
     started_at = manifest["retentionStartedAt"]
     expires_at = manifest["retentionExpiresAt"]
     retention_started = started_at is not None
+    resolution_state = manifest["resolutionState"]
+    recovery_state = manifest["recoveryState"]
     retention_required = (
-        manifest["resolutionState"] in {"resolved", "abandoned"}
+        isinstance(resolution_state, str)
+        and resolution_state in {"resolved", "abandoned"}
         if manifest["recordType"] == "content-conflict"
-        else manifest["recoveryState"] in {"committed", "rolled_back"}
+        else isinstance(recovery_state, str)
+        and recovery_state in {"committed", "rolled_back"}
     )
     if retention_started != retention_required:
         raise InterventionError(

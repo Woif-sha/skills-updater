@@ -89,6 +89,24 @@ class CliProtocolTests(unittest.TestCase):
         self.assertEqual(payload["operation"], "cleanup")
         self.assertIn("paths and globs are forbidden", payload["error_message"])
 
+        empty = subprocess.run(
+            [
+                sys.executable,
+                str(repo_root / "scripts" / "manage_interventions.py"),
+                "--json",
+                "--cleanup",
+                "",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=20,
+        )
+        self.assertEqual(empty.returncode, 1)
+        self.assertEqual(json.loads(empty.stdout)["status"], "error")
+
 
 if __name__ == "__main__":
     unittest.main()

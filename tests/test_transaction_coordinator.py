@@ -10,6 +10,66 @@ from unittest import mock
 
 
 class TransactionCoordinatorTests(unittest.TestCase):
+    def test_committed_snapshot_preserves_outcome_when_workspace_cleanup_fails(self):
+        import scripts.agent_skill_updater as updater
+
+        base = "a" * 40
+        remote = "b" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skill_dir = root / "skills" / "demo"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("old\n", encoding="utf-8")
+            (skill_dir / ".openskills.json").write_text(
+                json.dumps(
+                    {
+                        "source": "example/demo",
+                        "sourceType": "git",
+                        "repoUrl": "https://github.com/example/demo",
+                        "subpath": ".",
+                        "installedBaseVersion": base,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            workspace = root / "workspace"
+            payload = workspace / "payload"
+            payload.mkdir(parents=True)
+            (payload / "SKILL.md").write_text("new\n", encoding="utf-8")
+            source = updater.load_agent_skill_source(skill_dir)
+            prepared = updater.PreparedPayload(
+                payload_dir=payload,
+                payload_signature=updater.directory_signature(payload),
+                original_signature=updater.directory_signature(skill_dir),
+                exact_base_revision=base,
+                workspace_root=workspace,
+            )
+            real_rmtree = updater.shutil.rmtree
+
+            def fail_workspace_cleanup(path, *args, **kwargs):
+                if Path(path) == workspace:
+                    raise OSError("injected workspace cleanup failure")
+                return real_rmtree(path, *args, **kwargs)
+
+            with mock.patch.object(updater.shutil, "rmtree", side_effect=fail_workspace_cleanup):
+                outcome = updater.apply_observed_update(
+                    source,
+                    updater.RemoteObservation.from_source(
+                        source,
+                        revision=remote,
+                        version=remote,
+                    ),
+                    installed_base_version=base,
+                    prepared_payload=prepared,
+                )
+
+            self.assertEqual(outcome.status, "error")
+            self.assertEqual(outcome.installed_state, "committed")
+            self.assertTrue(outcome.applied)
+            self.assertEqual(outcome.action, "payload_merged")
+            self.assertEqual(outcome.cleanup_residue, workspace)
+            self.assertIn("injected workspace cleanup failure", outcome.error_message)
+
     def test_snapshot_clean_update_commits_without_successful_backup(self):
         import scripts.agent_skill_updater as updater
 
