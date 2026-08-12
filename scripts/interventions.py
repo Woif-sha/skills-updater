@@ -482,7 +482,7 @@ def _validate_member_evidence(location: Path, role: str, evidence: object) -> No
         if observed != evidence["manifestSha256"]:
             raise InterventionError(f"Intervention manifest identity changed at {location}")
         return
-    if set(evidence) != {"markerSha256", "stateSha256"}:
+    if set(evidence) != {"treeSha256"}:
         raise InterventionError(f"Invalid Diagnostic Journal evidence at {location}")
     observed = _diagnostic_journal_evidence(location)
     if observed != evidence:
@@ -490,10 +490,21 @@ def _validate_member_evidence(location: Path, role: str, evidence: object) -> No
 
 
 def _diagnostic_journal_evidence(journal: Path) -> dict[str, str]:
-    return {
-        "markerSha256": _sha256_file(journal / ".skills-updater-transaction"),
-        "stateSha256": _sha256_file(journal / "state.json"),
-    }
+    _require_regular_directory(journal, "Diagnostic Journal")
+    digest = hashlib.sha256()
+    for path in sorted(journal.rglob("*"), key=lambda item: item.relative_to(journal).as_posix()):
+        if path.is_symlink():
+            raise InterventionError(f"Diagnostic Journal contains an unsafe link: {path}")
+        relative = path.relative_to(journal).as_posix()
+        if path.is_dir():
+            record = f"directory\0{relative}".encode("utf-8")
+        elif path.is_file():
+            record = f"file\0{relative}\0".encode("utf-8") + path.read_bytes()
+        else:
+            raise InterventionError(f"Diagnostic Journal contains an unsupported entry: {path}")
+        digest.update(len(record).to_bytes(8, "big"))
+        digest.update(record)
+    return {"treeSha256": digest.hexdigest()}
 
 
 def _sha256_file(path: Path) -> str:
@@ -763,7 +774,7 @@ def _validate_record_states(manifest: dict, manifest_path: Path) -> None:
             )
     elif (
         not isinstance(proof, dict)
-        or set(proof) != {"markerSha256", "stateSha256"}
+        or set(proof) != {"treeSha256"}
         or any(
             not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
             for value in proof.values()

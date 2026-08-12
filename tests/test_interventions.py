@@ -228,7 +228,7 @@ class InterventionTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 set(manifest["validatedJournalEvidence"]),
-                {"markerSha256", "stateSha256"},
+                {"treeSha256"},
             )
 
     def test_cleanup_rejects_journal_changed_after_validation(self):
@@ -258,6 +258,45 @@ class InterventionTests(unittest.TestCase):
                 now=datetime(2026, 8, 2, tzinfo=timezone.utc),
             )
             (journal / "state.json").write_text('{"changed":true}', encoding="utf-8")
+
+            with self.assertRaisesRegex(InterventionError, "identity changed"):
+                cleanup_intervention(
+                    root,
+                    record.name,
+                    now=datetime(2026, 8, 18, tzinfo=timezone.utc),
+                )
+
+            self.assertTrue(record.is_dir())
+            self.assertTrue(journal.is_dir())
+
+    def test_cleanup_rejects_non_state_journal_file_changed_after_validation(self):
+        from scripts.interventions import (
+            InterventionError,
+            cleanup_intervention,
+            publish_recovery_required,
+            validate_recovery_required,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "interventions"
+            journal = Path(temp_dir) / "skills" / ".demo.transaction-snapshot-changed"
+            journal.mkdir(parents=True)
+            (journal / "state.json").write_text("{}", encoding="utf-8")
+            (journal / ".skills-updater-transaction").write_text("1\n", encoding="utf-8")
+            (journal / "metadata.before").write_text("original", encoding="utf-8")
+            record = publish_recovery_required(
+                root,
+                "demo",
+                journal,
+                now=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            )
+            validate_recovery_required(
+                root,
+                record.name,
+                lambda _: "rolled_back",
+                now=datetime(2026, 8, 2, tzinfo=timezone.utc),
+            )
+            (journal / "metadata.before").write_text("changed", encoding="utf-8")
 
             with self.assertRaisesRegex(InterventionError, "identity changed"):
                 cleanup_intervention(
