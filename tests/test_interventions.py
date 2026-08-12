@@ -663,6 +663,86 @@ class InterventionTests(unittest.TestCase):
             self.assertEqual(metadata_path.read_bytes(), original)
             self.assertTrue(journal.exists())
 
+    def test_validated_journal_survives_startup_recovery_until_group_cleanup(self):
+        import scripts.agent_skill_updater as updater
+        from scripts.interventions import (
+            cleanup_intervention,
+            publish_recovery_required,
+            validate_recovery_required,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            skills_root = root / "skills"
+            skill_dir = skills_root / "demo"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+            original = b'{"installedBaseVersion":"old"}\n'
+            expected = b'{"installedBaseVersion":"new"}\n'
+            (skill_dir / ".openskills.json").write_bytes(original)
+            journal = skills_root / ".demo.metadata-update-retained"
+            journal.mkdir()
+            (journal / "metadata.before").write_bytes(original)
+            (journal / "metadata.expected").write_bytes(expected)
+            (journal / "metadata.publish").write_bytes(expected)
+            (journal / "metadata.displaced").write_bytes(original)
+            (journal / "state.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "transactionType": "metadata",
+                        "skillName": "demo",
+                        "skillDir": str(skill_dir.resolve()),
+                        "phase": "rolled_back",
+                        "metadataPhase": "prepared",
+                        "originalMetadataPresent": True,
+                        "originalMetadataSha256": hashlib.sha256(original).hexdigest(),
+                        "expectedMetadataPresent": True,
+                        "expectedMetadataSha256": hashlib.sha256(expected).hexdigest(),
+                        "targetVersion": "new",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (journal / ".skills-updater-transaction").write_text("1\n", encoding="utf-8")
+            interventions_root = root / "interventions"
+            record = publish_recovery_required(
+                interventions_root,
+                "demo",
+                journal,
+                now=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            )
+            with mock.patch.object(
+                updater,
+                "get_interventions_dir",
+                return_value=interventions_root,
+            ):
+                updater.recover_incomplete_skill_transactions(skills_root)
+            self.assertTrue(journal.is_dir())
+            validate_recovery_required(
+                interventions_root,
+                record.name,
+                updater.validate_diagnostic_journal,
+                now=datetime(2026, 8, 2, tzinfo=timezone.utc),
+            )
+
+            with mock.patch.object(
+                updater,
+                "get_interventions_dir",
+                return_value=interventions_root,
+            ):
+                updater.recover_incomplete_skill_transactions(skills_root)
+
+            self.assertTrue(journal.is_dir())
+            cleaned = cleanup_intervention(
+                interventions_root,
+                record.name,
+                now=datetime(2026, 8, 18, tzinfo=timezone.utc),
+            )
+            self.assertEqual(cleaned["status"], "cleaned")
+            self.assertFalse(journal.exists())
+            self.assertFalse(record.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

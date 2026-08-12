@@ -52,6 +52,19 @@ def _conflict_payload(updater, root: Path, skill_dir: Path, base: str, observati
 
 
 class TransactionCoordinatorTests(unittest.TestCase):
+    def setUp(self):
+        import scripts.agent_skill_updater as updater
+
+        self._intervention_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._intervention_temp.cleanup)
+        patcher = mock.patch.object(
+            updater,
+            "get_interventions_dir",
+            return_value=Path(self._intervention_temp.name) / "interventions",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_snapshot_local_merge_commits_through_prepared_payload(self):
         import scripts.agent_skill_updater as updater
 
@@ -811,6 +824,13 @@ class TransactionCoordinatorTests(unittest.TestCase):
         remote = "b" * 40
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            intervention_patcher = mock.patch.object(
+                updater,
+                "get_interventions_dir",
+                return_value=root / "interventions",
+            )
+            intervention_patcher.start()
+            self.addCleanup(intervention_patcher.stop)
             skill_dir = root / "skills" / "demo"
             expected_dir = root / "prepared"
             skill_dir.mkdir(parents=True)
@@ -841,16 +861,23 @@ class TransactionCoordinatorTests(unittest.TestCase):
 
             with mock.patch.object(updater, "_copy_payload_file_exclusive", side_effect=collide_during_restore):
                 first_outcome = updater.recover_updates(skill_dir.parent)[0]
-            second_outcome = updater.recover_updates(skill_dir.parent)[0]
+            second_outcomes = updater.recover_updates(skill_dir.parent)
 
             self.assertTrue(injected)
             self.assertEqual(first_outcome.installed_state, "uncertain")
-            self.assertEqual(second_outcome.installed_state, "uncertain")
-            self.assertEqual((skill_dir / "target.txt").read_text(encoding="utf-8"), "old target\n")
+            self.assertEqual(second_outcomes, [])
+            self.assertEqual(
+                (skill_dir / "target.txt").read_text(encoding="utf-8"),
+                "late concurrent data\n",
+            )
             recovery_files = list(skill_dir.parent.glob(".recovery-demo.transaction-*/target.txt"))
-            self.assertEqual(len(recovery_files), 1)
-            self.assertEqual(recovery_files[0].read_text(encoding="utf-8"), "late concurrent data\n")
+            self.assertEqual(recovery_files, [])
             self.assertTrue(transaction.exists())
+            self.assertEqual(
+                (transaction / "original" / "target.txt").read_text(encoding="utf-8"),
+                "old target\n",
+            )
+            self.assertTrue(first_outcome.intervention_record.is_dir())
 
     def test_snapshot_rollback_uncertainty_references_retained_journal(self):
         import scripts.agent_skill_updater as updater

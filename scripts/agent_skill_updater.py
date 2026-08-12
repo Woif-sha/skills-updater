@@ -4195,6 +4195,8 @@ def recover_updates(skills_root: Path) -> list[TransactionOutcome]:
             _validate_transaction_root(transaction_root, skills_root)
             if not _looks_like_transaction_directory(transaction_root):
                 continue
+            if _diagnostic_journal_is_retained(transaction_root):
+                continue
             transaction_type, state = _read_recovery_state(
                 transaction_root,
                 skills_root,
@@ -4220,6 +4222,8 @@ def recover_incomplete_skill_transactions(skills_root: Path) -> None:
             continue
         _validate_transaction_root(transaction_root, skills_root)
         if not _looks_like_transaction_directory(transaction_root):
+            continue
+        if _diagnostic_journal_is_retained(transaction_root):
             continue
         state_path = transaction_root / TRANSACTION_STATE_FILENAME
         if not state_path.is_file():
@@ -4364,6 +4368,8 @@ def _recover_skill_transactions_locked(skill_dir: Path) -> None:
         if not transaction_root.name.startswith(prefixes):
             continue
         _validate_transaction_root(transaction_root, skill_dir.parent)
+        if _diagnostic_journal_is_retained(transaction_root):
+            continue
         try:
             state_path = transaction_root / TRANSACTION_STATE_FILENAME
             if not state_path.is_file():
@@ -4394,6 +4400,18 @@ def _recover_skill_transactions_locked(skill_dir: Path) -> None:
             raise
         if outcome.installed_state == "uncertain":
             raise AgentSkillRecoveryUncertainError(outcome)
+
+
+def _diagnostic_journal_is_retained(transaction_root: Path) -> bool:
+    try:
+        from .interventions import is_diagnostic_journal_retained
+    except ImportError:
+        from interventions import is_diagnostic_journal_retained
+
+    return is_diagnostic_journal_retained(
+        get_interventions_dir(),
+        transaction_root,
+    )
 
 
 def _read_recovery_state(

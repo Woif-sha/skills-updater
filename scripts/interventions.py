@@ -68,6 +68,41 @@ def inventory_interventions(
     return inventory
 
 
+def is_diagnostic_journal_retained(
+    interventions_root: Path,
+    diagnostic_journal: Path,
+) -> bool:
+    """Return whether a recovery record currently owns the journal retention."""
+
+    if not os.path.lexists(interventions_root):
+        return False
+    _require_regular_directory(interventions_root, "Intervention root")
+    journal = diagnostic_journal.resolve()
+    artifact_id = _recovery_artifact_id(journal)
+    record_path = interventions_root / artifact_id
+    if os.path.lexists(record_path):
+        _require_regular_directory(record_path, "Intervention record")
+        manifest = _read_manifest(record_path)
+        return (
+            manifest["recordType"] == "recovery-required"
+            and manifest["diagnosticReferences"] == [str(journal)]
+        )
+    tombstone = interventions_root / f".tombstone-{artifact_id}"
+    if not os.path.lexists(tombstone):
+        return False
+    _require_regular_directory(tombstone, "Intervention tombstone")
+    intent = _read_tombstone_intent(tombstone)
+    _validate_tombstone_members(tombstone, intent)
+    members = intent["members"]
+    journal_member = members[1] if len(members) == 2 else None
+    return (
+        intent.get("recordType") == "recovery-required"
+        and journal_member is not None
+        and journal_member["source"] == str(journal)
+        and journal_member["state"] != "deleted"
+    )
+
+
 def mark_content_conflict(
     interventions_root: Path,
     artifact_id: str,
@@ -113,8 +148,7 @@ def publish_recovery_required(
 
     _require_regular_directory(diagnostic_journal, "Diagnostic Journal")
     journal_path = diagnostic_journal.resolve()
-    artifact_hash = hashlib.sha256(str(journal_path).encode("utf-8")).hexdigest()[:24]
-    artifact_id = f"recovery-required-{artifact_hash}"
+    artifact_id = _recovery_artifact_id(journal_path)
     observed_at = _utc_datetime(now or datetime.now(timezone.utc), "creation time")
     manifest = {
         "schemaVersion": INTERVENTION_SCHEMA_VERSION,
@@ -151,6 +185,11 @@ def publish_recovery_required(
             shutil.rmtree(draft)
         raise
     return destination
+
+
+def _recovery_artifact_id(journal_path: Path) -> str:
+    artifact_hash = hashlib.sha256(str(journal_path).encode("utf-8")).hexdigest()[:24]
+    return f"recovery-required-{artifact_hash}"
 
 
 def validate_recovery_required(
