@@ -308,6 +308,41 @@ class InterventionTests(unittest.TestCase):
             self.assertTrue(record.is_dir())
             self.assertTrue(journal.is_dir())
 
+    def test_journal_evidence_rejects_root_and_nested_filesystem_links(self):
+        from scripts.interventions import InterventionError, publish_recovery_required
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            journal = root / "skills" / ".demo.transaction-links"
+            external = root / "external"
+            journal.mkdir(parents=True)
+            external.mkdir()
+            (journal / "state.json").write_text("{}", encoding="utf-8")
+            (journal / ".skills-updater-transaction").write_text("1\n", encoding="utf-8")
+            nested = journal / "nested"
+            nested.mkdir()
+
+            with mock.patch(
+                "scripts.interventions.os.path.isjunction",
+                side_effect=lambda path: Path(path) == nested,
+            ):
+                record = publish_recovery_required(root / "interventions", "demo", journal)
+                with self.assertRaisesRegex(InterventionError, "unsafe link"):
+                    from scripts.interventions import validate_recovery_required
+
+                    validate_recovery_required(
+                        root / "interventions",
+                        record.name,
+                        lambda _: "rolled_back",
+                    )
+
+            with mock.patch(
+                "scripts.interventions.os.path.isjunction",
+                side_effect=lambda path: Path(path) == journal,
+            ):
+                with self.assertRaisesRegex(InterventionError, "regular directory"):
+                    publish_recovery_required(root / "other-interventions", "demo", journal)
+
     def test_cleanup_rejects_unsafe_selectors_and_cleans_expired_record_idempotently(self):
         from scripts.interventions import InterventionError, cleanup_intervention
 

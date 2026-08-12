@@ -59,7 +59,7 @@ def inventory_interventions(
             continue
         if record_path.name.startswith("."):
             continue
-        if not record_path.is_dir() or record_path.is_symlink():
+        if not record_path.is_dir() or _is_filesystem_link(record_path):
             raise InterventionError(
                 f"Intervention root contains an unsupported entry: {record_path}"
             )
@@ -340,7 +340,7 @@ def _read_tombstone_intent(tombstone: Path) -> dict:
     intent_path = tombstone / "tombstone.json"
     if not os.path.lexists(intent_path):
         intent_path = _tombstone_completion(tombstone)
-    if intent_path.is_symlink() or not intent_path.is_file():
+    if _is_filesystem_link(intent_path) or not intent_path.is_file():
         raise InterventionError(f"Intervention tombstone intent is missing: {intent_path}")
     try:
         intent = json.loads(intent_path.read_text(encoding="utf-8"))
@@ -493,7 +493,7 @@ def _diagnostic_journal_evidence(journal: Path) -> dict[str, str]:
     _require_regular_directory(journal, "Diagnostic Journal")
     digest = hashlib.sha256()
     for path in sorted(journal.rglob("*"), key=lambda item: item.relative_to(journal).as_posix()):
-        if path.is_symlink():
+        if _is_filesystem_link(path):
             raise InterventionError(f"Diagnostic Journal contains an unsafe link: {path}")
         relative = path.relative_to(journal).as_posix()
         if path.is_dir():
@@ -508,7 +508,7 @@ def _diagnostic_journal_evidence(journal: Path) -> dict[str, str]:
 
 
 def _sha256_file(path: Path) -> str:
-    if path.is_symlink() or not path.is_file():
+    if _is_filesystem_link(path) or not path.is_file():
         raise InterventionError(f"Required retention evidence is missing: {path}")
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -658,7 +658,7 @@ def _inventory_item(manifest: dict, observed_at: datetime) -> dict[str, object]:
 
 def _read_manifest(record_path: Path) -> dict:
     manifest_path = record_path / "manifest.json"
-    if manifest_path.is_symlink() or not manifest_path.is_file():
+    if _is_filesystem_link(manifest_path) or not manifest_path.is_file():
         raise InterventionError(f"Intervention manifest is missing: {manifest_path}")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -875,8 +875,12 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
 
 
 def _require_regular_directory(path: Path, label: str) -> None:
-    if path.is_symlink() or not path.is_dir():
+    if _is_filesystem_link(path) or not path.is_dir():
         raise InterventionError(f"{label} must be a regular directory: {path}")
+
+
+def _is_filesystem_link(path: Path) -> bool:
+    return path.is_symlink() or (hasattr(os.path, "isjunction") and os.path.isjunction(path))
 
 
 def _ensure_interventions_root(path: Path) -> None:
