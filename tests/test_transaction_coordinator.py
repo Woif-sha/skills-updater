@@ -286,7 +286,92 @@ class TransactionCoordinatorTests(unittest.TestCase):
             self.assertEqual(manifest["exactBaseRevision"], base)
             self.assertEqual(manifest["targetRevision"], remote)
             self.assertEqual(manifest["conflicts"], ["SKILL.md"])
+            self.assertEqual(
+                manifest["diagnosticReferences"],
+                ["conflicts/SKILL.md"],
+            )
             self.assertEqual(list(interventions_root.glob(".draft-*")), [])
+
+    def test_real_merge_conflict_references_written_variants(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_dir = root / "base"
+            local_dir = root / "local"
+            remote_dir = root / "remote"
+            conflict_dir = root / "conflicts"
+            for directory, content in (
+                (base_dir, "base\n"),
+                (local_dir, "local\n"),
+                (remote_dir, "remote\n"),
+            ):
+                directory.mkdir()
+                (directory / "SKILL.md").write_text(content, encoding="utf-8")
+
+            with self.assertRaises(updater.AgentSkillMergeConflictError) as error:
+                updater._merge_skill_directories(
+                    base_dir=base_dir,
+                    local_dir=local_dir,
+                    remote_dir=remote_dir,
+                    merged_dir=root / "merged",
+                    conflict_root=conflict_dir,
+                )
+
+            prepared = updater.PreparedPayload(
+                payload_dir=None,
+                payload_signature=None,
+                original_signature=updater.directory_signature(local_dir),
+                exact_base_revision="a" * 40,
+                base_signature=updater.directory_signature(base_dir),
+                remote_signature=updater.directory_signature(remote_dir),
+                base_dir=base_dir,
+                local_dir=local_dir,
+                remote_dir=remote_dir,
+                conflict_dir=conflict_dir,
+                conflicts=error.exception.conflicts,
+            )
+            source = updater.AgentSkillSource(
+                name="demo",
+                local_dir=local_dir,
+                source="example/demo",
+                source_type="git",
+                repo_url="https://github.com/example/demo",
+                subpath=".",
+                generator=None,
+                workflow_id=None,
+                metadata_path=None,
+                entry_type="single-skill",
+            )
+            observation = updater.RemoteObservation.from_source(
+                source,
+                revision="b" * 40,
+                version="b" * 40,
+            )
+
+            manifest, _ = updater._content_conflict_manifest(
+                source,
+                observation,
+                prepared,
+            )
+
+            self.assertEqual(
+                manifest["diagnosticReferences"],
+                [
+                    "conflicts/SKILL.md.base",
+                    "conflicts/SKILL.md.local",
+                    "conflicts/SKILL.md.remote",
+                ],
+            )
+
+    def test_recovery_intervention_promotion_failure_preserves_uncertain_outcome(self):
+        import scripts.agent_skill_updater as updater
+
+        journal = Path("missing-journal")
+        record, error = updater._try_promote_recovery_required("demo", journal)
+
+        self.assertIsNone(record)
+        self.assertIn("Recovery-required Intervention promotion failed", error)
 
     def test_snapshot_content_conflict_crash_resumes_from_coordinator_journal(self):
         import scripts.agent_skill_updater as updater

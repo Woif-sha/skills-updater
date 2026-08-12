@@ -1243,8 +1243,11 @@ def _content_conflict_manifest(
         "conflicts": list(prepared.conflicts),
         "materialSignatures": material_signatures,
     }
-    manifest_bytes = _json_payload_bytes(manifest)
-    artifact_id = f"{source.name}-content-conflict-{hashlib.sha256(manifest_bytes).hexdigest()[:16]}"
+    identity_bytes = _json_payload_bytes(manifest)
+    artifact_id = (
+        f"{source.name}-content-conflict-"
+        f"{hashlib.sha256(identity_bytes + os.urandom(16)).hexdigest()[:16]}"
+    )
     manifest.update(
         {
             "schemaVersion": 1,
@@ -1262,7 +1265,12 @@ def _content_conflict_manifest(
                 {"role": "intervention-record", "path": artifact_id},
             ],
             "diagnosticReferences": [
-                f"conflicts/{relative_path}" for relative_path in prepared.conflicts
+                f"conflicts/{path.relative_to(prepared.conflict_dir).as_posix()}"
+                for path in sorted(
+                    prepared.conflict_dir.rglob("*"),
+                    key=lambda item: item.as_posix(),
+                )
+                if path.is_file()
             ],
         }
     )
@@ -1537,7 +1545,7 @@ def _try_promote_recovery_required(
 ) -> tuple[Optional[Path], Optional[str]]:
     try:
         return _promote_recovery_required(skill_name, diagnostic_journal), None
-    except (AgentSkillUpdaterError, OSError) as exc:
+    except (AgentSkillUpdaterError, OSError, ValueError) as exc:
         return None, f"Recovery-required Intervention promotion failed: {exc}"
 
 

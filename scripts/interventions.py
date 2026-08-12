@@ -185,6 +185,7 @@ def validate_recovery_required(
             f"Diagnostic Journal '{journal}' did not prove committed or rolled_back state."
         )
     manifest["recoveryState"] = installed_state
+    manifest["validatedJournalEvidence"] = _diagnostic_journal_evidence(journal)
     manifest["retentionStartedAt"] = _format_utc_timestamp(observed_at)
     manifest["retentionExpiresAt"] = _format_utc_timestamp(
         observed_at + timedelta(days=15)
@@ -501,6 +502,11 @@ def _retention_members(
             raise InterventionError(
                 f"Diagnostic Journal reference mismatch for '{artifact_id}'."
             )
+        evidence = _diagnostic_journal_evidence(journal)
+        if evidence != manifest.get("validatedJournalEvidence"):
+            raise InterventionError(
+                f"Diagnostic Journal identity changed after validation for '{artifact_id}'."
+            )
         members.append(
             {
                 "role": "diagnostic-journal",
@@ -508,7 +514,7 @@ def _retention_members(
                 "destination": str(tombstone / "diagnostic-journal"),
                 "required": True,
                 "state": "pending",
-                "evidence": _diagnostic_journal_evidence(journal),
+                "evidence": evidence,
             }
         )
     return members
@@ -699,6 +705,10 @@ def _validate_record_states(manifest: dict, manifest_path: Path) -> None:
             or manifest["recoveryState"] is not None
         ):
             raise InterventionError(f"Invalid content-conflict state at {manifest_path}")
+        if "validatedJournalEvidence" in manifest:
+            raise InterventionError(
+                f"Content conflicts cannot contain journal proof at {manifest_path}"
+            )
         return
     if (
         manifest["resolutionState"] is not None
@@ -706,6 +716,23 @@ def _validate_record_states(manifest: dict, manifest_path: Path) -> None:
         or manifest["recoveryState"] not in RECOVERY_STATES
     ):
         raise InterventionError(f"Invalid recovery-required state at {manifest_path}")
+    proof = manifest.get("validatedJournalEvidence")
+    if manifest["recoveryState"] == "required":
+        if proof is not None:
+            raise InterventionError(
+                f"Unvalidated recovery record contains proof at {manifest_path}"
+            )
+    elif (
+        not isinstance(proof, dict)
+        or set(proof) != {"markerSha256", "stateSha256"}
+        or any(
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in proof.values()
+        )
+    ):
+        raise InterventionError(
+            f"Settled recovery record is missing journal proof at {manifest_path}"
+        )
 
 
 def _validate_retention(manifest: dict, manifest_path: Path) -> None:

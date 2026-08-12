@@ -225,6 +225,49 @@ class InterventionTests(unittest.TestCase):
             self.assertEqual(item["recovery_state"], "committed")
             self.assertEqual(item["retention_started_at"], "2026-08-11T12:30:00Z")
             self.assertEqual(item["retention_expires_at"], "2026-08-26T12:30:00Z")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(manifest["validatedJournalEvidence"]),
+                {"markerSha256", "stateSha256"},
+            )
+
+    def test_cleanup_rejects_journal_changed_after_validation(self):
+        from scripts.interventions import (
+            InterventionError,
+            cleanup_intervention,
+            publish_recovery_required,
+            validate_recovery_required,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "interventions"
+            journal = Path(temp_dir) / "skills" / ".demo.transaction-changed"
+            journal.mkdir(parents=True)
+            (journal / "state.json").write_text("{}", encoding="utf-8")
+            (journal / ".skills-updater-transaction").write_text("1\n", encoding="utf-8")
+            record = publish_recovery_required(
+                root,
+                "demo",
+                journal,
+                now=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            )
+            validate_recovery_required(
+                root,
+                record.name,
+                lambda _: "committed",
+                now=datetime(2026, 8, 2, tzinfo=timezone.utc),
+            )
+            (journal / "state.json").write_text('{"changed":true}', encoding="utf-8")
+
+            with self.assertRaisesRegex(InterventionError, "identity changed"):
+                cleanup_intervention(
+                    root,
+                    record.name,
+                    now=datetime(2026, 8, 18, tzinfo=timezone.utc),
+                )
+
+            self.assertTrue(record.is_dir())
+            self.assertTrue(journal.is_dir())
 
     def test_cleanup_rejects_unsafe_selectors_and_cleans_expired_record_idempotently(self):
         from scripts.interventions import InterventionError, cleanup_intervention
