@@ -137,10 +137,7 @@ class LocalOnlyPolicyTests(unittest.TestCase):
             apply_observed_update,
             load_agent_skill_source,
             probe_git_worktree,
-            refresh_skill_metadata_version,
-            resolve_skill_update,
             stage_remote_skill,
-            update_git_worktree_skill,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -163,29 +160,20 @@ class LocalOnlyPolicyTests(unittest.TestCase):
                     "scripts.agent_skill_updater.fetch_source_remote_version",
                     side_effect=AssertionError("remote commit probe called"),
                 ):
-                    result = resolve_skill_update(source, root / "stage")
-
-            self.assertEqual(result.status, "local_only")
-            self.assertIsNone(result.staged_dir)
-            self.assertEqual(result.installed_base_version, "local")
-            self.assertEqual(result.local_version, "local")
-            for operation in (
-                lambda: stage_remote_skill(source, root / "stage-2"),
-                lambda: probe_git_worktree(source),
-                lambda: update_git_worktree_skill(source),
-                lambda: refresh_skill_metadata_version(source, "a" * 40, "b" * 40),
-                lambda: apply_observed_update(
-                    source,
-                    RemoteObservation.from_source(
-                        source,
-                        revision="b" * 40,
-                        version="b" * 40,
-                    ),
-                    installed_base_version="a" * 40,
-                ),
-            ):
-                with self.assertRaisesRegex(AgentSkillUpdaterError, "local-only"):
-                    operation()
+                    for operation in (
+                        lambda: stage_remote_skill(source, root / "stage-2"),
+                        lambda: probe_git_worktree(source),
+                        lambda: apply_observed_update(
+                            source,
+                            RemoteObservation.from_source(
+                                source,
+                                revision="b" * 40,
+                                version="b" * 40,
+                            ),
+                        ),
+                    ):
+                        with self.assertRaisesRegex(AgentSkillUpdaterError, "local-only"):
+                            operation()
 
     def test_json_clis_report_local_only_without_remote_access(self):
         import scripts.check_updates as check_updates

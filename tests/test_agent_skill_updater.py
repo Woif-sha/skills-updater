@@ -80,8 +80,8 @@ class AgentSkillUpdaterTests(unittest.TestCase):
     def test_resolve_generated_update_retains_exact_source_revision(self):
         from scripts.agent_skill_updater import (
             AgentSkillSource,
+            _resolve_snapshot_update,
             fetch_source_remote_observation,
-            resolve_skill_update,
         )
 
         revision = "b" * 40
@@ -144,10 +144,12 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                         "scripts.agent_skill_updater.stage_remote_skill",
                         side_effect=stage_generated,
                     ):
-                        update = resolve_skill_update(
+                        update = _resolve_snapshot_update(
                             source,
                             root / "stage",
                             observation,
+                            "1.0.0",
+                            "1.0.0",
                         )
 
         self.assertIs(update.remote_observation, observation)
@@ -373,32 +375,26 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                             remote_observation=resolved.remote_observation,
                         ),
                     ):
-                        with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
-                            with mock.patch(
-                                "scripts.update_agent_skills.prepare_snapshot_payload",
-                                return_value=mock.sentinel.prepared_payload,
-                            ) as prepare:
-                                with mock.patch(
-                                    "scripts.update_agent_skills.apply_observed_update",
-                                    return_value=updater.TransactionOutcome(
-                                        name="demo-skill",
-                                        status="up_to_date",
-                                        installed_state="committed",
-                                        applied=True,
-                                        action="payload_merged",
-                                        version="new123456789",
-                                    ),
-                                ) as apply:
-                                    with self.assertRaises(SystemExit) as exit_info:
-                                        with redirect_stdout(stdout):
-                                            updater.main()
+                        with mock.patch(
+                            "scripts.update_agent_skills.apply_observed_update",
+                            return_value=updater.TransactionOutcome(
+                                name="demo-skill",
+                                status="up_to_date",
+                                installed_state="committed",
+                                applied=True,
+                                action="payload_merged",
+                                version="new123456789",
+                            ),
+                        ) as apply:
+                            with self.assertRaises(SystemExit) as exit_info:
+                                with redirect_stdout(stdout):
+                                    updater.main()
 
         self.assertEqual(exit_info.exception.code, 0)
         payload = json.loads(stdout.getvalue())
         self.assertEqual(len(payload), 1)
         self.assertEqual(payload[0]["name"], "demo-skill")
         self.assertTrue(payload[0]["applied"])
-        prepare.assert_called_once_with(resolved)
         apply.assert_called_once()
 
     def test_update_agent_skills_refreshes_metadata_when_staged_content_matches(self):
@@ -451,24 +447,23 @@ class AgentSkillUpdaterTests(unittest.TestCase):
                             remote_observation=resolved.remote_observation,
                         ),
                     ):
-                        with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
-                            with mock.patch(
-                                "scripts.update_agent_skills.apply_observed_update",
-                                return_value=SimpleNamespace(
-                                    status="up_to_date",
-                                    installed_state="committed",
-                                    applied=True,
-                                    action="metadata_refreshed",
-                                    version="new123456789",
-                                    error_message=None,
-                                    diagnostic_journal=None,
-                                    cleanup_residue=None,
-                                    intervention_record=None,
-                                ),
-                            ) as apply_observed:
-                                with self.assertRaises(SystemExit) as exit_info:
-                                    with redirect_stdout(stdout):
-                                        updater.main()
+                        with mock.patch(
+                            "scripts.update_agent_skills.apply_observed_update",
+                            return_value=SimpleNamespace(
+                                status="up_to_date",
+                                installed_state="committed",
+                                applied=True,
+                                action="metadata_refreshed",
+                                version="new123456789",
+                                error_message=None,
+                                diagnostic_journal=None,
+                                cleanup_residue=None,
+                                intervention_record=None,
+                            ),
+                        ) as apply_observed:
+                            with self.assertRaises(SystemExit) as exit_info:
+                                with redirect_stdout(stdout):
+                                    updater.main()
 
         self.assertEqual(exit_info.exception.code, 0)
         payload = json.loads(stdout.getvalue())

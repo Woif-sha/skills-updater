@@ -15,13 +15,14 @@ from typing import Iterator, Optional
 if __package__:
     from .agent_skill_updater import (
         AgentSkillUpdaterError,
+        AgentSkillRecoveryUncertainError,
         LOCAL_ONLY_UPDATE_POLICY,
         canonical_repo_identity,
         detect_skill_entry_type,
         get_agent_skills_dir,
         is_git_worktree_skill,
         normalize_git_commit,
-        recover_incomplete_skill_transactions,
+        recover_updates,
         same_git_commit,
         sanitize_repo_url,
         skill_update_lock,
@@ -31,13 +32,14 @@ if __package__:
 else:
     from agent_skill_updater import (
         AgentSkillUpdaterError,
+        AgentSkillRecoveryUncertainError,
         LOCAL_ONLY_UPDATE_POLICY,
         canonical_repo_identity,
         detect_skill_entry_type,
         get_agent_skills_dir,
         is_git_worktree_skill,
         normalize_git_commit,
-        recover_incomplete_skill_transactions,
+        recover_updates,
         same_git_commit,
         sanitize_repo_url,
         skill_update_lock,
@@ -82,7 +84,13 @@ def sync_registry(skills_root: Optional[Path] = None) -> dict:
 
 
 def _sync_registry_unlocked(root: Path) -> dict:
-    recover_incomplete_skill_transactions(root)
+    recovery_outcomes = recover_updates(root)
+    uncertain = next(
+        (outcome for outcome in recovery_outcomes if outcome.installed_state == "uncertain"),
+        None,
+    )
+    if uncertain is not None:
+        raise AgentSkillRecoveryUncertainError(uncertain)
     previous = load_registry(root)["entries"]
     entries: dict[str, dict] = {}
 

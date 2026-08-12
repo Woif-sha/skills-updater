@@ -791,7 +791,7 @@ class InterventionTests(unittest.TestCase):
                 "get_interventions_dir",
                 return_value=interventions_root,
             ):
-                updater.recover_incomplete_skill_transactions(skills_root)
+                self.assertEqual(updater.recover_updates(skills_root), [])
             self.assertTrue(journal.is_dir())
             validate_recovery_required(
                 interventions_root,
@@ -805,7 +805,7 @@ class InterventionTests(unittest.TestCase):
                 "get_interventions_dir",
                 return_value=interventions_root,
             ):
-                updater.recover_incomplete_skill_transactions(skills_root)
+                self.assertEqual(updater.recover_updates(skills_root), [])
 
             self.assertTrue(journal.is_dir())
             cleaned = cleanup_intervention(

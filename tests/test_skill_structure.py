@@ -1,4 +1,5 @@
 import json
+import inspect
 import re
 import unittest
 from pathlib import Path
@@ -83,6 +84,57 @@ class SkillStructureTests(unittest.TestCase):
         )
 
         self.assertEqual([path for path in retired if (REPO_ROOT / path).exists()], [])
+
+    def test_update_lifecycle_has_only_two_public_coordinator_entries(self):
+        from scripts import agent_skill_updater as updater
+
+        self.assertEqual(
+            list(inspect.signature(updater.apply_observed_update).parameters),
+            ["source", "observation"],
+        )
+        self.assertTrue(callable(updater.recover_updates))
+        retired = (
+            "AgentSkillUpdate",
+            "AgentSkillUpdateCommittedError",
+            "prepare_snapshot_payload",
+            "recover_incomplete_skill_transactions",
+            "refresh_skill_metadata_version",
+            "resolve_skill_update",
+            "update_git_worktree_skill",
+        )
+        self.assertEqual([name for name in retired if hasattr(updater, name)], [])
+        updater_text = inspect.getsource(updater)
+        self.assertIsNone(
+            re.search(
+                r"def _recover_(?:snapshot|git|metadata|decoded|coordinator)",
+                updater_text,
+            )
+        )
+        coordinator_text = inspect.getsource(updater._coordinate_prepared_update)
+        self.assertEqual(
+            [
+                name
+                for name in ("stage_remote_skill", "_stage_git_skill_at_ref", "probe_git_worktree")
+                if name in coordinator_text
+            ],
+            [],
+        )
+
+    def test_update_cli_does_not_orchestrate_transaction_modes(self):
+        cli_text = (REPO_ROOT / "scripts" / "update_agent_skills.py").read_text(
+            encoding="utf-8"
+        )
+
+        forbidden = (
+            "AgentSkillUpdateCommittedError",
+            "prepare_snapshot_payload",
+            "recover_incomplete_skill_transactions",
+            "refresh_skill_metadata_version",
+            "resolve_skill_update",
+            "update_git_worktree_skill",
+            "tempfile",
+        )
+        self.assertEqual([name for name in forbidden if name in cli_text], [])
 
     def test_internal_markdown_links_resolve(self):
         broken: list[str] = []
