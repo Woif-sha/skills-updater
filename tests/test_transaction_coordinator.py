@@ -52,6 +52,19 @@ def _conflict_payload(updater, root: Path, skill_dir: Path, base: str, observati
 
 
 class TransactionCoordinatorTests(unittest.TestCase):
+    def setUp(self):
+        import scripts.agent_skill_updater as updater
+
+        self._intervention_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._intervention_temp.cleanup)
+        patcher = mock.patch.object(
+            updater,
+            "get_interventions_dir",
+            return_value=Path(self._intervention_temp.name) / "interventions",
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_snapshot_local_merge_commits_through_prepared_payload(self):
         import scripts.agent_skill_updater as updater
 
@@ -286,7 +299,92 @@ class TransactionCoordinatorTests(unittest.TestCase):
             self.assertEqual(manifest["exactBaseRevision"], base)
             self.assertEqual(manifest["targetRevision"], remote)
             self.assertEqual(manifest["conflicts"], ["SKILL.md"])
+            self.assertEqual(
+                manifest["diagnosticReferences"],
+                ["conflicts/SKILL.md"],
+            )
             self.assertEqual(list(interventions_root.glob(".draft-*")), [])
+
+    def test_real_merge_conflict_references_written_variants(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_dir = root / "base"
+            local_dir = root / "local"
+            remote_dir = root / "remote"
+            conflict_dir = root / "conflicts"
+            for directory, content in (
+                (base_dir, "base\n"),
+                (local_dir, "local\n"),
+                (remote_dir, "remote\n"),
+            ):
+                directory.mkdir()
+                (directory / "SKILL.md").write_text(content, encoding="utf-8")
+
+            with self.assertRaises(updater.AgentSkillMergeConflictError) as error:
+                updater._merge_skill_directories(
+                    base_dir=base_dir,
+                    local_dir=local_dir,
+                    remote_dir=remote_dir,
+                    merged_dir=root / "merged",
+                    conflict_root=conflict_dir,
+                )
+
+            prepared = updater.PreparedPayload(
+                payload_dir=None,
+                payload_signature=None,
+                original_signature=updater.directory_signature(local_dir),
+                exact_base_revision="a" * 40,
+                base_signature=updater.directory_signature(base_dir),
+                remote_signature=updater.directory_signature(remote_dir),
+                base_dir=base_dir,
+                local_dir=local_dir,
+                remote_dir=remote_dir,
+                conflict_dir=conflict_dir,
+                conflicts=error.exception.conflicts,
+            )
+            source = updater.AgentSkillSource(
+                name="demo",
+                local_dir=local_dir,
+                source="example/demo",
+                source_type="git",
+                repo_url="https://github.com/example/demo",
+                subpath=".",
+                generator=None,
+                workflow_id=None,
+                metadata_path=None,
+                entry_type="single-skill",
+            )
+            observation = updater.RemoteObservation.from_source(
+                source,
+                revision="b" * 40,
+                version="b" * 40,
+            )
+
+            manifest, _ = updater._content_conflict_manifest(
+                source,
+                observation,
+                prepared,
+            )
+
+            self.assertEqual(
+                manifest["diagnosticReferences"],
+                [
+                    "conflicts/SKILL.md.base",
+                    "conflicts/SKILL.md.local",
+                    "conflicts/SKILL.md.remote",
+                ],
+            )
+
+    def test_recovery_intervention_promotion_failure_preserves_uncertain_outcome(self):
+        import scripts.agent_skill_updater as updater
+
+        journal = Path("missing-journal")
+        record, error = updater._try_promote_recovery_required("demo", journal)
+
+        self.assertIsNone(record)
+        self.assertIn("Recovery-required Intervention promotion failed", error)
 
     def test_snapshot_content_conflict_crash_resumes_from_coordinator_journal(self):
         import scripts.agent_skill_updater as updater
@@ -726,6 +824,13 @@ class TransactionCoordinatorTests(unittest.TestCase):
         remote = "b" * 40
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            intervention_patcher = mock.patch.object(
+                updater,
+                "get_interventions_dir",
+                return_value=root / "interventions",
+            )
+            intervention_patcher.start()
+            self.addCleanup(intervention_patcher.stop)
             skill_dir = root / "skills" / "demo"
             expected_dir = root / "prepared"
             skill_dir.mkdir(parents=True)
@@ -756,16 +861,23 @@ class TransactionCoordinatorTests(unittest.TestCase):
 
             with mock.patch.object(updater, "_copy_payload_file_exclusive", side_effect=collide_during_restore):
                 first_outcome = updater.recover_updates(skill_dir.parent)[0]
-            second_outcome = updater.recover_updates(skill_dir.parent)[0]
+            second_outcomes = updater.recover_updates(skill_dir.parent)
 
             self.assertTrue(injected)
             self.assertEqual(first_outcome.installed_state, "uncertain")
-            self.assertEqual(second_outcome.installed_state, "uncertain")
-            self.assertEqual((skill_dir / "target.txt").read_text(encoding="utf-8"), "old target\n")
+            self.assertEqual(second_outcomes, [])
+            self.assertEqual(
+                (skill_dir / "target.txt").read_text(encoding="utf-8"),
+                "late concurrent data\n",
+            )
             recovery_files = list(skill_dir.parent.glob(".recovery-demo.transaction-*/target.txt"))
-            self.assertEqual(len(recovery_files), 1)
-            self.assertEqual(recovery_files[0].read_text(encoding="utf-8"), "late concurrent data\n")
+            self.assertEqual(recovery_files, [])
             self.assertTrue(transaction.exists())
+            self.assertEqual(
+                (transaction / "original" / "target.txt").read_text(encoding="utf-8"),
+                "old target\n",
+            )
+            self.assertTrue(first_outcome.intervention_record.is_dir())
 
     def test_snapshot_rollback_uncertainty_references_retained_journal(self):
         import scripts.agent_skill_updater as updater
@@ -805,9 +917,12 @@ class TransactionCoordinatorTests(unittest.TestCase):
             self.assertTrue(outcome.intervention_record.is_dir())
             self.assertEqual({path.name for path in outcome.intervention_record.iterdir()}, {"manifest.json"})
             manifest = json.loads((outcome.intervention_record / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["kind"], "recovery-required")
-            self.assertEqual(manifest["diagnosticJournal"], str(outcome.diagnostic_journal))
-            self.assertEqual(manifest["installedState"], "uncertain")
+            self.assertEqual(manifest["recordType"], "recovery-required")
+            self.assertEqual(
+                manifest["diagnosticReferences"],
+                [str(outcome.diagnostic_journal.resolve())],
+            )
+            self.assertEqual(manifest["recoveryState"], "required")
             self.assertEqual((skill_dir / "SKILL.md").read_text(encoding="utf-8"), "old\n")
 
     def test_snapshot_v4_decoder_settles_without_rewriting_legacy_journal(self):

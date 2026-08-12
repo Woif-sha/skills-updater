@@ -1243,9 +1243,37 @@ def _content_conflict_manifest(
         "conflicts": list(prepared.conflicts),
         "materialSignatures": material_signatures,
     }
-    manifest_bytes = _json_payload_bytes(manifest)
-    artifact_id = f"{source.name}-content-conflict-{hashlib.sha256(manifest_bytes).hexdigest()[:16]}"
-    manifest["artifactId"] = artifact_id
+    identity_bytes = _json_payload_bytes(manifest)
+    artifact_id = (
+        f"{source.name}-content-conflict-"
+        f"{hashlib.sha256(identity_bytes + os.urandom(16)).hexdigest()[:16]}"
+    )
+    manifest.update(
+        {
+            "schemaVersion": 1,
+            "artifactId": artifact_id,
+            "recordType": "content-conflict",
+            "createdAt": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "resolutionState": "unresolved",
+            "recoveryState": None,
+            "retentionStartedAt": None,
+            "retentionExpiresAt": None,
+            "retentionGroup": [
+                {"role": "intervention-record", "path": artifact_id},
+            ],
+            "diagnosticReferences": [
+                f"conflicts/{path.relative_to(prepared.conflict_dir).as_posix()}"
+                for path in sorted(
+                    prepared.conflict_dir.rglob("*"),
+                    key=lambda item: item.as_posix(),
+                )
+                if path.is_file()
+            ],
+        }
+    )
     return manifest, {name: path for name, path in materials.items() if path is not None}
 
 
@@ -1499,33 +1527,16 @@ def _finish_content_conflict_transaction(
 
 
 def _promote_recovery_required(skill_name: str, diagnostic_journal: Path) -> Path:
-    manifest = {
-        "kind": "recovery-required",
-        "skillName": skill_name,
-        "installedState": "uncertain",
-        "diagnosticJournal": str(diagnostic_journal.resolve()),
-    }
-    artifact_id = (
-        f"{skill_name}-recovery-required-"
-        f"{hashlib.sha256(_json_payload_bytes(manifest)).hexdigest()[:16]}"
-    )
-    manifest["artifactId"] = artifact_id
-    intervention_root = get_interventions_dir()
-    intervention_root.mkdir(parents=True, exist_ok=True)
-    if _is_filesystem_link(intervention_root) or not intervention_root.is_dir():
-        raise AgentSkillUpdaterError(
-            f"Intervention root must be a regular directory: {intervention_root}"
-        )
-    destination = intervention_root / artifact_id
-    draft = Path(tempfile.mkdtemp(prefix=".draft-", dir=intervention_root))
     try:
-        _write_json_atomic(draft / "manifest.json", manifest)
-        _rename_directory_exclusive(draft, destination)
-    except BaseException:
-        if draft.exists():
-            shutil.rmtree(draft)
-        raise
-    return destination
+        from .interventions import publish_recovery_required
+    except ImportError:
+        from interventions import publish_recovery_required
+
+    return publish_recovery_required(
+        get_interventions_dir(),
+        skill_name,
+        diagnostic_journal,
+    )
 
 
 def _try_promote_recovery_required(
@@ -1534,7 +1545,7 @@ def _try_promote_recovery_required(
 ) -> tuple[Optional[Path], Optional[str]]:
     try:
         return _promote_recovery_required(skill_name, diagnostic_journal), None
-    except (AgentSkillUpdaterError, OSError) as exc:
+    except (AgentSkillUpdaterError, OSError, ValueError) as exc:
         return None, f"Recovery-required Intervention promotion failed: {exc}"
 
 
@@ -4184,6 +4195,8 @@ def recover_updates(skills_root: Path) -> list[TransactionOutcome]:
             _validate_transaction_root(transaction_root, skills_root)
             if not _looks_like_transaction_directory(transaction_root):
                 continue
+            if _diagnostic_journal_is_retained(transaction_root):
+                continue
             transaction_type, state = _read_recovery_state(
                 transaction_root,
                 skills_root,
@@ -4209,6 +4222,8 @@ def recover_incomplete_skill_transactions(skills_root: Path) -> None:
             continue
         _validate_transaction_root(transaction_root, skills_root)
         if not _looks_like_transaction_directory(transaction_root):
+            continue
+        if _diagnostic_journal_is_retained(transaction_root):
             continue
         state_path = transaction_root / TRANSACTION_STATE_FILENAME
         if not state_path.is_file():
@@ -4240,6 +4255,108 @@ def recover_incomplete_skill_transactions(skills_root: Path) -> None:
                 raise AgentSkillRecoveryUncertainError(outcome)
 
 
+def validate_diagnostic_journal(transaction_root: Path) -> str:
+    """Read one Diagnostic Journal and prove its settled Installed State."""
+
+    skills_root = transaction_root.parent
+    _validate_transaction_root(transaction_root, skills_root)
+    if not _looks_like_transaction_name(transaction_root.name):
+        raise AgentSkillUpdaterError(
+            f"Path is not a recognized Diagnostic Journal: {transaction_root}"
+        )
+    if not _looks_like_transaction_directory(transaction_root):
+        raise AgentSkillUpdaterError(
+            f"Diagnostic Journal marker is missing: {transaction_root}"
+        )
+    transaction_type, state = _read_recovery_state(transaction_root, skills_root)
+    skill_dir = _decoded_skill_dir(state)
+    with skill_update_lock(skill_dir):
+        return _validate_decoded_journal_settlement(
+            transaction_root,
+            transaction_type,
+            state,
+        )
+
+
+def _validate_decoded_journal_settlement(
+    transaction_root: Path,
+    transaction_type: str,
+    state: dict | _MetadataJournal | _GitJournal,
+) -> str:
+    skill_dir = _decoded_skill_dir(state)
+    _validate_skill_root(skill_dir)
+    if isinstance(state, _MetadataJournal):
+        if state.phase not in {COORDINATOR_PHASE_COMMITTED, COORDINATOR_PHASE_ROLLED_BACK}:
+            raise AgentSkillUpdaterError(
+                f"Diagnostic Journal '{transaction_root}' is not settled."
+            )
+        _read_verified_transaction_metadata_snapshots(transaction_root, state.evidence)
+        committed = state.phase == COORDINATOR_PHASE_COMMITTED
+        _validate_transaction_metadata(skill_dir, state.evidence, expected=committed)
+        return "committed" if committed else "rolled_back"
+    if isinstance(state, _GitJournal):
+        if state.phase not in {COORDINATOR_PHASE_COMMITTED, COORDINATOR_PHASE_ROLLED_BACK}:
+            raise AgentSkillUpdaterError(
+                f"Diagnostic Journal '{transaction_root}' is not settled."
+            )
+        committed = state.phase == COORDINATOR_PHASE_COMMITTED
+        _read_verified_transaction_metadata_snapshots(
+            transaction_root,
+            state.metadata_evidence,
+        )
+        if state.git_evidence is not None:
+            _validate_git_identity(
+                skill_dir,
+                state.git_evidence,
+                expected=committed,
+                require_configuration=True,
+            )
+            _validate_transaction_metadata(
+                skill_dir,
+                state.metadata_evidence,
+                expected=committed,
+            )
+        elif state.legacy_state is not None:
+            legacy = state.legacy_state
+            _validate_git_worktree_revision(
+                skill_dir,
+                legacy["originalBranch"],
+                legacy["expectedHead"] if committed else legacy["originalHead"],
+                legacy["expectedSignature"] if committed else legacy["originalSignature"],
+                legacy["entryType"],
+            )
+            _validate_transaction_metadata(skill_dir, legacy, expected=committed)
+        else:
+            raise AgentSkillUpdaterError(f"Invalid Git Diagnostic Journal: {transaction_root}")
+        return "committed" if committed else "rolled_back"
+    if not isinstance(state, dict):
+        raise AgentSkillUpdaterError(f"Invalid Diagnostic Journal: {transaction_root}")
+    if (
+        transaction_type == COORDINATOR_TRANSACTION_TYPE
+        and state["transactionKind"] != SNAPSHOT_TRANSACTION_KIND
+    ) or transaction_type != COORDINATOR_TRANSACTION_TYPE and transaction_type != SNAPSHOT_TRANSACTION_TYPE:
+        raise AgentSkillUpdaterError(f"Invalid Diagnostic Journal: {transaction_root}")
+    phase = state["phase"]
+    if phase not in {COORDINATOR_PHASE_COMMITTED, COORDINATOR_PHASE_ROLLED_BACK}:
+        raise AgentSkillUpdaterError(
+            f"Diagnostic Journal '{transaction_root}' is not settled."
+        )
+    committed = phase == COORDINATOR_PHASE_COMMITTED
+    _read_verified_transaction_metadata_snapshots(transaction_root, state)
+    evidence = _snapshot_transaction_evidence(state)
+    _validate_skill_payload(
+        skill_dir,
+        evidence["expectedSignature"] if committed else evidence["originalSignature"],
+        entry_type=evidence["entryType"],
+    )
+    if is_git_worktree_skill(skill_dir):
+        raise AgentSkillUpdaterError(
+            f"Snapshot transaction cannot prove a non-Git Installed State at '{skill_dir}'."
+        )
+    _validate_transaction_metadata(skill_dir, state, expected=committed)
+    return "committed" if committed else "rolled_back"
+
+
 def _recover_skill_transactions_locked(skill_dir: Path) -> None:
     prefixes = (
         f".{skill_dir.name}.update-",
@@ -4251,6 +4368,8 @@ def _recover_skill_transactions_locked(skill_dir: Path) -> None:
         if not transaction_root.name.startswith(prefixes):
             continue
         _validate_transaction_root(transaction_root, skill_dir.parent)
+        if _diagnostic_journal_is_retained(transaction_root):
+            continue
         try:
             state_path = transaction_root / TRANSACTION_STATE_FILENAME
             if not state_path.is_file():
@@ -4281,6 +4400,18 @@ def _recover_skill_transactions_locked(skill_dir: Path) -> None:
             raise
         if outcome.installed_state == "uncertain":
             raise AgentSkillRecoveryUncertainError(outcome)
+
+
+def _diagnostic_journal_is_retained(transaction_root: Path) -> bool:
+    try:
+        from .interventions import is_diagnostic_journal_retained
+    except ImportError:
+        from interventions import is_diagnostic_journal_retained
+
+    return is_diagnostic_journal_retained(
+        get_interventions_dir(),
+        transaction_root,
+    )
 
 
 def _read_recovery_state(

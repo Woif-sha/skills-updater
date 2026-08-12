@@ -3,9 +3,10 @@ name: skills-updater
 description: >
   This skill should be used when the user says "skills-updater", "检查 skill 更新",
   "更新已安装的 skill", "从 GitHub 安装 skill", "同步 .skills-list.json",
-  "这个 skill 是我自己写的，不要联网更新", or "修复 skills-updater".
+  "这个 skill 是我自己写的，不要联网更新", "列出或清理 Intervention Record",
+  or "修复 skills-updater".
   Activate only for the install, update, and registry lifecycle under
-  ~/.agents/skills or this updater's own implementation.
+  ~/.agents/skills, updater-owned Intervention Records, or this updater's implementation.
 ---
 
 # Skills Updater
@@ -36,4 +37,4 @@ These are the single normative definitions for every route. Operation workflows 
 
 ## Scope
 
-This Skill owns `~/.agents/skills` only. It does not manage Claude marketplaces, recommend third-party Skills, or maintain tool-specific mirror directories.
+This Skill owns `~/.agents/skills` and updater-created records under `~/.agents/interventions`. It does not manage Claude marketplaces, recommend third-party Skills, or maintain tool-specific mirror directories.

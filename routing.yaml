@@ -62,6 +62,14 @@
       "negative_signals": ["这次只检查", "暂时不要更新", "只执行 check-only"]
     },
     {
+      "id": "manage-interventions",
+      "labels": {"en": "Manage Intervention Records", "zh": "管理介入记录"},
+      "route": "Follow workflows/manage-interventions.md",
+      "required_reads": [],
+      "workflow": "workflows/manage-interventions.md",
+      "trigger_examples": ["列出 Intervention Record", "标记冲突已解决", "验证恢复记录", "清理介入记录", "inventory interventions", "cleanup intervention"]
+    },
+    {
       "id": "repair-updater",
       "labels": {"en": "Repair or review the updater", "zh": "修复或审查更新器"},
       "route": "Follow workflows/repair-updater.md",

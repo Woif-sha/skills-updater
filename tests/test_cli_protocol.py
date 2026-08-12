@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -13,6 +14,7 @@ class CliProtocolTests(unittest.TestCase):
             ("update_agent_skills.py", ["--json", "--definitely-invalid"], list),
             ("install_agent_skill.py", ["--json"], list),
             ("sync_skills_registry.py", ["--json", "--definitely-invalid"], dict),
+            ("manage_interventions.py", ["--json", "--force"], dict),
         )
 
         for script_name, arguments, payload_type in cases:
@@ -34,6 +36,76 @@ class CliProtocolTests(unittest.TestCase):
                 item = payload[0] if isinstance(payload, list) else payload
                 self.assertEqual(item["status"], "error")
                 self.assertTrue(item["error_message"])
+
+    def test_intervention_cli_defaults_to_read_only_inventory_and_rejects_paths(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        with self.subTest(operation="inventory"):
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                env = dict(os.environ)
+                env["USERPROFILE"] = temp_dir
+                env["HOME"] = temp_dir
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(repo_root / "scripts" / "manage_interventions.py"),
+                        "--json",
+                    ],
+                    cwd=repo_root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="strict",
+                    timeout=20,
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(
+                    json.loads(result.stdout),
+                    {"status": "ok", "operation": "inventory", "records": []},
+                )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(repo_root / "scripts" / "manage_interventions.py"),
+                "--json",
+                "--cleanup",
+                "../arbitrary-path",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "error")
+        self.assertEqual(payload["operation"], "cleanup")
+        self.assertIn("paths and globs are forbidden", payload["error_message"])
+
+        empty = subprocess.run(
+            [
+                sys.executable,
+                str(repo_root / "scripts" / "manage_interventions.py"),
+                "--json",
+                "--cleanup",
+                "",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=20,
+        )
+        self.assertEqual(empty.returncode, 1)
+        self.assertEqual(json.loads(empty.stdout)["status"], "error")
 
 
 if __name__ == "__main__":
