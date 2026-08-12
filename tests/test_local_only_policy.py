@@ -132,15 +132,15 @@ class LocalOnlyPolicyTests(unittest.TestCase):
 
     def test_low_level_update_apis_enforce_local_only_policy(self):
         from scripts.agent_skill_updater import (
-            AgentSkillUpdate,
             AgentSkillUpdaterError,
+            RemoteObservation,
+            apply_observed_update,
             load_agent_skill_source,
             probe_git_worktree,
             refresh_skill_metadata_version,
             resolve_skill_update,
             stage_remote_skill,
             update_git_worktree_skill,
-            update_skill_from_staged,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -174,16 +174,14 @@ class LocalOnlyPolicyTests(unittest.TestCase):
                 lambda: probe_git_worktree(source),
                 lambda: update_git_worktree_skill(source),
                 lambda: refresh_skill_metadata_version(source, "a" * 40, "b" * 40),
-                lambda: update_skill_from_staged(
-                    AgentSkillUpdate(
-                        source=source,
-                        staged_dir=root / "incoming",
-                        status="update_available",
-                        installed_base_version="a" * 40,
-                        local_version="a" * 40,
-                        remote_version="b" * 40,
+                lambda: apply_observed_update(
+                    source,
+                    RemoteObservation.from_source(
+                        source,
+                        revision="b" * 40,
+                        version="b" * 40,
                     ),
-                    root / "backup",
+                    installed_base_version="a" * 40,
                 ),
             ):
                 with self.assertRaisesRegex(AgentSkillUpdaterError, "local-only"):

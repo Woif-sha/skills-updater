@@ -369,9 +369,8 @@ def _apply_transaction_outcome(
         item["diagnostic_journal"] = str(outcome.diagnostic_journal)
     if outcome.cleanup_residue is not None:
         item["cleanup_residue"] = str(outcome.cleanup_residue)
-    intervention_record = getattr(outcome, "intervention_record", None)
-    if intervention_record is not None:
-        item["intervention_record"] = str(intervention_record)
+    if outcome.intervention_record is not None:
+        item["intervention_record"] = str(outcome.intervention_record)
 
 
 def _require_probe_observation(
