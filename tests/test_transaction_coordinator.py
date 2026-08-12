@@ -13,7 +13,7 @@ from unittest import mock
 def _prepared_payload(updater, skill_dir: Path, expected_dir: Path, base: str, observation):
     local_dir = expected_dir.parent / "prepared-local"
     updater._copy_directory_contents(skill_dir, local_dir)
-    return updater.PreparedPayload(
+    return updater._PreparedPayload(
         expected_dir,
         updater.directory_signature(expected_dir),
         updater.directory_signature(local_dir),
@@ -34,7 +34,7 @@ def _conflict_payload(updater, root: Path, skill_dir: Path, base: str, observati
         directory = materials / name
         directory.mkdir(parents=True)
         (directory / "SKILL.md").write_text(content, encoding="utf-8")
-    return updater.PreparedPayload(
+    return updater._PreparedPayload(
         None,
         None,
         updater.directory_signature(skill_dir),
@@ -48,6 +48,20 @@ def _conflict_payload(updater, root: Path, skill_dir: Path, base: str, observati
         conflict_dir=materials / "conflicts",
         conflicts=("SKILL.md",),
         workspace_root=materials,
+    )
+
+
+def _prepared_observation(
+    updater,
+    source,
+    observation,
+    prepared_payload,
+):
+    return updater._PreparedObservedUpdate(
+        source=source,
+        observation=observation,
+        installed_base_version=updater._read_installed_base_version(source),
+        snapshot_payload=prepared_payload,
     )
 
 
@@ -96,10 +110,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 revision=remote_revision,
                 version=remote_revision,
             )
-            update = updater.AgentSkillUpdate(
+            update = updater._ObservedUpdate(
                 source=source,
                 staged_dir=remote_dir,
-                status="update_available",
                 installed_base_version=base_revision,
                 local_version=base_revision,
                 remote_version=remote_revision,
@@ -107,13 +120,10 @@ class TransactionCoordinatorTests(unittest.TestCase):
             )
 
             with mock.patch.object(updater, "_stage_git_skill_at_ref", return_value=base_dir):
-                prepared = updater.prepare_snapshot_payload(update)
+                prepared = updater._prepare_snapshot_payload(update)
             workspace_root = prepared.workspace_root
-            outcome = updater.apply_observed_update(
-                source,
-                observation,
-                installed_base_version=base_revision,
-                prepared_payload=prepared,
+            outcome = updater._coordinate_prepared_update(
+                _prepared_observation(updater, source, observation, prepared)
             )
 
             merged = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
@@ -142,7 +152,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
             observation = updater.RemoteObservation.from_source(source, revision=remote, version=remote)
             prepared = _prepared_payload(updater, skill_dir, expected_dir, base, observation)
 
-            outcome = updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+            outcome = updater._coordinate_prepared_update(
+                _prepared_observation(updater, source, observation, prepared)
+            )
 
             self.assertEqual(outcome.installed_state, "committed")
             self.assertTrue(outcome.applied)
@@ -171,11 +183,8 @@ class TransactionCoordinatorTests(unittest.TestCase):
             observation = updater.RemoteObservation.from_source(source, revision=remote, version=remote)
             prepared = _prepared_payload(updater, skill_dir, expected_dir, base, observation)
 
-            outcome = updater.apply_observed_update(
-                source,
-                observation,
-                installed_base_version=base,
-                prepared_payload=prepared,
+            outcome = updater._coordinate_prepared_update(
+                _prepared_observation(updater, source, observation, prepared)
             )
 
             self.assertEqual(outcome.installed_state, "committed")
@@ -211,11 +220,8 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 "_remove_prepared_workspace",
                 side_effect=OSError("cleanup denied"),
             ):
-                outcome = updater.apply_observed_update(
-                    source,
-                    observation,
-                    installed_base_version=base,
-                    prepared_payload=prepared,
+                outcome = updater._coordinate_prepared_update(
+                    _prepared_observation(updater, source, observation, prepared)
                 )
 
             self.assertEqual(outcome.installed_state, "committed")
@@ -252,11 +258,8 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 updater.AgentSkillUpdaterError,
                 "Prepared Payload Remote Observation",
             ):
-                updater.apply_observed_update(
-                    source,
-                    applied_observation,
-                    installed_base_version=base,
-                    prepared_payload=prepared,
+                updater._coordinate_prepared_update(
+                    _prepared_observation(updater, source, applied_observation, prepared)
                 )
 
             self.assertEqual((skill_dir / "SKILL.md").read_text(encoding="utf-8"), "old\n")
@@ -281,11 +284,13 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 (directory / "SKILL.md").write_text(content, encoding="utf-8")
             source = updater.load_agent_skill_source(skill_dir)
             observation = updater.RemoteObservation.from_source(source, revision=remote, version=remote)
-            prepared = updater.PreparedPayload(None, None, updater.directory_signature(skill_dir), base, remote_observation=observation, base_signature=updater.directory_signature(materials/"base"), remote_signature=updater.directory_signature(materials/"remote"), base_dir=materials/"base", local_dir=materials/"local", remote_dir=materials/"remote", conflict_dir=materials/"conflicts", conflicts=("SKILL.md",))
+            prepared = updater._PreparedPayload(None, None, updater.directory_signature(skill_dir), base, remote_observation=observation, base_signature=updater.directory_signature(materials/"base"), remote_signature=updater.directory_signature(materials/"remote"), base_dir=materials/"base", local_dir=materials/"local", remote_dir=materials/"remote", conflict_dir=materials/"conflicts", conflicts=("SKILL.md",))
             interventions_root = root / "interventions"
 
             with mock.patch.object(updater, "get_interventions_dir", return_value=interventions_root):
-                outcome = updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                outcome = updater._coordinate_prepared_update(
+                    _prepared_observation(updater, source, observation, prepared)
+                )
 
             self.assertEqual(outcome.installed_state, "unchanged")
             self.assertFalse(outcome.applied)
@@ -331,7 +336,7 @@ class TransactionCoordinatorTests(unittest.TestCase):
                     conflict_root=conflict_dir,
                 )
 
-            prepared = updater.PreparedPayload(
+            prepared = updater._PreparedPayload(
                 payload_dir=None,
                 payload_signature=None,
                 original_signature=updater.directory_signature(local_dir),
@@ -405,7 +410,7 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 (directory / "SKILL.md").write_text(content, encoding="utf-8")
             source = updater.load_agent_skill_source(skill_dir)
             observation = updater.RemoteObservation.from_source(source, revision=remote, version=remote)
-            prepared = updater.PreparedPayload(None, None, updater.directory_signature(skill_dir), base, remote_observation=observation, base_signature=updater.directory_signature(materials/"base"), remote_signature=updater.directory_signature(materials/"remote"), base_dir=materials/"base", local_dir=materials/"local", remote_dir=materials/"remote", conflict_dir=materials/"conflicts", conflicts=("SKILL.md",), workspace_root=materials)
+            prepared = updater._PreparedPayload(None, None, updater.directory_signature(skill_dir), base, remote_observation=observation, base_signature=updater.directory_signature(materials/"base"), remote_signature=updater.directory_signature(materials/"remote"), base_dir=materials/"base", local_dir=materials/"local", remote_dir=materials/"remote", conflict_dir=materials/"conflicts", conflicts=("SKILL.md",), workspace_root=materials)
             interventions_root = root / "interventions"
             real_set_phase = updater._set_coordinator_phase
 
@@ -417,7 +422,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
             with mock.patch.object(updater, "get_interventions_dir", return_value=interventions_root):
                 with mock.patch.object(updater, "_set_coordinator_phase", side_effect=interrupt_before_promotion):
                     with self.assertRaises(KeyboardInterrupt):
-                        updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                        updater._coordinate_prepared_update(
+                            _prepared_observation(updater, source, observation, prepared)
+                        )
                 transaction = next(skill_dir.parent.glob(".demo.transaction-*"))
                 state = json.loads((transaction / "state.json").read_text(encoding="utf-8"))
                 self.assertEqual(state["transactionKind"], "snapshot-intervention")
@@ -456,7 +463,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
             with mock.patch.object(updater, "get_interventions_dir", return_value=interventions_root):
                 with mock.patch.object(updater, "_set_coordinator_phase", side_effect=interrupt_before_promotion):
                     with self.assertRaises(KeyboardInterrupt):
-                        updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                        updater._coordinate_prepared_update(
+                            _prepared_observation(updater, source, observation, prepared)
+                        )
                 transaction = next(skill_dir.parent.glob(".demo.transaction-*"))
                 (skill_dir / "SKILL.md").write_text("concurrent\n", encoding="utf-8")
                 outcomes = updater.recover_updates(skill_dir.parent)
@@ -485,22 +494,26 @@ class TransactionCoordinatorTests(unittest.TestCase):
             interventions_root = root / "interventions"
 
             with mock.patch.object(updater, "get_interventions_dir", return_value=interventions_root):
-                first = updater.apply_observed_update(
-                    source,
-                    observation,
-                    installed_base_version=base,
-                    prepared_payload=_conflict_payload(
-                        updater, root / "materials-one", skill_dir, base, observation, "local one\n"
-                    ),
+                first = updater._coordinate_prepared_update(
+                    _prepared_observation(
+                        updater,
+                        source,
+                        observation,
+                        _conflict_payload(
+                            updater, root / "materials-one", skill_dir, base, observation, "local one\n"
+                        ),
+                    )
                 )
                 skill_file.write_text("local two\n", encoding="utf-8")
-                second = updater.apply_observed_update(
-                    source,
-                    observation,
-                    installed_base_version=base,
-                    prepared_payload=_conflict_payload(
-                        updater, root / "materials-two", skill_dir, base, observation, "local two\n"
-                    ),
+                second = updater._coordinate_prepared_update(
+                    _prepared_observation(
+                        updater,
+                        source,
+                        observation,
+                        _conflict_payload(
+                            updater, root / "materials-two", skill_dir, base, observation, "local two\n"
+                        ),
+                    )
                 )
 
             self.assertNotEqual(first.intervention_record, second.intervention_record)
@@ -530,7 +543,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
             prepared = _prepared_payload(updater, skill_dir, expected_dir, base, observation)
             skill_file.write_text("concurrent\n", encoding="utf-8")
 
-            outcome = updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+            outcome = updater._coordinate_prepared_update(
+                _prepared_observation(updater, source, observation, prepared)
+            )
 
             self.assertEqual(outcome.installed_state, "unchanged")
             self.assertFalse(outcome.applied)
@@ -565,7 +580,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 return real_link(source_path, destination_path)
 
             with mock.patch.object(updater.os, "link", side_effect=fail_metadata_publication):
-                outcome = updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                outcome = updater._coordinate_prepared_update(
+                    _prepared_observation(updater, source, observation, prepared)
+                )
 
             self.assertEqual(outcome.installed_state, "rolled_back")
             self.assertFalse(outcome.applied)
@@ -606,7 +623,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 return real_copy(Path(source_path), Path(destination_path))
 
             with mock.patch.object(updater, "_copy_payload_file_exclusive", side_effect=fail_second_incoming):
-                outcome = updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                outcome = updater._coordinate_prepared_update(
+                    _prepared_observation(updater, source, observation, prepared)
+                )
 
             self.assertTrue(injected)
             self.assertEqual(outcome.installed_state, "rolled_back")
@@ -640,9 +659,13 @@ class TransactionCoordinatorTests(unittest.TestCase):
                     (skill_dir / "target.txt").write_text("concurrent unique data\n", encoding="utf-8")
 
             with mock.patch.object(updater, "_set_coordinator_phase", side_effect=inject_same_path_file):
-                outcome = updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                outcome = updater._coordinate_prepared_update(
+                    _prepared_observation(updater, source, observation, prepared)
+                )
 
             self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIsNotNone(outcome.intervention_record)
             self.assertEqual((skill_dir / "target.txt").read_text(encoding="utf-8"), "old target\n")
             recovery_files = list(skill_dir.parent.glob(".recovery-demo.transaction-*/target.txt"))
             self.assertEqual(len(recovery_files), 1)
@@ -674,7 +697,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 "_commit_transaction_metadata",
                 side_effect=PermissionError("injected metadata failure"),
             ):
-                outcome = updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                outcome = updater._coordinate_prepared_update(
+                    _prepared_observation(updater, source, observation, prepared)
+                )
 
             self.assertEqual(outcome.installed_state, "rolled_back")
             self.assertTrue((skill_dir / "node").is_file())
@@ -700,7 +725,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
             observation = updater.RemoteObservation.from_source(source, revision=remote, version=remote)
             prepared = _prepared_payload(updater, skill_dir, expected_dir, base, observation)
 
-            outcome = updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+            outcome = updater._coordinate_prepared_update(
+                _prepared_observation(updater, source, observation, prepared)
+            )
 
             self.assertEqual(outcome.installed_state, "committed")
             self.assertTrue((skill_dir / "empty").is_dir())
@@ -732,7 +759,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 return result
 
             with mock.patch.object(updater, "_commit_transaction_metadata", side_effect=add_git_control_after_metadata):
-                outcome = updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                outcome = updater._coordinate_prepared_update(
+                    _prepared_observation(updater, source, observation, prepared)
+                )
 
             self.assertEqual(outcome.installed_state, "rolled_back")
             self.assertEqual((skill_dir / "SKILL.md").read_text(encoding="utf-8"), "old\n")
@@ -767,10 +796,14 @@ class TransactionCoordinatorTests(unittest.TestCase):
                     injected = True
 
             with mock.patch.object(updater, "_set_coordinator_phase", side_effect=inject_concurrent_metadata):
-                outcome = updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                outcome = updater._coordinate_prepared_update(
+                    _prepared_observation(updater, source, observation, prepared)
+                )
 
             self.assertTrue(injected)
             self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIsNotNone(outcome.intervention_record)
             self.assertEqual((skill_dir / "SKILL.md").read_text(encoding="utf-8"), "old\n")
             self.assertEqual(metadata_path.read_bytes(), concurrent_metadata)
 
@@ -801,7 +834,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
 
             with mock.patch.object(updater, "_set_coordinator_phase", side_effect=interrupt_before_install):
                 with self.assertRaises(KeyboardInterrupt):
-                    updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                    updater._coordinate_prepared_update(
+                        _prepared_observation(updater, source, observation, prepared)
+                    )
 
             transaction = next(skills_root.glob(".demo.transaction-*"))
             state_path = transaction / "state.json"
@@ -847,7 +882,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
 
             with mock.patch.object(updater, "_commit_transaction_metadata", side_effect=KeyboardInterrupt()):
                 with self.assertRaises(KeyboardInterrupt):
-                    updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                    updater._coordinate_prepared_update(
+                        _prepared_observation(updater, source, observation, prepared)
+                    )
             transaction = next(skill_dir.parent.glob(".demo.transaction-*"))
             real_copy = updater._copy_payload_file_exclusive
             injected = False
@@ -865,6 +902,8 @@ class TransactionCoordinatorTests(unittest.TestCase):
 
             self.assertTrue(injected)
             self.assertEqual(first_outcome.installed_state, "uncertain")
+            self.assertEqual(first_outcome.action, "intervention_required")
+            self.assertIsNotNone(first_outcome.intervention_record)
             self.assertEqual(second_outcomes, [])
             self.assertEqual(
                 (skill_dir / "target.txt").read_text(encoding="utf-8"),
@@ -909,7 +948,9 @@ class TransactionCoordinatorTests(unittest.TestCase):
 
             with mock.patch.object(updater, "get_interventions_dir", return_value=interventions_root):
                 with mock.patch.object(updater, "_set_coordinator_phase", side_effect=corrupt_displaced_payload):
-                    outcome = updater.apply_observed_update(source, observation, installed_base_version=base, prepared_payload=prepared)
+                    outcome = updater._coordinate_prepared_update(
+                        _prepared_observation(updater, source, observation, prepared)
+                    )
 
             self.assertEqual(outcome.installed_state, "uncertain")
             self.assertEqual(outcome.action, "intervention_required")
@@ -1003,7 +1044,6 @@ class TransactionCoordinatorTests(unittest.TestCase):
                         updater.RemoteObservation.from_source(
                             source, revision="b" * 40, version="b" * 40
                         ),
-                        installed_base_version="a" * 40,
                     )
 
             self.assertEqual(list(skill_dir.parent.glob(".demo.transaction-*")), [])
@@ -1051,7 +1091,6 @@ class TransactionCoordinatorTests(unittest.TestCase):
                         updater.RemoteObservation.from_source(
                             source, revision="b" * 40, version="b" * 40
                         ),
-                        installed_base_version="a" * 40,
                     )
 
             self.assertEqual(list(skill_dir.parent.glob(".demo.transaction-*")), [])
@@ -1063,8 +1102,8 @@ class TransactionCoordinatorTests(unittest.TestCase):
             apply_observed_update,
         )
 
-        base = "a" * 40
         remote = "b" * 40
+        base = remote[:12]
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
             skill_dir = skills_root / "demo"
@@ -1099,7 +1138,6 @@ class TransactionCoordinatorTests(unittest.TestCase):
             outcome = apply_observed_update(
                 source,
                 RemoteObservation.from_source(source, revision=remote, version=remote),
-                installed_base_version=base,
             )
 
             self.assertEqual(outcome.status, "up_to_date")
@@ -1123,7 +1161,7 @@ class TransactionCoordinatorTests(unittest.TestCase):
             skill_dir = skills_root / "openspec-explore"
             skill_dir.mkdir(parents=True)
             (skill_dir / "SKILL.md").write_text(
-                "---\nname: openspec-explore\ngeneratedBy: 1.0.0\n---\n",
+                "---\nname: openspec-explore\ngeneratedBy: 2.0.0\n---\n",
                 encoding="utf-8",
             )
             metadata_path = skill_dir / ".openskills.json"
@@ -1155,7 +1193,6 @@ class TransactionCoordinatorTests(unittest.TestCase):
                             revision=revision,
                             version=version,
                         ),
-                        installed_base_version="1.0.0",
                     )
 
             transaction = next(skills_root.glob(".openspec-explore.transaction-*"))
@@ -1171,8 +1208,8 @@ class TransactionCoordinatorTests(unittest.TestCase):
     def test_metadata_publish_failure_returns_verified_rollback(self):
         import scripts.agent_skill_updater as updater
 
-        base = "a" * 40
         remote = "b" * 40
+        base = remote[:12]
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
             skill_dir = skills_root / "demo"
@@ -1219,7 +1256,6 @@ class TransactionCoordinatorTests(unittest.TestCase):
                     updater.RemoteObservation.from_source(
                         source, revision=remote, version=remote
                     ),
-                    installed_base_version=base,
                 )
 
             self.assertTrue(failed["value"])
@@ -1233,8 +1269,8 @@ class TransactionCoordinatorTests(unittest.TestCase):
     def test_recover_updates_decodes_metadata_v1_without_rewriting_it(self):
         from scripts.agent_skill_updater import recover_updates
 
-        base = "a" * 40
         remote = "b" * 40
+        base = remote[:12]
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
             skill_dir = skills_root / "demo"
@@ -1305,6 +1341,8 @@ class TransactionCoordinatorTests(unittest.TestCase):
             self.assertEqual(len(outcomes), 1)
             self.assertEqual(outcomes[0].status, "error")
             self.assertEqual(outcomes[0].installed_state, "uncertain")
+            self.assertEqual(outcomes[0].action, "intervention_required")
+            self.assertIsNotNone(outcomes[0].intervention_record)
             self.assertEqual(outcomes[0].diagnostic_journal, transaction)
             self.assertTrue(transaction.exists())
 
@@ -1323,19 +1361,18 @@ class TransactionCoordinatorTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaises(updater.AgentSkillRecoveryUncertainError) as error:
-                updater.recover_incomplete_skill_transactions(skills_root)
-
-            outcome = error.exception.outcome
+            outcome = updater.recover_updates(skills_root)[0]
             self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIsNotNone(outcome.intervention_record)
             self.assertEqual(outcome.diagnostic_journal, transaction)
             self.assertTrue(transaction.exists())
 
     def test_interrupted_metadata_transaction_uses_single_phase_envelope(self):
         import scripts.agent_skill_updater as updater
 
-        base = "a" * 40
         remote = "b" * 40
+        base = remote[:12]
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
             skill_dir = skills_root / "demo"
@@ -1382,7 +1419,6 @@ class TransactionCoordinatorTests(unittest.TestCase):
                         updater.RemoteObservation.from_source(
                             source, revision=remote, version=remote
                         ),
-                        installed_base_version=base,
                     )
 
             transactions = list(skills_root.glob(".demo.transaction-*"))
@@ -1450,14 +1486,16 @@ class TransactionCoordinatorTests(unittest.TestCase):
             outcome = updater.recover_updates(skills_root)[0]
 
             self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIsNotNone(outcome.intervention_record)
             self.assertEqual(outcome.diagnostic_journal, transaction)
             self.assertTrue(transaction.exists())
 
     def test_committed_recovery_cleanup_failure_remains_committed(self):
         import scripts.agent_skill_updater as updater
 
-        base = "a" * 40
         remote = "b" * 40
+        base = remote[:12]
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
             skill_dir = skills_root / "demo"
@@ -1505,7 +1543,6 @@ class TransactionCoordinatorTests(unittest.TestCase):
                         updater.RemoteObservation.from_source(
                             source, revision=remote, version=remote
                         ),
-                        installed_base_version=base,
                     )
             transaction = next(skills_root.glob(".demo.transaction-*"))
 
@@ -1613,24 +1650,16 @@ class TransactionCoordinatorTests(unittest.TestCase):
             "entries": {"demo": entry},
         }
         observation = mock.sentinel.remote_observation
-        resolved = mock.Mock(
-            status="update_available",
-            installed_base_version=base,
-            local_version=base,
-            remote_version=remote,
-            remote_observation=observation,
-        )
         output = io.StringIO()
 
         with mock.patch.object(sys, "argv", ["update_agent_skills.py", "--skill", "demo", "--json"]):
             with mock.patch.object(cli, "sync_registry", side_effect=[registry, registry]):
                 with mock.patch.object(cli, "update_registry_entries"):
                     with mock.patch.object(cli, "_probe_entry", return_value=cli.EntryProbe("update_available", base, remote, remote_observation=observation)):
-                        with mock.patch.object(cli, "resolve_skill_update", return_value=resolved):
-                            with mock.patch.object(cli, "prepare_snapshot_payload", side_effect=PermissionError("access denied")):
-                                with self.assertRaises(SystemExit) as exit_info:
-                                    with redirect_stdout(output):
-                                        cli.main()
+                        with mock.patch.object(cli, "apply_observed_update", side_effect=PermissionError("access denied")):
+                            with self.assertRaises(SystemExit) as exit_info:
+                                with redirect_stdout(output):
+                                    cli.main()
 
         self.assertEqual(exit_info.exception.code, 1)
         item = json.loads(output.getvalue())[0]

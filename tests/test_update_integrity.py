@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import scripts.agent_skill_updater as updater
+
 
 def run_git(repo: Path, *arguments: str) -> str:
     result = subprocess.run(
@@ -23,6 +25,38 @@ def run_git(repo: Path, *arguments: str) -> str:
     if result.returncode != 0:
         raise AssertionError(result.stderr or result.stdout)
     return result.stdout.strip()
+
+
+def _git_observation(source):
+    probe = updater.probe_git_worktree(source)
+    return updater.RemoteObservation.from_source(
+        source,
+        revision=probe.remote_version,
+        version=probe.remote_version,
+        git_identity=updater.GitIdentityEvidence(
+            local_revision=probe.local_version,
+            branch=probe.branch,
+            remote_ref=probe.remote_ref,
+        ),
+    )
+
+
+def _metadata_observation(source, remote_version: str):
+    return updater.RemoteObservation.from_source(
+        source,
+        revision=remote_version,
+        version=remote_version,
+    )
+
+
+def _publish_test_recovery_required(skill_name: str, diagnostic_journal: Path) -> Path:
+    from scripts.interventions import publish_recovery_required
+
+    return publish_recovery_required(
+        diagnostic_journal.parent.parent / "interventions",
+        skill_name,
+        diagnostic_journal,
+    )
 
 
 def stage_git_revision_payload(
@@ -60,6 +94,15 @@ def snapshot_metadata(installed_base: str = "a" * 40, **extra) -> dict:
 
 
 class PayloadIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(
+            updater,
+            "_promote_recovery_required",
+            side_effect=_publish_test_recovery_required,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_signature_records_cannot_collide_through_newline_paths(self):
         import scripts.agent_skill_updater as updater
 
@@ -187,6 +230,13 @@ class PayloadIntegrityTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "skills"
+            intervention_patcher = mock.patch.object(
+                updater,
+                "get_interventions_dir",
+                return_value=root.parent / "interventions",
+            )
+            intervention_patcher.start()
+            self.addCleanup(intervention_patcher.stop)
             local = root / "demo"
             transaction = root / ".demo.update-interrupted"
             original = transaction / "original"
@@ -250,8 +300,15 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater.os.replace",
                 side_effect=interrupt_first_recovery,
             ):
-                with self.assertRaisesRegex(PermissionError, "interrupted rollback"):
+                with self.assertRaisesRegex(
+                    updater.AgentSkillRecoveryUncertainError,
+                    "interrupted rollback",
+                ) as interrupted:
                     sync_registry(root)
+
+            self.assertEqual(interrupted.exception.outcome.action, "intervention_required")
+            self.assertIsNotNone(interrupted.exception.outcome.intervention_record)
+            shutil.rmtree(interrupted.exception.outcome.intervention_record)
 
             self.assertTrue(transaction.exists())
             self.assertTrue(failed_once["value"])
@@ -261,8 +318,13 @@ class PayloadIntegrityTests(unittest.TestCase):
                 (recovery_root / "user.txt").read_text(encoding="utf-8"),
                 "concurrent user data\n",
             )
-            with self.assertRaisesRegex(AgentSkillUpdaterError, "preserved at"):
+            with self.assertRaisesRegex(
+                updater.AgentSkillRecoveryUncertainError,
+                "preserved at",
+            ) as preserved:
                 sync_registry(root)
+            self.assertEqual(preserved.exception.outcome.action, "intervention_required")
+            self.assertIsNotNone(preserved.exception.outcome.intervention_record)
             self.assertEqual(
                 (recovery_root / "user.txt").read_text(encoding="utf-8"),
                 "concurrent user data\n",
@@ -274,7 +336,7 @@ class PayloadIntegrityTests(unittest.TestCase):
             self.assertTrue((local / "node").is_file())
             self.assertEqual((local / "node").read_text(encoding="utf-8"), "old file\n")
             self.assertEqual((local / ".openskills.json").read_bytes(), original_metadata)
-            self.assertFalse(transaction.exists())
+            self.assertTrue(transaction.exists())
 
     def test_same_skill_update_lock_rejects_a_second_writer(self):
         from scripts.agent_skill_updater import AgentSkillUpdaterError, skill_update_lock
@@ -355,12 +417,12 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._is_filesystem_link",
                 side_effect=mark_recovery_root_unsafe,
             ):
-                with self.assertRaisesRegex(
-                    updater.AgentSkillUpdaterError,
-                    "Recovery directory is unsafe",
-                ):
-                    updater.recover_incomplete_skill_transactions(root)
+                outcomes = updater.recover_updates(root)
 
+            outcome = next(item for item in outcomes if item.diagnostic_journal == transaction)
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIn("Recovery directory is unsafe", outcome.error_message)
             self.assertTrue(transaction.is_dir())
 
     def test_payload_recovery_rejects_nested_directory_link(self):
@@ -424,12 +486,11 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._is_filesystem_link",
                 side_effect=mark_transaction_unsafe,
             ):
-                with self.assertRaisesRegex(
-                    updater.AgentSkillUpdaterError,
-                    "Transaction root must not be a symlink or junction",
-                ):
-                    updater.recover_incomplete_skill_transactions(root)
+                outcome = updater.recover_updates(root)[0]
 
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIn("Transaction root must not be a symlink or junction", outcome.error_message)
             self.assertEqual((local / "SKILL.md").read_bytes(), before)
 
     def test_failed_transaction_directory_link_is_rejected_before_payload_move(self):
@@ -475,12 +536,11 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._is_filesystem_link",
                 side_effect=mark_failed_unsafe,
             ):
-                with self.assertRaisesRegex(
-                    updater.AgentSkillUpdaterError,
-                    "Transaction directory is unsafe",
-                ):
-                    updater.recover_incomplete_skill_transactions(root)
+                outcome = updater.recover_updates(root)[0]
 
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIn("Transaction directory is unsafe", outcome.error_message)
             self.assertEqual(updater.directory_signature(local), before)
 
     def test_nested_recovery_link_is_rejected_before_payload_move(self):
@@ -528,17 +588,16 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._is_filesystem_link",
                 side_effect=mark_nested_unsafe,
             ):
-                with self.assertRaisesRegex(
-                    updater.AgentSkillUpdaterError,
-                    "Recovery destination is unsafe",
-                ):
-                    updater.recover_incomplete_skill_transactions(root)
+                outcome = updater.recover_updates(root)[0]
 
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIn("Recovery destination is unsafe", outcome.error_message)
             self.assertEqual(updater.directory_signature(local), before)
             self.assertFalse(any((transaction / "failed").glob("attempt-*")))
 
     def test_missing_transaction_state_fails_closed_and_preserves_snapshot(self):
-        from scripts.agent_skill_updater import AgentSkillUpdaterError, recover_incomplete_skill_transactions
+        from scripts.agent_skill_updater import AgentSkillUpdaterError
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "skills"
@@ -551,9 +610,12 @@ class PayloadIntegrityTests(unittest.TestCase):
             (original / "SKILL.md").write_text("recoverable\n", encoding="utf-8")
             (transaction / ".skills-updater-transaction").write_text("1\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(AgentSkillUpdaterError, "state is missing"):
-                recover_incomplete_skill_transactions(root)
+            outcome = updater.recover_updates(root)[0]
 
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIsNotNone(outcome.intervention_record)
+            self.assertIn("state.json", outcome.error_message)
             self.assertTrue(transaction.exists())
             self.assertEqual(
                 (original / "SKILL.md").read_text(encoding="utf-8"),
@@ -565,7 +627,6 @@ class PayloadIntegrityTests(unittest.TestCase):
         from scripts.agent_skill_updater import (
             AgentSkillUpdaterError,
             directory_signature,
-            recover_incomplete_skill_transactions,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -592,16 +653,17 @@ class PayloadIntegrityTests(unittest.TestCase):
             }
             (transaction / "state.json").write_text(json.dumps(state), encoding="utf-8")
 
-            with self.assertRaisesRegex(AgentSkillUpdaterError, "Invalid update transaction state"):
-                recover_incomplete_skill_transactions(root)
+            outcome = updater.recover_updates(root)[0]
 
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIn("Invalid update transaction state", outcome.error_message)
             self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "unchanged\n")
             self.assertTrue(transaction.is_dir())
 
     def test_committed_recovery_preserves_safe_concurrent_metadata_before_cleanup(self):
         from scripts.agent_skill_updater import (
             directory_signature,
-            recover_incomplete_skill_transactions,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -633,7 +695,7 @@ class PayloadIntegrityTests(unittest.TestCase):
             }
             (transaction / "state.json").write_text(json.dumps(state), encoding="utf-8")
 
-            recover_incomplete_skill_transactions(root)
+            updater.recover_updates(root)
 
             self.assertEqual((local / ".openskills.json").read_bytes(), old_metadata)
             self.assertFalse(transaction.exists())
@@ -868,10 +930,9 @@ class PayloadIntegrityTests(unittest.TestCase):
                                 intervention_record=None,
                             ),
                         ) as apply_observed:
-                            with mock.patch("scripts.update_agent_skills.resolve_skill_update") as resolve:
-                                with self.assertRaises(SystemExit) as exit_info:
-                                    with redirect_stdout(stdout):
-                                        updater.main()
+                            with self.assertRaises(SystemExit) as exit_info:
+                                with redirect_stdout(stdout):
+                                    updater.main()
 
         self.assertEqual(exit_info.exception.code, 0)
         payload = json.loads(stdout.getvalue())
@@ -880,13 +941,12 @@ class PayloadIntegrityTests(unittest.TestCase):
         self.assertEqual(payload[0]["local_version"], full_sha)
         self.assertEqual(payload[0]["installed_state"], "committed")
         apply_observed.assert_called_once()
-        resolve.assert_not_called()
 
     def test_snapshot_metadata_refresh_preserves_concurrent_local_only_write(self):
         import scripts.agent_skill_updater as updater
 
-        base = "a" * 40
         remote = "b" * 40
+        base = remote[:12]
         with tempfile.TemporaryDirectory() as temp_dir:
             skill_dir = Path(temp_dir) / "demo"
             skill_dir.mkdir()
@@ -930,10 +990,13 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._set_coordinator_phase",
                 side_effect=inject_concurrent_write,
             ):
-                with self.assertRaisesRegex(updater.AgentSkillUpdaterError, "Concurrent write"):
-                    updater.refresh_skill_metadata_version(source, base, remote)
+                outcome = updater.apply_observed_update(
+                    source, _metadata_observation(source, remote)
+                )
 
             self.assertTrue(injected["value"])
+            self.assertEqual(outcome.status, "error")
+            self.assertIn("Concurrent write", outcome.error_message)
             self.assertEqual(metadata_path.read_bytes(), concurrent)
 
     def test_metadata_transaction_recovers_crash_between_capture_and_publish(self):
@@ -991,7 +1054,7 @@ class PayloadIntegrityTests(unittest.TestCase):
             (transaction / ".skills-updater-transaction").write_text("1\n", encoding="utf-8")
 
             self.assertFalse(metadata_path.exists())
-            updater.recover_incomplete_skill_transactions(skills_root)
+            updater.recover_updates(skills_root)
 
             self.assertEqual(metadata_path.read_bytes(), original)
             self.assertFalse(transaction.exists())
@@ -999,8 +1062,8 @@ class PayloadIntegrityTests(unittest.TestCase):
     def test_metadata_refresh_cleanup_error_reports_committed_state(self):
         import scripts.agent_skill_updater as updater
 
-        base = "a" * 40
         remote = "b" * 40
+        base = remote[:12]
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
             skill_dir = skills_root / "demo"
@@ -1036,26 +1099,28 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._remove_transaction_tree",
                 side_effect=updater.AgentSkillUpdaterError("cleanup interrupted"),
             ):
-                with self.assertRaises(updater.AgentSkillUpdateCommittedError) as error:
-                    updater.refresh_skill_metadata_version(source, base, remote)
+                outcome = updater.apply_observed_update(
+                    source, _metadata_observation(source, remote)
+                )
 
-            self.assertEqual(error.exception.action, "metadata_refreshed")
-            self.assertEqual(error.exception.version, remote)
+            self.assertEqual(outcome.installed_state, "committed")
+            self.assertEqual(outcome.action, "metadata_refreshed")
+            self.assertEqual(outcome.version, remote)
             self.assertEqual(
                 json.loads(metadata_path.read_text(encoding="utf-8"))["installedBaseVersion"],
                 remote,
             )
             transactions = list(skills_root.glob(".demo.transaction-*"))
             self.assertEqual(len(transactions), 1)
-            updater.recover_incomplete_skill_transactions(skills_root)
+            updater.recover_updates(skills_root)
             self.assertFalse(transactions[0].exists())
 
 
     def test_metadata_publish_link_failure_restores_original_and_cleans_journal(self):
         import scripts.agent_skill_updater as updater
 
-        base = "a" * 40
         remote = "b" * 40
+        base = remote[:12]
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
             skill_dir = skills_root / "demo"
@@ -1111,13 +1176,13 @@ class PayloadIntegrityTests(unittest.TestCase):
                     "scripts.agent_skill_updater._set_coordinator_phase",
                     side_effect=record_phase,
                 ):
-                    with self.assertRaisesRegex(
-                        updater.AgentSkillUpdaterError,
-                        "injected publish failure",
-                    ):
-                        updater.refresh_skill_metadata_version(source, base, remote)
+                    outcome = updater.apply_observed_update(
+                        source, _metadata_observation(source, remote)
+                    )
 
             self.assertTrue(injected["value"])
+            self.assertEqual(outcome.status, "error")
+            self.assertIn("injected publish failure", outcome.error_message)
             self.assertIn(updater.COORDINATOR_PHASE_METADATA_PUBLISH_FAILED, phases)
             self.assertEqual(metadata_path.read_bytes(), original)
             self.assertEqual(list(skills_root.glob(".demo.transaction-*")), [])
@@ -1125,8 +1190,8 @@ class PayloadIntegrityTests(unittest.TestCase):
     def test_metadata_rollback_read_failure_is_recovered_from_existing_capture(self):
         import scripts.agent_skill_updater as updater
 
-        base = "a" * 40
         remote = "b" * 40
+        base = remote[:12]
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_root = Path(temp_dir) / "skills"
             skill_dir = skills_root / "demo"
@@ -1180,19 +1245,21 @@ class PayloadIntegrityTests(unittest.TestCase):
                     autospec=True,
                     side_effect=interrupt_first_rollback_capture_read,
                 ):
-                    with self.assertRaisesRegex(
-                        updater.AgentSkillUpdaterError,
-                        "Rollback also failed",
-                    ):
-                        updater.refresh_skill_metadata_version(source, base, remote)
+                    outcome = updater.apply_observed_update(
+                        source, _metadata_observation(source, remote)
+                    )
 
             self.assertTrue(injected["value"])
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIsNotNone(outcome.intervention_record)
+            self.assertIn("Rollback also failed", outcome.error_message)
             self.assertFalse(metadata_path.exists())
             transactions = list(skills_root.glob(".demo.transaction-*"))
             self.assertEqual(len(transactions), 1)
             self.assertEqual(len(list(transactions[0].glob("metadata.rollback-*"))), 1)
 
-            updater.recover_incomplete_skill_transactions(skills_root)
+            updater.recover_updates(skills_root)
 
             self.assertEqual(metadata_path.read_bytes(), original)
             self.assertFalse(transactions[0].exists())
@@ -1465,7 +1532,7 @@ class PayloadIntegrityTests(unittest.TestCase):
         from scripts.agent_skill_updater import (
             AgentSkillSource,
             RemoteObservation,
-            resolve_skill_update,
+            _resolve_snapshot_update,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1504,13 +1571,14 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._stage_git_skill_at_ref",
                 return_value=remote,
             ) as stage:
-                result = resolve_skill_update(
+                result = _resolve_snapshot_update(
                     source,
                     root / "stage",
                     observation,
+                    snapshot_metadata()["installedBaseVersion"],
+                    snapshot_metadata()["installedBaseVersion"],
                 )
 
-            self.assertEqual(result.status, "update_available")
             self.assertEqual(result.remote_version, remote_sha)
             stage.assert_called_once_with(source, root / "stage", remote_sha)
 
@@ -1669,6 +1737,15 @@ class PayloadIntegrityTests(unittest.TestCase):
 
 
 class GitWorktreeIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(
+            updater,
+            "_promote_recovery_required",
+            side_effect=_publish_test_recovery_required,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def create_remote_and_clone(self, root: Path) -> tuple[Path, Path, Path, str]:
         remote = root / "remote.git"
         subprocess.run(
@@ -1826,7 +1903,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                     updater.AgentSkillUpdaterError,
                     "updatePolicy changed",
                 ):
-                    updater.update_git_worktree_skill(source)
+                    updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(metadata_path.read_bytes(), concurrent_bytes)
 
@@ -1850,8 +1927,6 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(metadata["installedBaseVersion"], version_a)
 
     def test_equal_head_with_stale_base_only_refreshes_metadata(self):
-        from scripts.agent_skill_updater import update_git_worktree_skill
-
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             remote, seed, local, version_a = self.create_remote_and_clone(root)
@@ -1859,8 +1934,9 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             run_git(local, "pull", "--ff-only")
             metadata_path = self.write_metadata(local, remote, version_a)
             skill_bytes = (local / "SKILL.md").read_bytes()
+            source = self.source_for(local, metadata_path)
 
-            result = update_git_worktree_skill(self.source_for(local, metadata_path))
+            result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(result.action, "metadata_refreshed")
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
@@ -1870,14 +1946,13 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertNotIn("sourceCommitSha", metadata)
 
     def test_equal_head_expands_short_installed_base_to_full_sha(self):
-        from scripts.agent_skill_updater import update_git_worktree_skill
-
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             remote, _, local, version = self.create_remote_and_clone(root)
             metadata_path = self.write_metadata(local, remote, version[:12])
+            source = self.source_for(local, metadata_path)
 
-            result = update_git_worktree_skill(self.source_for(local, metadata_path))
+            result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(result.action, "metadata_refreshed")
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1905,11 +1980,13 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._set_coordinator_phase",
                 side_effect=inject_concurrent_write,
             ):
-                result = updater.update_git_worktree_skill(source)
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertTrue(injected["value"])
             self.assertEqual(result.status, "error")
             self.assertEqual(result.installed_state, "uncertain")
+            self.assertEqual(result.action, "intervention_required")
+            self.assertIsNotNone(result.intervention_record)
             self.assertIn("Concurrent write", result.error_message)
             self.assertIsNotNone(result.diagnostic_journal)
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version)
@@ -1922,6 +1999,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             root = Path(temp_dir)
             remote, _, local, version = self.create_remote_and_clone(root)
             metadata_path = self.write_metadata(local, remote, version[:12])
+            source = self.source_for(local, metadata_path)
             original_metadata = metadata_path.read_bytes()
             changed_origin = str(root / "other.git")
             real_commit = updater._commit_transaction_metadata
@@ -1934,9 +2012,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._commit_transaction_metadata",
                 side_effect=change_origin_after_publish,
             ):
-                result = updater.update_git_worktree_skill(
-                    self.source_for(local, metadata_path)
-                )
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(result.status, "error")
             self.assertEqual(result.installed_state, "rolled_back")
@@ -1947,16 +2023,15 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
 
     def test_clean_behind_fast_forwards_without_damaging_repository(self):
-        from scripts.agent_skill_updater import update_git_worktree_skill
-
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             remote, seed, local, version_a = self.create_remote_and_clone(root)
             version_b = self.advance_remote(seed)
             metadata_path = self.write_metadata(local, remote, version_a)
+            source = self.source_for(local, metadata_path)
             origin_before = run_git(local, "config", "--get", "remote.origin.url")
 
-            result = update_git_worktree_skill(self.source_for(local, metadata_path))
+            result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(result.action, "fast_forwarded")
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
@@ -1972,6 +2047,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             remote, seed, local, version_a = self.create_remote_and_clone(root)
             version_b = self.advance_remote(seed)
             metadata_path = self.write_metadata(local, remote, version_a)
+            source = self.source_for(local, metadata_path)
             original_metadata = metadata_path.read_bytes()
             real_set_phase = updater._set_coordinator_phase
 
@@ -1985,9 +2061,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 side_effect=interrupt_at_payload_intent,
             ):
                 with self.assertRaises(KeyboardInterrupt):
-                    updater.update_git_worktree_skill(
-                        self.source_for(local, metadata_path)
-                    )
+                    updater.apply_observed_update(source, _git_observation(source))
 
             transaction = next(local.parent.glob(".demo.transaction-*"))
             state = json.loads((transaction / "state.json").read_text(encoding="utf-8"))
@@ -2034,14 +2108,13 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             remote, seed, local, version_a = self.create_remote_and_clone(root)
             version_b = self.advance_remote(seed)
             metadata_path = self.write_metadata(local, remote, version_a)
+            source = self.source_for(local, metadata_path)
 
             with mock.patch(
                 "scripts.agent_skill_updater._remove_transaction_tree",
                 side_effect=updater.AgentSkillUpdaterError("cleanup failed"),
             ):
-                result = updater.update_git_worktree_skill(
-                    self.source_for(local, metadata_path)
-                )
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(result.status, "error")
             self.assertEqual(result.installed_state, "committed")
@@ -2061,6 +2134,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             remote, seed, local, version_a = self.create_remote_and_clone(root)
             version_b = self.advance_remote(seed)
             metadata_path = self.write_metadata(local, remote, version_a)
+            source = self.source_for(local, metadata_path)
             real_remove = updater._remove_transaction_tree
             failed = {"value": False}
 
@@ -2076,9 +2150,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._remove_transaction_tree",
                 side_effect=remove_metadata_evidence_then_fail,
             ):
-                result = updater.update_git_worktree_skill(
-                    self.source_for(local, metadata_path)
-                )
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             transaction = next(local.parent.glob(".demo.transaction-*"))
             self.assertEqual(result.installed_state, "committed")
@@ -2100,6 +2172,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             remote, seed, local, version_a = self.create_remote_and_clone(root)
             version_b = self.advance_remote(seed)
             metadata_path = self.write_metadata(local, remote, version_a)
+            source = self.source_for(local, metadata_path)
             real_cleanup = updater._cleanup_git_transaction
             changed_ref = {"value": None}
 
@@ -2119,9 +2192,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._cleanup_git_transaction",
                 side_effect=change_original_temporary_ref,
             ):
-                result = updater.update_git_worktree_skill(
-                    self.source_for(local, metadata_path)
-                )
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             transaction = next(local.parent.glob(".demo.transaction-*"))
             self.assertEqual(result.installed_state, "committed")
@@ -2144,6 +2215,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             remote, seed, local, version_a = self.create_remote_and_clone(root)
             version_b = self.advance_remote(seed)
             metadata_path = self.write_metadata(local, remote, version_a)
+            source = self.source_for(local, metadata_path)
             real_set_phase = updater._set_coordinator_phase
 
             def interrupt_at_payload_intent(transaction_root, state, phase):
@@ -2156,9 +2228,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 side_effect=interrupt_at_payload_intent,
             ):
                 with self.assertRaises(KeyboardInterrupt):
-                    updater.update_git_worktree_skill(
-                        self.source_for(local, metadata_path)
-                    )
+                    updater.apply_observed_update(source, _git_observation(source))
 
             transaction = next(local.parent.glob(".demo.transaction-*"))
             state = updater._read_coordinator_transaction_state(
@@ -2187,6 +2257,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             remote, seed, local, version_a = self.create_remote_and_clone(root)
             self.advance_remote(seed)
             metadata_path = self.write_metadata(local, remote, version_a)
+            source = self.source_for(local, metadata_path)
             real_set_phase = updater._set_coordinator_phase
 
             def interrupt_at_payload_intent(transaction_root, state, phase):
@@ -2199,9 +2270,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 side_effect=interrupt_at_payload_intent,
             ):
                 with self.assertRaises(KeyboardInterrupt):
-                    updater.update_git_worktree_skill(
-                        self.source_for(local, metadata_path)
-                    )
+                    updater.apply_observed_update(source, _git_observation(source))
 
             transaction = next(local.parent.glob(".demo.transaction-*"))
             state_path = transaction / "state.json"
@@ -2212,6 +2281,8 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             outcome = updater.recover_updates(local.parent)[0]
 
             self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIsNotNone(outcome.intervention_record)
             self.assertEqual(outcome.diagnostic_journal, transaction)
             self.assertTrue(transaction.exists())
 
@@ -2223,6 +2294,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             remote, seed, local, version_a = self.create_remote_and_clone(root)
             version_b = self.advance_remote(seed)
             metadata_path = self.write_metadata(local, remote, version_a)
+            source = self.source_for(local, metadata_path)
             real_set_phase = updater._set_coordinator_phase
 
             def interrupt_at_payload_intent(transaction_root, state, phase):
@@ -2235,9 +2307,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 side_effect=interrupt_at_payload_intent,
             ):
                 with self.assertRaises(KeyboardInterrupt):
-                    updater.update_git_worktree_skill(
-                        self.source_for(local, metadata_path)
-                    )
+                    updater.apply_observed_update(source, _git_observation(source))
 
             transaction = next(local.parent.glob(".demo.transaction-*"))
             state_path = transaction / "state.json"
@@ -2255,14 +2325,14 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             outcome = updater.recover_updates(local.parent)[0]
 
             self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertEqual(outcome.action, "intervention_required")
+            self.assertIsNotNone(outcome.intervention_record)
             self.assertEqual(outcome.diagnostic_journal, transaction)
             self.assertTrue(transaction.exists())
             self.assertEqual(run_git(local, "rev-parse", foreign_refs["original"]), version_a)
             self.assertEqual(run_git(local, "rev-parse", foreign_refs["expected"]), version_b)
 
     def test_skill_pack_uses_the_transactional_git_worktree_engine(self):
-        from scripts.agent_skill_updater import update_git_worktree_skill
-
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             _, seed, local, version_a = self.create_pack_remote_and_clone(root)
@@ -2274,7 +2344,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             version_b = run_git(seed, "rev-parse", "HEAD")
             source = self.pack_source_for(local)
 
-            result = update_git_worktree_skill(source)
+            result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(result.action, "fast_forwarded")
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
@@ -2307,7 +2377,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._commit_transaction_metadata",
                 side_effect=PermissionError("pack metadata failure"),
             ):
-                result = updater.update_git_worktree_skill(source)
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(result.status, "error")
             self.assertEqual(result.installed_state, "rolled_back")
@@ -2320,7 +2390,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(list(local.parent.glob(".demo-pack.transaction-*")), [])
 
     def test_skill_pack_remote_without_skills_directory_is_rejected_before_apply(self):
-        from scripts.agent_skill_updater import AgentSkillUpdaterError, update_git_worktree_skill
+        from scripts.agent_skill_updater import AgentSkillUpdaterError
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2333,7 +2403,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             metadata_before = (local / ".openskills.json").read_bytes()
 
             with self.assertRaisesRegex(AgentSkillUpdaterError, "required skills tree"):
-                update_git_worktree_skill(source)
+                updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
             self.assertTrue((local / "skills" / "demo" / "SKILL.md").is_file())
@@ -2347,6 +2417,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             remote, seed, local, version_a = self.create_remote_and_clone(root)
             version_b = self.advance_remote(seed)
             metadata_path = self.write_metadata(local, remote, version_a)
+            source = self.source_for(local, metadata_path)
             run_git(local, "branch", "topic", version_a)
             original_metadata = metadata_path.read_bytes()
             real_compare_and_swap = updater._git_compare_and_swap_ref
@@ -2367,9 +2438,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._git_compare_and_swap_ref",
                 side_effect=switch_branch_after_forward_cas,
             ):
-                result = updater.update_git_worktree_skill(
-                    self.source_for(local, metadata_path)
-                )
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertTrue(switched["value"])
             self.assertEqual(result.status, "error")
@@ -2382,7 +2451,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
 
     def test_dirty_behind_refuses_pull_and_preserves_head(self):
-        from scripts.agent_skill_updater import AgentSkillUpdaterError, probe_git_worktree, update_git_worktree_skill
+        from scripts.agent_skill_updater import AgentSkillUpdaterError, probe_git_worktree
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2395,14 +2464,15 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             probe = probe_git_worktree(source)
             self.assertEqual(probe.relation, "behind")
             self.assertTrue(probe.working_tree_dirty)
-            with self.assertRaisesRegex(AgentSkillUpdaterError, "payload changes"):
-                update_git_worktree_skill(source)
+            result = updater.apply_observed_update(source, _git_observation(source))
+            self.assertEqual(result.status, "error")
+            self.assertIn("refusing automatic fast-forward", result.error_message)
 
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
             self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "local dirty change\n")
 
     def test_ignored_path_that_remote_will_track_blocks_fast_forward(self):
-        from scripts.agent_skill_updater import AgentSkillUpdaterError, probe_git_worktree, update_git_worktree_skill
+        from scripts.agent_skill_updater import AgentSkillUpdaterError, probe_git_worktree
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2421,15 +2491,14 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(probe.relation, "behind")
             self.assertTrue(probe.working_tree_dirty)
             self.assertEqual(probe.ignored_conflicts, ("ignored.txt",))
-            with self.assertRaisesRegex(AgentSkillUpdaterError, "Ignored paths would be overwritten"):
-                update_git_worktree_skill(source)
+            result = updater.apply_observed_update(source, _git_observation(source))
+            self.assertEqual(result.status, "error")
+            self.assertIn("Ignored paths would be overwritten", result.error_message)
 
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
             self.assertEqual(ignored_path.read_text(encoding="utf-8"), "local secret\n")
 
     def test_ignored_payload_becoming_untracked_is_preserved_during_fast_forward(self):
-        from scripts.agent_skill_updater import update_git_worktree_skill
-
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             remote, seed, local, _ = self.create_remote_and_clone(root)
@@ -2448,13 +2517,14 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             run_git(seed, "commit", "-m", "stop ignoring local secret")
             run_git(seed, "push", "origin", "main")
             version_b = run_git(seed, "rev-parse", "HEAD")
+            source = self.source_for(local, metadata_path)
 
-            result = update_git_worktree_skill(self.source_for(local, metadata_path))
+            result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(result.status, "up_to_date")
             self.assertEqual(result.installed_state, "committed")
             self.assertEqual(result.action, "fast_forwarded")
-            self.assertTrue(result.working_tree_dirty)
+            self.assertTrue(updater._git_worktree_has_payload_changes(local))
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
             self.assertEqual(secret.read_text(encoding="utf-8"), "preserve me\n")
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -2462,7 +2532,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(list(local.parent.glob(".demo.transaction-*")), [])
 
     def test_ahead_is_safe_and_diverged_fails_closed(self):
-        from scripts.agent_skill_updater import AgentSkillUpdaterError, probe_git_worktree, update_git_worktree_skill
+        from scripts.agent_skill_updater import AgentSkillUpdaterError, probe_git_worktree
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2483,8 +2553,10 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             diverged = probe_git_worktree(source)
             self.assertEqual(diverged.relation, "diverged")
             self.assertEqual(diverged.status, "error")
-            with self.assertRaisesRegex(AgentSkillUpdaterError, "diverged"):
-                update_git_worktree_skill(source)
+            outcome = updater.apply_observed_update(source, _git_observation(source))
+            self.assertEqual(outcome.status, "error")
+            self.assertEqual(outcome.installed_state, "unchanged")
+            self.assertIn("diverged", outcome.error_message)
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), local_head)
 
     def test_detached_head_and_untracked_topic_branch_fail_closed(self):
@@ -2507,8 +2579,6 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
 
     def test_metadata_failure_after_fast_forward_restores_head_and_metadata(self):
-        from scripts.agent_skill_updater import update_git_worktree_skill
-
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             remote, seed, local, version_a = self.create_remote_and_clone(root)
@@ -2526,7 +2596,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._commit_transaction_metadata",
                 side_effect=fail_metadata_write,
             ):
-                result = update_git_worktree_skill(source)
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(result.status, "error")
             self.assertEqual(result.installed_state, "rolled_back")
@@ -2564,7 +2634,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._verify_git_source_configuration",
                 side_effect=change_origin_after_metadata_publish,
             ):
-                result = updater.update_git_worktree_skill(source)
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertTrue(injected["value"])
             self.assertEqual(result.status, "error")
@@ -2686,8 +2756,8 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
         from scripts.agent_skill_updater import (
             AgentSkillSource,
             AgentSkillUpdaterError,
+            _resolve_snapshot_update,
             probe_git_worktree,
-            resolve_skill_update,
         )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2721,8 +2791,18 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             with self.assertRaises(AgentSkillUpdaterError):
                 probe_git_worktree(source)
             with mock.patch("scripts.agent_skill_updater.stage_remote_skill") as stage:
-                with self.assertRaisesRegex(AgentSkillUpdaterError, "dedicated Git update path"):
-                    resolve_skill_update(source, Path(temp_dir) / "stage")
+                with self.assertRaisesRegex(AgentSkillUpdaterError, "became a Git worktree"):
+                    _resolve_snapshot_update(
+                        source,
+                        Path(temp_dir) / "stage",
+                        updater.RemoteObservation.from_source(
+                            source,
+                            revision="b" * 40,
+                            version="b" * 40,
+                        ),
+                        "a" * 40,
+                        "a" * 40,
+                    )
             stage.assert_not_called()
 
     def test_linked_git_control_entry_is_rejected_before_any_git_command(self):
@@ -2912,7 +2992,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._set_coordinator_phase",
                 side_effect=switch_branch_before_payload_mutation,
             ):
-                result = updater.update_git_worktree_skill(source)
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertTrue(switched["value"])
             self.assertEqual(result.status, "error")
@@ -2931,6 +3011,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             remote, seed, local, version_a = self.create_remote_and_clone(root)
             self.advance_remote(seed)
             metadata_path = self.write_metadata(local, remote, version_a)
+            source = self.source_for(local, metadata_path)
             original_metadata = metadata_path.read_bytes()
             real_set_phase = updater._set_coordinator_phase
             changed = {"value": False}
@@ -2951,9 +3032,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._set_coordinator_phase",
                 side_effect=change_payload_before_cas,
             ):
-                result = updater.update_git_worktree_skill(
-                    self.source_for(local, metadata_path)
-                )
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertTrue(changed["value"])
             self.assertEqual(result.status, "error")
@@ -2975,6 +3054,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             remote, seed, local, version_a = self.create_remote_and_clone(root)
             self.advance_remote(seed)
             metadata_path = self.write_metadata(local, remote, version_a)
+            source = self.source_for(local, metadata_path)
             original_metadata = metadata_path.read_bytes()
             real_verify = updater._verify_git_apply_preconditions
             calls = {"value": 0}
@@ -2991,9 +3071,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._verify_git_apply_preconditions",
                 side_effect=reject_final_cas,
             ):
-                result = updater.update_git_worktree_skill(
-                    self.source_for(local, metadata_path)
-                )
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(calls["value"], 2)
             self.assertEqual(result.status, "error")
@@ -3032,11 +3110,6 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
         self.assertIn("permission denied", str(caught.exception))
 
     def test_interrupted_git_rollback_is_recovered_from_durable_journal(self):
-        from scripts.agent_skill_updater import (
-            recover_incomplete_skill_transactions,
-            update_git_worktree_skill,
-        )
-
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             _, seed, local, version_a = self.create_remote_and_clone(root)
@@ -3050,13 +3123,13 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 side_effect=KeyboardInterrupt(),
             ):
                 with self.assertRaises(KeyboardInterrupt):
-                    update_git_worktree_skill(source)
+                    updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
             transactions = list(local.parent.glob(".demo.transaction-*"))
             self.assertEqual(len(transactions), 1)
 
-            recover_incomplete_skill_transactions(local.parent)
+            updater.recover_updates(local.parent)
 
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_a)
             self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "version-a\n")
@@ -3218,11 +3291,6 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertFalse(transaction.exists())
 
     def test_committed_git_recovery_accepts_preserved_ignored_payload(self):
-        from scripts.agent_skill_updater import (
-            recover_incomplete_skill_transactions,
-            update_git_worktree_skill,
-        )
-
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             _, seed, local, version_a = self.create_remote_and_clone(root)
@@ -3237,7 +3305,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._remove_transaction_tree",
                 side_effect=PermissionError("cleanup failed"),
             ):
-                result = update_git_worktree_skill(source)
+                result = updater.apply_observed_update(source, _git_observation(source))
 
             self.assertEqual(result.installed_state, "committed")
             self.assertTrue(result.applied)
@@ -3245,7 +3313,7 @@ class GitWorktreeIntegrityTests(unittest.TestCase):
             self.assertEqual((local / "ignored.txt").read_text(encoding="utf-8"), "keep me\n")
             self.assertEqual(len(list(local.parent.glob(".demo.transaction-*"))), 1)
 
-            recover_incomplete_skill_transactions(local.parent)
+            updater.recover_updates(local.parent)
 
             self.assertEqual(run_git(local, "rev-parse", "HEAD"), version_b)
             self.assertEqual((local / "ignored.txt").read_text(encoding="utf-8"), "keep me\n")

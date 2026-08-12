@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -13,9 +12,7 @@ from typing import Optional
 if __package__:
     from .agent_skill_updater import (
         LOCAL_ONLY_UPDATE_POLICY,
-        AgentSkillSource,
         AgentSkillRecoveryUncertainError,
-        AgentSkillUpdateCommittedError,
         AgentSkillUpdaterError,
         GitIdentityEvidence,
         RemoteObservation,
@@ -23,10 +20,8 @@ if __package__:
         apply_observed_update,
         agent_skill_source_from_registry_entry,
         fetch_source_remote_observation,
-        prepare_snapshot_payload,
         probe_git_worktree,
         registry_entry_uses_git_worktree,
-        resolve_skill_update,
         versions_match,
     )
     from .i18n import get_i18n, t
@@ -36,9 +31,7 @@ else:
     sys.path.insert(0, str(Path(__file__).parent))
     from agent_skill_updater import (  # noqa: E402
         LOCAL_ONLY_UPDATE_POLICY,
-        AgentSkillSource,
         AgentSkillRecoveryUncertainError,
-        AgentSkillUpdateCommittedError,
         AgentSkillUpdaterError,
         GitIdentityEvidence,
         RemoteObservation,
@@ -46,10 +39,8 @@ else:
         apply_observed_update,
         agent_skill_source_from_registry_entry,
         fetch_source_remote_observation,
-        prepare_snapshot_payload,
         probe_git_worktree,
         registry_entry_uses_git_worktree,
-        resolve_skill_update,
         versions_match,
     )
     from i18n import get_i18n, t  # noqa: E402
@@ -107,167 +98,85 @@ def main() -> None:
         raise SystemExit(1)
     payload: list[dict[str, object]] = []
     updated_names: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="skills-updater-apply-") as temp_dir:
-        stage_root = Path(temp_dir)
-        for name, entry in registry["entries"].items():
-            if args.skill and name != args.skill:
+    for name, entry in registry["entries"].items():
+        if args.skill and name != args.skill:
+            continue
+
+        probe = _probe_entry(entry)
+        item = {
+            "name": name,
+            "entry_type": entry.get("entryType"),
+            "update_mode": entry.get("updateMode"),
+            "status": probe.status,
+            "installed_base_version": entry.get("installedBaseVersion", "unknown"),
+            "local_version": probe.local_version,
+            "remote_version": probe.remote_version,
+            "git_relation": probe.git_relation,
+            "working_tree_dirty": probe.working_tree_dirty,
+            "action": "none",
+            "error_message": probe.error_message,
+            "applied": False,
+            "installed_state": "unchanged",
+        }
+
+        entry["localVersion"] = probe.local_version
+        entry["remoteVersion"] = probe.remote_version
+        entry["lastStatus"] = probe.status
+        if probe.git_relation is not None:
+            entry["gitRelation"] = probe.git_relation
+        if probe.working_tree_dirty is not None:
+            entry["workingTreeDirty"] = probe.working_tree_dirty
+
+        try:
+            if entry.get("updatePolicy") == LOCAL_ONLY_UPDATE_POLICY:
+                item["action"] = "skipped_local"
+                payload.append(item)
                 continue
 
-            probe = _probe_entry(entry)
-            item = {
-                "name": name,
-                "entry_type": entry.get("entryType"),
-                "update_mode": entry.get("updateMode"),
-                "status": probe.status,
-                "installed_base_version": entry.get("installedBaseVersion", "unknown"),
-                "local_version": probe.local_version,
-                "remote_version": probe.remote_version,
-                "git_relation": probe.git_relation,
-                "working_tree_dirty": probe.working_tree_dirty,
-                "action": "none",
-                "error_message": probe.error_message,
-                "applied": False,
-                "installed_state": "unchanged",
-            }
+            if args.check_only or probe.status == "error":
+                payload.append(item)
+                continue
 
-            entry["localVersion"] = probe.local_version
-            entry["remoteVersion"] = probe.remote_version
-            entry["lastStatus"] = probe.status
-            if probe.git_relation is not None:
-                entry["gitRelation"] = probe.git_relation
-            if probe.working_tree_dirty is not None:
-                entry["workingTreeDirty"] = probe.working_tree_dirty
+            if probe.status == "unknown_version":
+                payload.append(item)
+                continue
 
-            try:
-                if entry.get("updatePolicy") == LOCAL_ONLY_UPDATE_POLICY:
-                    item["action"] = "skipped_local"
-                    payload.append(item)
-                    continue
+            source = agent_skill_source_from_registry_entry(entry)
+            if (
+                probe.status == "up_to_date"
+                and entry.get("installedBaseVersion") == probe.remote_version
+            ):
+                payload.append(item)
+                continue
 
-                if args.check_only or probe.status == "error":
-                    payload.append(item)
-                    continue
+            if probe.status not in {"up_to_date", "update_available"}:
+                payload.append(item)
+                continue
 
-                if probe.status == "unknown_version":
-                    payload.append(item)
-                    continue
+            outcome = apply_observed_update(
+                source,
+                _require_probe_observation(name, probe),
+            )
+            _apply_transaction_outcome(item, outcome)
+            if outcome.version is not None and outcome.installed_state == "committed":
+                item["installed_base_version"] = outcome.version
+                if outcome.action == "fast_forwarded":
+                    item["local_version"] = outcome.version
+                    item["git_relation"] = "equal"
+                    item["working_tree_dirty"] = False
+                elif probe.git_relation is None:
+                    item["local_version"] = outcome.version
+            if outcome.applied:
+                updated_names.append(name)
+        except AgentSkillRecoveryUncertainError as exc:
+            _apply_transaction_outcome(item, exc.outcome)
+        except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+            item["status"] = "error"
+            item["error_message"] = str(exc)
+            item["applied"] = False
+            item["installed_state"] = "unchanged"
 
-                source = agent_skill_source_from_registry_entry(entry)
-                if registry_entry_uses_git_worktree(entry):
-                    remote_version = probe.remote_version
-                    if remote_version is None:
-                        raise AgentSkillUpdaterError(
-                            f"Git probe for '{name}' is missing its expected revision."
-                        )
-                    if (
-                        probe.status == "up_to_date"
-                        and entry.get("installedBaseVersion") == remote_version
-                    ):
-                        payload.append(item)
-                        continue
-                    outcome = apply_observed_update(
-                        source,
-                        _require_probe_observation(name, probe),
-                        installed_base_version=str(entry["installedBaseVersion"]),
-                    )
-                    _apply_transaction_outcome(item, outcome)
-                    if outcome.action == "fast_forwarded" and outcome.version is not None:
-                        item["local_version"] = outcome.version
-                        item["git_relation"] = "equal"
-                        item["working_tree_dirty"] = False
-                    if outcome.installed_state == "committed" and outcome.version is not None:
-                        item["installed_base_version"] = outcome.version
-                    if outcome.applied:
-                        updated_names.append(name)
-                    payload.append(item)
-                    continue
-
-                if (
-                    probe.status == "up_to_date"
-                    and probe.remote_version
-                    and probe.local_version != probe.remote_version
-                    and versions_match(probe.local_version, probe.remote_version)
-                ):
-                    outcome = _apply_metadata_observation(
-                        item,
-                        source,
-                        str(entry["installedBaseVersion"]),
-                        _require_probe_observation(name, probe),
-                    )
-                    if outcome.applied:
-                        updated_names.append(name)
-                    payload.append(item)
-                    continue
-
-                if probe.status != "update_available":
-                    payload.append(item)
-                    continue
-
-                resolved = resolve_skill_update(
-                    source,
-                    stage_root / name,
-                    _require_probe_observation(name, probe),
-                )
-                item["installed_base_version"] = resolved.installed_base_version
-                item["local_version"] = resolved.local_version
-                resolved_remote_version = resolved.remote_version or probe.remote_version
-                if resolved.status == "update_available":
-                    if resolved.remote_observation is None:
-                        raise AgentSkillUpdaterError(
-                            f"Resolved update for '{name}' is missing its Remote Observation."
-                        )
-                    prepared_payload = prepare_snapshot_payload(resolved)
-                    outcome = apply_observed_update(
-                        source,
-                        resolved.remote_observation,
-                        installed_base_version=resolved.installed_base_version,
-                        prepared_payload=prepared_payload,
-                    )
-                    _apply_transaction_outcome(item, outcome)
-                    item["remote_version"] = resolved.remote_version
-                    if outcome.version is not None and outcome.installed_state == "committed":
-                        item["installed_base_version"] = outcome.version
-                        item["local_version"] = outcome.version
-                    if outcome.applied:
-                        updated_names.append(name)
-                elif resolved.status == "up_to_date" and resolved_remote_version:
-                    if resolved.remote_observation is None:
-                        raise AgentSkillUpdaterError(
-                            f"Resolved update for '{name}' is missing its Remote Observation."
-                        )
-                    outcome = _apply_metadata_observation(
-                        item,
-                        source,
-                        resolved.installed_base_version,
-                        resolved.remote_observation,
-                    )
-                    item["remote_version"] = resolved_remote_version
-                    if outcome.applied:
-                        updated_names.append(name)
-                else:
-                    item["status"] = resolved.status
-                    item["error_message"] = resolved.error_message
-            except AgentSkillRecoveryUncertainError as exc:
-                _apply_transaction_outcome(item, exc.outcome)
-            except AgentSkillUpdateCommittedError as exc:
-                item["status"] = "error"
-                item["error_message"] = str(exc)
-                item["applied"] = True
-                item["action"] = exc.action
-                item["installed_state"] = "committed"
-                if exc.version is not None:
-                    item["installed_base_version"] = exc.version
-                    item["local_version"] = exc.version
-                    item["remote_version"] = exc.version
-                if name not in updated_names:
-                    updated_names.append(name)
-            except (AgentSkillUpdaterError, OSError, ValueError) as exc:
-                item["status"] = "error"
-                item["error_message"] = str(exc)
-                item["applied"] = False
-                item["installed_state"] = "unchanged"
-
-            payload.append(item)
+        payload.append(item)
 
     try:
         refreshed_registry = sync_registry()
@@ -391,24 +300,6 @@ def _recovery_outcome_item(outcome: TransactionOutcome) -> dict[str, object]:
     }
     _apply_transaction_outcome(item, outcome)
     return item
-
-
-def _apply_metadata_observation(
-    item: dict[str, object],
-    source: AgentSkillSource,
-    installed_base_version: str,
-    observation: RemoteObservation,
-) -> TransactionOutcome:
-    outcome = apply_observed_update(
-        source,
-        observation,
-        installed_base_version=installed_base_version,
-    )
-    _apply_transaction_outcome(item, outcome)
-    if outcome.version is not None and outcome.installed_state == "committed":
-        item["installed_base_version"] = outcome.version
-        item["local_version"] = outcome.version
-    return outcome
 
 
 def _probe_entry(entry: dict) -> EntryProbe:
