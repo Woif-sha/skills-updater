@@ -375,6 +375,107 @@ class AgentSkillUpdaterTests(unittest.TestCase):
             self.assertIn("Keep this local rule.", merged)
             self.assertTrue((backup_root / "demo-skill" / "SKILL.md").exists())
 
+    def test_update_skill_from_staged_preserves_uncertain_outcome_at_legacy_seam(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = root / "skills" / "demo"
+            remote = root / "remote"
+            base = root / "base"
+            backup_root = root / "backup"
+            for directory in (local, remote, base, backup_root):
+                directory.mkdir(parents=True)
+            for directory in (local, remote, base):
+                (directory / "SKILL.md").write_text("same\n", encoding="utf-8")
+            metadata_path = local / ".openskills.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "source": "example/demo",
+                        "sourceType": "git",
+                        "repoUrl": "https://github.com/example/demo",
+                        "subpath": ".",
+                        "installedBaseVersion": "a" * 40,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source = updater.AgentSkillSource(
+                "demo",
+                local,
+                "example/demo",
+                "git",
+                "https://github.com/example/demo",
+                ".",
+                None,
+                None,
+                metadata_path,
+                entry_type="single-skill",
+            )
+            update = updater.AgentSkillUpdate(
+                source,
+                remote,
+                "update_available",
+                "a" * 40,
+                "a" * 40,
+                "b" * 40,
+            )
+            outcome = updater.TransactionOutcome(
+                name="demo",
+                status="error",
+                installed_state="uncertain",
+                applied=False,
+                action="intervention_required",
+                error_message="rollback proof is incomplete",
+                diagnostic_journal=root / "journal",
+                intervention_record=root / "intervention",
+            )
+
+            with mock.patch("scripts.agent_skill_updater._stage_git_skill_at_ref", return_value=base):
+                with mock.patch(
+                    "scripts.agent_skill_updater._apply_payload_transaction",
+                    return_value=outcome,
+                ) as apply_transaction:
+                    with self.assertRaises(updater.AgentSkillRecoveryUncertainError) as error:
+                        updater.update_skill_from_staged(update, backup_root)
+                    self.assertIs(error.exception.outcome, outcome)
+
+                    committed = updater.TransactionOutcome(
+                        name="demo",
+                        status="error",
+                        installed_state="committed",
+                        applied=True,
+                        action="payload_merged",
+                        version="b" * 40,
+                        error_message="cleanup failed after commit",
+                    )
+                    apply_transaction.return_value = committed
+                    with self.assertRaises(updater.AgentSkillUpdateCommittedError) as error:
+                        updater.update_skill_from_staged(update, backup_root)
+
+            self.assertEqual(error.exception.action, "payload_merged")
+            self.assertEqual(error.exception.version, "b" * 40)
+
+    def test_legacy_metadata_result_preserves_uncertain_outcome(self):
+        import scripts.agent_skill_updater as updater
+
+        outcome = updater.TransactionOutcome(
+            name="demo",
+            status="error",
+            installed_state="uncertain",
+            applied=False,
+            action="intervention_required",
+            error_message="metadata recovery is uncertain",
+            diagnostic_journal=Path("journal"),
+            intervention_record=Path("intervention"),
+        )
+
+        with self.assertRaises(updater.AgentSkillRecoveryUncertainError) as error:
+            updater._legacy_metadata_result(outcome)
+
+        self.assertIs(error.exception.outcome, outcome)
+
     def test_update_skill_from_staged_blocks_conflicting_local_and_remote_changes(self):
         from scripts.agent_skill_updater import (
             AgentSkillSource,

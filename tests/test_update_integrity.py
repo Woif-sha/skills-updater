@@ -262,6 +262,49 @@ class PayloadIntegrityTests(unittest.TestCase):
             self.assertTrue((backup_root / "demo" / "SKILL.md").is_file())
             self.assertFalse(transactions[0].exists())
 
+    def test_prepared_snapshot_crash_then_git_identity_change_keeps_journal(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = root / "skills" / "demo"
+            merged = root / "merged"
+            local.mkdir(parents=True)
+            merged.mkdir()
+            (local / "SKILL.md").write_text("old\n", encoding="utf-8")
+            (merged / "SKILL.md").write_text("new\n", encoding="utf-8")
+            metadata_path = local / ".openskills.json"
+            metadata_path.write_text(json.dumps(snapshot_metadata()), encoding="utf-8")
+            source = updater.AgentSkillSource(
+                "demo", local, "example/demo", "git", "https://github.com/example/demo",
+                ".", None, None, metadata_path, entry_type="single-skill",
+            )
+            update = updater.AgentSkillUpdate(
+                source, merged, "update_available", "a" * 40, "a" * 40, "b" * 40
+            )
+            real_set_phase = updater._set_transaction_phase
+
+            def interrupt_prepared(transaction_root, state, phase):
+                real_set_phase(transaction_root, state, phase)
+                if phase == updater.TRANSACTION_PHASE_PREPARED:
+                    raise KeyboardInterrupt("injected prepared crash")
+
+            with mock.patch(
+                "scripts.agent_skill_updater._set_transaction_phase",
+                side_effect=interrupt_prepared,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    updater._apply_payload_transaction(update, merged)
+
+            journal = next(local.parent.glob(".demo.update-*"))
+            (local / ".git").mkdir()
+            with self.assertRaises(updater.AgentSkillRecoveryUncertainError) as error:
+                updater.recover_incomplete_skill_transactions(local.parent)
+
+            self.assertTrue(journal.is_dir())
+            self.assertEqual(error.exception.outcome.diagnostic_journal, journal)
+            self.assertIsNotNone(error.exception.outcome.intervention_record)
+
     def test_snapshot_rolls_back_if_git_control_appears_during_metadata_commit(self):
         import scripts.agent_skill_updater as updater
 
@@ -306,13 +349,60 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._commit_transaction_metadata",
                 side_effect=add_git_control,
             ):
-                with self.assertRaisesRegex(updater.AgentSkillUpdaterError, "Git worktree"):
-                    updater._apply_payload_transaction(update, merged)
+                outcome = updater._apply_payload_transaction(update, merged)
+
+            self.assertEqual(outcome.status, "error")
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertIsNotNone(outcome.intervention_record)
+            self.assertIn("Git worktree", outcome.error_message)
 
             self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "old\n")
             self.assertEqual(metadata_path.read_bytes(), original_metadata)
             self.assertTrue((local / ".git").is_dir())
-            self.assertEqual(list(local.parent.glob(".demo.update-*")), [])
+            journals = list(local.parent.glob(".demo.update-*"))
+            self.assertEqual(len(journals), 1)
+            with self.assertRaises(updater.AgentSkillUpdaterError):
+                updater.validate_diagnostic_journal(journals[0])
+
+    def test_prepared_snapshot_git_identity_change_remains_recovery_required(self):
+        import scripts.agent_skill_updater as updater
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = root / "skills" / "demo"
+            merged = root / "merged"
+            local.mkdir(parents=True)
+            merged.mkdir()
+            (local / "SKILL.md").write_text("old\n", encoding="utf-8")
+            (merged / "SKILL.md").write_text("new\n", encoding="utf-8")
+            metadata_path = local / ".openskills.json"
+            metadata_path.write_text(json.dumps(snapshot_metadata()), encoding="utf-8")
+            source = updater.AgentSkillSource(
+                "demo", local, "example/demo", "git", "https://github.com/example/demo",
+                ".", None, None, metadata_path, entry_type="single-skill",
+            )
+            update = updater.AgentSkillUpdate(
+                source, merged, "update_available", "a" * 40, "a" * 40, "b" * 40
+            )
+            real_set_phase = updater._set_transaction_phase
+
+            def fail_before_moving_original(transaction_root, state, phase):
+                if phase == updater.TRANSACTION_PHASE_MOVING_ORIGINAL:
+                    (local / ".git").mkdir()
+                    raise updater.AgentSkillUpdaterError("injected prepared identity change")
+                real_set_phase(transaction_root, state, phase)
+
+            with mock.patch(
+                "scripts.agent_skill_updater._set_transaction_phase",
+                side_effect=fail_before_moving_original,
+            ):
+                outcome = updater._apply_payload_transaction(update, merged)
+
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertIsNotNone(outcome.diagnostic_journal)
+            self.assertIsNotNone(outcome.intervention_record)
+            self.assertTrue(outcome.diagnostic_journal.is_dir())
+            self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "old\n")
 
     def test_snapshot_rechecks_commit_state_after_backup_publication(self):
         import scripts.agent_skill_updater as updater
@@ -369,12 +459,19 @@ class PayloadIntegrityTests(unittest.TestCase):
                         "scripts.agent_skill_updater._publish_payload_backup",
                         side_effect=mutate_after_backup,
                     ):
-                        with self.assertRaises(updater.AgentSkillUpdaterError):
-                            updater._apply_payload_transaction(
-                                update,
-                                merged,
-                                backup_dir=backup_dir,
-                            )
+                        outcome = updater._apply_payload_transaction(
+                            update,
+                            merged,
+                            backup_dir=backup_dir,
+                        )
+
+                    self.assertEqual(outcome.status, "error")
+                    expected_state = "rolled_back" if mutation == "payload" else "uncertain"
+                    self.assertEqual(outcome.installed_state, expected_state)
+                    if expected_state == "uncertain":
+                        self.assertIsNotNone(outcome.intervention_record)
+                    else:
+                        self.assertIsNone(outcome.intervention_record)
 
                     self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "old\n")
                     self.assertEqual(
@@ -389,7 +486,19 @@ class PayloadIntegrityTests(unittest.TestCase):
                     else:
                         self.assertEqual(metadata_path.read_bytes(), original_metadata)
                     self.assertEqual((local / ".git").is_dir(), mutation == "git")
-                    self.assertEqual(list(local.parent.glob(".demo.update-*")), [])
+                    journals = list(local.parent.glob(".demo.update-*"))
+                    self.assertEqual(len(journals), int(expected_state == "uncertain"))
+                    if expected_state == "uncertain":
+                        with self.assertRaises(updater.AgentSkillUpdaterError):
+                            updater.validate_diagnostic_journal(journals[0])
+                        if mutation == "git":
+                            (local / ".git").rmdir()
+                        else:
+                            metadata_path.write_bytes(original_metadata)
+                        self.assertEqual(
+                            updater.validate_diagnostic_journal(journals[0]),
+                            "rolled_back",
+                        )
 
     def test_low_level_staging_rejects_incomplete_source_and_non_commit_ref(self):
         import scripts.agent_skill_updater as updater
@@ -649,7 +758,6 @@ class PayloadIntegrityTests(unittest.TestCase):
         from scripts.agent_skill_updater import (
             AgentSkillSource,
             AgentSkillUpdate,
-            AgentSkillUpdaterError,
             _apply_payload_transaction,
             _copy_payload_file_exclusive,
         )
@@ -686,10 +794,14 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._copy_payload_file_exclusive",
                 side_effect=create_concurrent_file_before_install,
             ):
-                with self.assertRaisesRegex(AgentSkillUpdaterError, "preserved at"):
-                    _apply_payload_transaction(update, merged)
+                outcome = _apply_payload_transaction(update, merged)
 
             self.assertTrue(injected["value"])
+            self.assertEqual(outcome.status, "error")
+            self.assertEqual(outcome.installed_state, "rolled_back")
+            self.assertIsNone(outcome.intervention_record)
+            self.assertIn("preserved at", outcome.error_message)
+            self.assertEqual(list(local.parent.glob(".demo.update-*")), [])
             self.assertEqual((local / "target.txt").read_text(encoding="utf-8"), "old target\n")
             recovery_roots = list(local.parent.glob(".recovery-demo.update-*"))
             self.assertEqual(len(recovery_roots), 1)
@@ -700,6 +812,7 @@ class PayloadIntegrityTests(unittest.TestCase):
 
     def test_process_interrupt_and_late_restore_collision_remain_recoverable(self):
         from scripts.agent_skill_updater import (
+            AgentSkillRecoveryUncertainError,
             AgentSkillSource,
             AgentSkillUpdate,
             AgentSkillUpdaterError,
@@ -752,7 +865,7 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._copy_payload_file_exclusive",
                 side_effect=create_late_file_during_restore,
             ):
-                with self.assertRaises(FileExistsError):
+                with self.assertRaises(AgentSkillRecoveryUncertainError):
                     recover_incomplete_skill_transactions(local.parent)
 
             self.assertTrue(injected["value"])
@@ -773,7 +886,6 @@ class PayloadIntegrityTests(unittest.TestCase):
         from scripts.agent_skill_updater import (
             AgentSkillSource,
             AgentSkillUpdate,
-            AgentSkillUpdaterError,
             _apply_payload_transaction,
         )
 
@@ -809,15 +921,21 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._commit_transaction_metadata",
                 side_effect=fail_after_payload_is_installed,
             ):
-                with self.assertRaisesRegex(AgentSkillUpdaterError, "original payload was restored"):
-                    _apply_payload_transaction(update, merged)
+                outcome = _apply_payload_transaction(update, merged)
 
+            self.assertEqual(outcome.status, "error")
+            self.assertEqual(outcome.installed_state, "rolled_back")
+            self.assertIn("original payload was restored", outcome.error_message)
             self.assertTrue((local / "node").is_file())
             self.assertEqual((local / "node").read_text(encoding="utf-8"), "old file\n")
             self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "old\n")
 
     def test_registry_sync_recovers_interrupted_transaction_before_scanning(self):
-        from scripts.agent_skill_updater import AgentSkillUpdaterError, directory_signature
+        from scripts.agent_skill_updater import (
+            AgentSkillRecoveryUncertainError,
+            AgentSkillUpdaterError,
+            directory_signature,
+        )
         from scripts.skills_registry import sync_registry
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -885,7 +1003,7 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater.os.replace",
                 side_effect=interrupt_first_recovery,
             ):
-                with self.assertRaisesRegex(PermissionError, "interrupted rollback"):
+                with self.assertRaises(AgentSkillRecoveryUncertainError):
                     sync_registry(root)
 
             self.assertTrue(transaction.exists())
@@ -1235,6 +1353,7 @@ class PayloadIntegrityTests(unittest.TestCase):
 
     def test_committed_recovery_preserves_safe_concurrent_metadata_before_cleanup(self):
         from scripts.agent_skill_updater import (
+            AgentSkillRecoveryUncertainError,
             directory_signature,
             recover_incomplete_skill_transactions,
         )
@@ -1268,10 +1387,12 @@ class PayloadIntegrityTests(unittest.TestCase):
             }
             (transaction / "state.json").write_text(json.dumps(state), encoding="utf-8")
 
-            recover_incomplete_skill_transactions(root)
+            with self.assertRaises(AgentSkillRecoveryUncertainError) as error:
+                recover_incomplete_skill_transactions(root)
 
             self.assertEqual((local / ".openskills.json").read_bytes(), old_metadata)
-            self.assertFalse(transaction.exists())
+            self.assertTrue(transaction.exists())
+            self.assertEqual(error.exception.outcome.diagnostic_journal, transaction)
 
     def test_empty_payload_directory_is_preserved_by_successful_update(self):
         from scripts.agent_skill_updater import (
@@ -1400,6 +1521,7 @@ class PayloadIntegrityTests(unittest.TestCase):
             installed_base_version="a" * 40,
             local_version="a" * 40,
             remote_version="b" * 40,
+            remote_observation=mock.sentinel.remote_observation,
         )
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -1417,16 +1539,12 @@ class PayloadIntegrityTests(unittest.TestCase):
                     ):
                         with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
                             with mock.patch(
-                                "scripts.update_agent_skills.make_backup_root",
-                                return_value=Path(r"C:\backup"),
+                                "scripts.update_agent_skills.prepare_snapshot_payload",
+                                side_effect=PermissionError("injected access denied"),
                             ):
-                                with mock.patch(
-                                    "scripts.update_agent_skills.update_skill_from_staged",
-                                    side_effect=PermissionError("injected access denied"),
-                                ):
-                                    with self.assertRaises(SystemExit) as exit_info:
-                                        with redirect_stdout(stdout), redirect_stderr(stderr):
-                                            updater.main()
+                                with self.assertRaises(SystemExit) as exit_info:
+                                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                                        updater.main()
 
         self.assertEqual(exit_info.exception.code, 1)
         payload = json.loads(stdout.getvalue())
@@ -1466,11 +1584,16 @@ class PayloadIntegrityTests(unittest.TestCase):
             installed_base_version=version_a,
             local_version=version_a,
             remote_version=version_b,
+            remote_observation=mock.sentinel.remote_observation,
         )
-        committed_error = updater.AgentSkillUpdateCommittedError(
-            "payload committed; cleanup failed",
+        committed_outcome = updater.TransactionOutcome(
+            name="demo",
+            status="error",
+            installed_state="committed",
+            applied=True,
             action="payload_merged",
             version=version_b,
+            error_message="payload committed; cleanup failed",
         )
         stdout = io.StringIO()
         with mock.patch.object(
@@ -1491,12 +1614,12 @@ class PayloadIntegrityTests(unittest.TestCase):
                     ):
                         with mock.patch("scripts.update_agent_skills.resolve_skill_update", return_value=resolved):
                             with mock.patch(
-                                "scripts.update_agent_skills.make_backup_root",
-                                return_value=Path(r"C:\backup"),
+                                "scripts.update_agent_skills.prepare_snapshot_payload",
+                                return_value=mock.sentinel.prepared_payload,
                             ):
                                 with mock.patch(
-                                    "scripts.update_agent_skills.update_skill_from_staged",
-                                    side_effect=committed_error,
+                                    "scripts.update_agent_skills.apply_observed_update",
+                                    return_value=committed_outcome,
                                 ):
                                     with self.assertRaises(SystemExit) as exit_info:
                                         with redirect_stdout(stdout):
@@ -1912,11 +2035,12 @@ class PayloadIntegrityTests(unittest.TestCase):
                 "scripts.agent_skill_updater._remove_transaction_tree",
                 side_effect=updater.AgentSkillUpdaterError("cleanup interrupted"),
             ):
-                with self.assertRaises(updater.AgentSkillUpdateCommittedError) as error:
-                    updater._apply_payload_transaction(update, merged)
+                outcome = updater._apply_payload_transaction(update, merged)
 
-            self.assertEqual(error.exception.action, "payload_merged")
-            self.assertEqual(error.exception.version, remote)
+            self.assertEqual(outcome.status, "error")
+            self.assertEqual(outcome.installed_state, "committed")
+            self.assertEqual(outcome.action, "payload_merged")
+            self.assertEqual(outcome.version, remote)
             self.assertEqual((skill_dir / "SKILL.md").read_text(encoding="utf-8"), "new\n")
             self.assertEqual(
                 json.loads(metadata_path.read_text(encoding="utf-8"))["installedBaseVersion"],
@@ -2475,10 +2599,11 @@ class PayloadIntegrityTests(unittest.TestCase):
     def test_snapshot_metadata_compare_and_swap_preserves_concurrent_write(self):
         from scripts.agent_skill_updater import (
             TRANSACTION_PHASE_COMMITTING_METADATA,
+            AgentSkillRecoveryUncertainError,
             AgentSkillSource,
             AgentSkillUpdate,
-            AgentSkillUpdaterError,
             _set_transaction_phase,
+            recover_incomplete_skill_transactions,
             update_skill_from_staged,
         )
 
@@ -2521,10 +2646,19 @@ class PayloadIntegrityTests(unittest.TestCase):
                     "scripts.agent_skill_updater._set_transaction_phase",
                     side_effect=inject_metadata,
                 ):
-                    with self.assertRaisesRegex(AgentSkillUpdaterError, "original payload was restored"):
+                    with self.assertRaises(AgentSkillRecoveryUncertainError) as error:
                         update_skill_from_staged(update, backup_root)
 
             self.assertTrue(injected["value"])
+            outcome = error.exception.outcome
+            self.assertEqual(outcome.installed_state, "uncertain")
+            self.assertIsNotNone(outcome.diagnostic_journal)
+            self.assertIsNotNone(outcome.intervention_record)
+            journal = outcome.diagnostic_journal
+            self.assertTrue(journal.is_dir())
+            with self.assertRaises(AgentSkillRecoveryUncertainError):
+                recover_incomplete_skill_transactions(local.parent)
+            self.assertTrue(journal.is_dir())
             self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "old\n")
             self.assertEqual(metadata_path.read_bytes(), concurrent_metadata)
             recovered = list(
@@ -2534,6 +2668,10 @@ class PayloadIntegrityTests(unittest.TestCase):
             )
             self.assertEqual(len(recovered), 1)
             self.assertEqual(recovered[0].read_bytes(), concurrent_metadata)
+            metadata_path.write_bytes(original_metadata)
+            from scripts.agent_skill_updater import validate_diagnostic_journal
+
+            self.assertEqual(validate_diagnostic_journal(journal), "rolled_back")
 
     def test_snapshot_apply_rechecks_local_only_after_lock_before_any_mutation(self):
         import scripts.agent_skill_updater as updater

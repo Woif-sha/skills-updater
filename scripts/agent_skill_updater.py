@@ -312,6 +312,19 @@ class TransactionOutcome:
 
 
 @dataclass(frozen=True)
+class _SnapshotRollbackResult:
+    recovery_path: Optional[Path]
+    original_state_proven: bool
+
+
+@dataclass(frozen=True)
+class _SnapshotRecoveryResult:
+    cleanup_residue: Optional[Path] = None
+    cleanup_error: Optional[str] = None
+    recovery_path: Optional[Path] = None
+
+
+@dataclass(frozen=True)
 class _ControlMetadataEvidence:
     before_present: bool
     before_sha256: Optional[str]
@@ -840,11 +853,16 @@ def update_skill_from_staged(
 
         _require_remote_updates_enabled(update.source, update.installed_base_version)
         _validate_skill_payload(merged_dir, entry_type=update.source.entry_type)
-        _apply_payload_transaction(
+        outcome = _apply_payload_transaction(
             update,
             merged_dir,
             expected_original_signature=local_signature,
             backup_dir=backup_dir,
+        )
+        _raise_legacy_transaction_error(
+            outcome,
+            "Snapshot update committed with cleanup residue.",
+            "Snapshot update failed.",
         )
 
 
@@ -1083,15 +1101,30 @@ def refresh_skill_metadata_version(
 
 
 def _legacy_metadata_result(outcome: TransactionOutcome) -> bool:
+    _raise_legacy_transaction_error(
+        outcome,
+        "Metadata refresh committed with cleanup residue.",
+        "Metadata refresh failed.",
+    )
+    return outcome.applied
+
+
+def _raise_legacy_transaction_error(
+    outcome: TransactionOutcome,
+    committed_default: str,
+    failed_default: str,
+) -> None:
     if outcome.status != "error":
-        return outcome.applied
+        return
+    if outcome.installed_state == "uncertain":
+        raise AgentSkillRecoveryUncertainError(outcome)
     if outcome.installed_state == "committed":
         raise AgentSkillUpdateCommittedError(
-            outcome.error_message or "Metadata refresh committed with cleanup residue.",
+            outcome.error_message or committed_default,
             action=outcome.action,
             version=outcome.version,
         )
-    raise AgentSkillUpdaterError(outcome.error_message or "Metadata refresh failed.")
+    raise AgentSkillUpdaterError(outcome.error_message or failed_default)
 
 
 def _validate_snapshot_metadata_refresh_state(
@@ -3436,6 +3469,7 @@ def _apply_payload_transaction(
                     version=update.remote_version,
                     error_message=f"Failed to prepare update for '{update.source.name}': {exc}",
                 )
+            rollback = _SnapshotRollbackResult(None, True)
             try:
                 if state["phase"] in {
                     TRANSACTION_PHASE_PREPARING,
@@ -3453,17 +3487,25 @@ def _apply_payload_transaction(
                         original_metadata,
                         expected_metadata_bytes,
                     )
-                    if recovery_path is None:
-                        _validate_transaction_metadata(skill_dir, state, expected=False)
-                    else:
+                    if recovery_path is not None:
                         state["recoveryPath"] = str(recovery_path)
+                    rollback = _SnapshotRollbackResult(
+                        recovery_path,
+                        _snapshot_original_state_proven(
+                            skill_dir,
+                            state,
+                            recovery_path,
+                        ),
+                    )
+                    state["rollbackProven"] = rollback.original_state_proven
                     _set_transaction_phase(
                         transaction_root,
                         state,
                         TRANSACTION_PHASE_ROLLED_BACK,
                     )
                 else:
-                    recovery_path = _restore_payload_transaction(transaction_root, state)
+                    rollback = _restore_payload_transaction(transaction_root, state)
+                    recovery_path = rollback.recovery_path
             except Exception as rollback_exc:  # noqa: BLE001 - retain durable recovery data
                 return _recovery_required_outcome(
                     name=update.source.name,
@@ -3472,6 +3514,26 @@ def _apply_payload_transaction(
                         f"Failed to apply update for '{update.source.name}': {exc}. "
                         f"Rollback also failed: {rollback_exc}. Recovery data remains at "
                         f"{transaction_root}."
+                    ),
+                    diagnostic_journal=transaction_root,
+                    action="intervention_required",
+                )
+            recovery_suffix = (
+                f" Unexpected concurrent files were preserved at {recovery_path}."
+                if recovery_path is not None
+                else ""
+            )
+            error_message = (
+                f"Failed to apply update for '{update.source.name}'; the original payload was "
+                f"restored: {exc}.{recovery_suffix}"
+            )
+            if not rollback.original_state_proven:
+                return _recovery_required_outcome(
+                    name=update.source.name,
+                    version=update.remote_version,
+                    error_message=(
+                        f"Failed to apply update for '{update.source.name}'; rollback could not "
+                        f"prove the original Installed State: {exc}.{recovery_suffix}"
                     ),
                     diagnostic_journal=transaction_root,
                     action="intervention_required",
@@ -3492,23 +3554,6 @@ def _apply_payload_transaction(
                         f"{cleanup_exc}"
                     ),
                     cleanup_residue=transaction_root,
-                )
-            recovery_suffix = (
-                f" Unexpected concurrent files were preserved at {recovery_path}."
-                if recovery_path is not None
-                else ""
-            )
-            error_message = (
-                f"Failed to apply update for '{update.source.name}'; the original payload was "
-                f"restored: {exc}.{recovery_suffix}"
-            )
-            if recovery_path is not None:
-                return _recovery_required_outcome(
-                    name=update.source.name,
-                    version=update.remote_version,
-                    error_message=error_message,
-                    diagnostic_journal=transaction_root,
-                    action="intervention_required",
                 )
             return TransactionOutcome(
                 name=update.source.name,
@@ -3948,18 +3993,9 @@ def _validate_decoded_journal_settlement(
         raise AgentSkillUpdaterError(
             f"Diagnostic Journal '{transaction_root}' is not settled."
         )
-    if phase == TRANSACTION_PHASE_ROLLED_BACK and state.get("recoveryPath"):
-        raise AgentSkillUpdaterError(
-            f"Diagnostic Journal '{transaction_root}' retains unresolved recovery data."
-        )
     _read_verified_transaction_metadata_snapshots(transaction_root, state)
     committed = phase == TRANSACTION_PHASE_COMMITTED
-    _validate_skill_payload(
-        skill_dir,
-        state["expectedSignature"] if committed else state["originalSignature"],
-        entry_type="single-skill",
-    )
-    _validate_transaction_metadata(skill_dir, state, expected=committed)
+    _validate_snapshot_installed_state(skill_dir, state, committed=committed)
     return "committed" if committed else "rolled_back"
 
 
@@ -3993,13 +4029,24 @@ def recover_incomplete_skill_transactions(skills_root: Path) -> None:
             ) from exc
         skill_dir = _decoded_skill_dir(state)
         with skill_update_lock(skill_dir):
-            outcome = _recover_decoded_transaction_locked(
-                transaction_root,
-                transaction_type,
-                state,
-            )
+            try:
+                outcome = _recover_decoded_transaction_locked(
+                    transaction_root,
+                    transaction_type,
+                    state,
+                )
+            except AgentSkillRecoveryUncertainError:
+                raise
+            except (AgentSkillUpdaterError, OSError, ValueError) as exc:
+                if not _uses_structured_recovery_outcome(transaction_root):
+                    raise
+                raise AgentSkillRecoveryUncertainError(
+                    _uncertain_recovery_outcome(transaction_root, exc)
+                ) from exc
             if outcome.installed_state == "uncertain":
                 raise AgentSkillRecoveryUncertainError(outcome)
+            if outcome.status == "error":
+                raise AgentSkillUpdaterError(outcome.error_message or "Transaction recovery failed.")
 
 
 def _recover_skill_transactions_locked(skill_dir: Path) -> None:
@@ -4035,6 +4082,8 @@ def _recover_skill_transactions_locked(skill_dir: Path) -> None:
                 transaction_type,
                 state,
             )
+        except AgentSkillRecoveryUncertainError:
+            raise
         except (AgentSkillUpdaterError, OSError, ValueError) as exc:
             if _uses_structured_recovery_outcome(transaction_root):
                 raise AgentSkillRecoveryUncertainError(
@@ -4043,6 +4092,8 @@ def _recover_skill_transactions_locked(skill_dir: Path) -> None:
             raise
         if outcome.installed_state == "uncertain":
             raise AgentSkillRecoveryUncertainError(outcome)
+        if outcome.status == "error":
+            raise AgentSkillUpdaterError(outcome.error_message or "Transaction recovery failed.")
 
 
 def _read_recovery_state(
@@ -4094,8 +4145,35 @@ def _recover_decoded_transaction_locked(
     if not isinstance(state, dict):
         raise AgentSkillUpdaterError(f"Invalid decoded transaction journal: {transaction_root}")
     original_phase = state["phase"]
-    _recover_transaction_from_state(transaction_root, state)
-    return _legacy_recovery_outcome(state, original_phase)
+    recovery = _recover_transaction_from_state(transaction_root, state)
+    outcome = _legacy_recovery_outcome(state, original_phase)
+    if recovery.cleanup_residue is not None:
+        return TransactionOutcome(
+            name=outcome.name,
+            status="error",
+            installed_state=outcome.installed_state,
+            applied=outcome.applied,
+            action="none",
+            error_message=(
+                f"{outcome.installed_state.replace('_', ' ').title()} Snapshot recovery is valid, "
+                f"but transaction cleanup failed at {recovery.cleanup_residue}: "
+                f"{recovery.cleanup_error}."
+            ),
+            cleanup_residue=recovery.cleanup_residue,
+        )
+    if recovery.recovery_path is None:
+        return outcome
+    return TransactionOutcome(
+        name=outcome.name,
+        status="error",
+        installed_state="rolled_back",
+        applied=False,
+        action="none",
+        error_message=(
+            f"Interrupted update for '{outcome.name}' was rolled back; unexpected files "
+            f"were preserved at {recovery.recovery_path}."
+        ),
+    )
 
 
 def _read_coordinator_transaction_state(
@@ -4732,7 +4810,7 @@ def _transaction_skill_name_hint(transaction_root: Path) -> str:
 def _uses_structured_recovery_outcome(transaction_root: Path) -> bool:
     return any(
         marker in transaction_root.name
-        for marker in (".transaction-", ".metadata-update-", ".git-update-")
+        for marker in (".transaction-", ".metadata-update-", ".git-update-", ".update-")
     )
 
 
@@ -4835,37 +4913,34 @@ def _validate_git_worktree_revision(
     return current_head
 
 
-def _recover_transaction_from_state(transaction_root: Path, state: dict) -> None:
+def _recover_transaction_from_state(
+    transaction_root: Path,
+    state: dict,
+) -> _SnapshotRecoveryResult:
     skill_dir = Path(state["skillDir"])
     _validate_transaction_root(transaction_root, skill_dir.parent)
     _validate_skill_root(skill_dir)
     phase = state["phase"]
     if phase == TRANSACTION_PHASE_COMMITTED:
-        _validate_skill_payload(
-            skill_dir,
-            state["expectedSignature"],
-            entry_type="single-skill",
-        )
-        _validate_safe_metadata_path(skill_dir)
+        _validate_snapshot_installed_state(skill_dir, state, committed=True)
         try:
             _remove_transaction_tree(transaction_root)
-        except (OSError, AgentSkillUpdaterError) as exc:
-            raise AgentSkillUpdaterError(
-                f"Committed update is valid, but transaction cleanup failed at "
-                f"{transaction_root}: {exc}"
-            ) from exc
-        return
+        except (OSError, AgentSkillUpdaterError) as cleanup_exc:
+            return _SnapshotRecoveryResult(
+                cleanup_residue=transaction_root,
+                cleanup_error=str(cleanup_exc),
+            )
+        return _SnapshotRecoveryResult()
 
     if phase == TRANSACTION_PHASE_ROLLED_BACK:
-        _validate_skill_payload(
-            skill_dir,
-            state["originalSignature"],
-            entry_type="single-skill",
-        )
-        if state.get("recoveryPath"):
-            _validate_safe_metadata_path(skill_dir)
-        else:
-            _validate_transaction_metadata(skill_dir, state, expected=False)
+        if not state.get("rollbackProven", True):
+            error = AgentSkillUpdaterError(
+                f"Rolled-back update at {transaction_root} cannot prove the original Installed State."
+            )
+            raise AgentSkillRecoveryUncertainError(
+                _uncertain_recovery_outcome(transaction_root, error)
+            ) from error
+        _validate_snapshot_installed_state(skill_dir, state, committed=False)
         recovery_path = _safe_recovery_directory(
             skill_dir,
             transaction_root,
@@ -4874,45 +4949,47 @@ def _recover_transaction_from_state(transaction_root: Path, state: dict) -> None
         has_recovery_data = recovery_path is not None and any(recovery_path.iterdir())
         try:
             _remove_transaction_tree(transaction_root)
-        except (OSError, AgentSkillUpdaterError) as exc:
-            raise AgentSkillUpdaterError(
-                f"Rolled-back update is valid, but transaction cleanup failed at "
-                f"{transaction_root}: {exc}"
-            ) from exc
-        if has_recovery_data:
-            raise AgentSkillUpdaterError(
-                f"Interrupted update for '{skill_dir.name}' was rolled back; unexpected files "
-                f"were preserved at {recovery_path}."
+        except (OSError, AgentSkillUpdaterError) as cleanup_exc:
+            return _SnapshotRecoveryResult(
+                cleanup_residue=transaction_root,
+                cleanup_error=str(cleanup_exc),
             )
-        return
+        return _SnapshotRecoveryResult(
+            recovery_path=recovery_path if has_recovery_data else None
+        )
 
     if phase in {TRANSACTION_PHASE_PREPARING, TRANSACTION_PHASE_PREPARED}:
-        _validate_skill_payload(
-            skill_dir,
-            state["originalSignature"],
-            entry_type="single-skill",
-        )
-        _validate_safe_metadata_path(skill_dir)
+        _validate_snapshot_installed_state(skill_dir, state, committed=False)
         _set_transaction_phase(transaction_root, state, TRANSACTION_PHASE_ROLLED_BACK)
         try:
             _remove_transaction_tree(transaction_root)
-        except (OSError, AgentSkillUpdaterError) as exc:
-            raise AgentSkillUpdaterError(
-                f"Prepared update was rolled back, but transaction cleanup failed at "
-                f"{transaction_root}: {exc}"
-            ) from exc
-        return
+        except (OSError, AgentSkillUpdaterError) as cleanup_exc:
+            return _SnapshotRecoveryResult(
+                cleanup_residue=transaction_root,
+                cleanup_error=str(cleanup_exc),
+            )
+        return _SnapshotRecoveryResult()
 
-    recovery_path = _restore_payload_transaction(transaction_root, state)
-    _remove_transaction_tree(transaction_root)
-    if recovery_path is not None:
+    rollback = _restore_payload_transaction(transaction_root, state)
+    if not rollback.original_state_proven:
         raise AgentSkillUpdaterError(
-            f"Interrupted update for '{skill_dir.name}' was rolled back; unexpected files were "
-            f"preserved at {recovery_path}."
+            f"Interrupted update for '{skill_dir.name}' could not prove the original Installed "
+            f"State; recovery data remains at {transaction_root}."
         )
+    try:
+        _remove_transaction_tree(transaction_root)
+    except (OSError, AgentSkillUpdaterError) as cleanup_exc:
+        return _SnapshotRecoveryResult(
+            cleanup_residue=transaction_root,
+            cleanup_error=str(cleanup_exc),
+        )
+    return _SnapshotRecoveryResult(recovery_path=rollback.recovery_path)
 
 
-def _restore_payload_transaction(transaction_root: Path, state: dict) -> Optional[Path]:
+def _restore_payload_transaction(
+    transaction_root: Path,
+    state: dict,
+) -> _SnapshotRollbackResult:
     skill_dir = Path(state["skillDir"])
     original_dir = _transaction_subdirectory(transaction_root, "original")
     incoming_dir = _transaction_subdirectory(transaction_root, "incoming")
@@ -4998,10 +5075,43 @@ def _restore_payload_transaction(transaction_root: Path, state: dict) -> Optiona
     if recovery_path is not None:
         state["recoveryPath"] = str(recovery_path)
         _write_transaction_state(transaction_root, state)
-    if metadata_recovery is None:
-        _validate_transaction_metadata(skill_dir, state, expected=False)
+    original_state_proven = _snapshot_original_state_proven(
+        skill_dir,
+        state,
+        metadata_recovery,
+    )
+    state["rollbackProven"] = original_state_proven
     _set_transaction_phase(transaction_root, state, TRANSACTION_PHASE_ROLLED_BACK)
-    return recovery_path
+    return _SnapshotRollbackResult(recovery_path, original_state_proven)
+
+
+def _snapshot_original_state_proven(
+    skill_dir: Path,
+    state: dict,
+    metadata_recovery: Optional[Path],
+) -> bool:
+    if metadata_recovery is not None:
+        return False
+    _validate_transaction_metadata(skill_dir, state, expected=False)
+    return not is_git_worktree_skill(skill_dir)
+
+
+def _validate_snapshot_installed_state(
+    skill_dir: Path,
+    state: dict,
+    *,
+    committed: bool,
+) -> None:
+    _validate_skill_payload(
+        skill_dir,
+        state["expectedSignature"] if committed else state["originalSignature"],
+        entry_type="single-skill",
+    )
+    if is_git_worktree_skill(skill_dir):
+        raise AgentSkillUpdaterError(
+            f"Snapshot transaction cannot prove a non-Git Installed State at '{skill_dir}'."
+        )
+    _validate_transaction_metadata(skill_dir, state, expected=committed)
 
 
 def _preserve_unexpected_payload(
@@ -5437,6 +5547,8 @@ def _read_transaction_state(transaction_root: Path, skills_root: Path) -> dict:
         raise AgentSkillUpdaterError(f"Invalid update transaction state at {transaction_root}.")
     _validate_transaction_metadata_state(state, transaction_root)
     if "recoveryPath" in state and not isinstance(state["recoveryPath"], str):
+        raise AgentSkillUpdaterError(f"Invalid update transaction state at {transaction_root}.")
+    if "rollbackProven" in state and not isinstance(state["rollbackProven"], bool):
         raise AgentSkillUpdaterError(f"Invalid update transaction state at {transaction_root}.")
     if (
         state["version"] != TRANSACTION_STATE_VERSION

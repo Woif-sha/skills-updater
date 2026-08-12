@@ -10,6 +10,55 @@ from unittest import mock
 
 
 class TransactionCoordinatorTests(unittest.TestCase):
+    def test_snapshot_startup_cleanup_failure_preserves_proven_installed_state(self):
+        import scripts.agent_skill_updater as updater
+
+        for phase, installed_state, applied in (
+            (updater.TRANSACTION_PHASE_COMMITTED, "committed", True),
+            (updater.TRANSACTION_PHASE_ROLLED_BACK, "rolled_back", False),
+        ):
+            with self.subTest(phase=phase):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    skills_root = Path(temp_dir) / "skills"
+                    skill_dir = skills_root / "demo"
+                    journal = skills_root / f".demo.update-{phase}"
+                    skill_dir.mkdir(parents=True)
+                    journal.mkdir()
+                    payload = "new\n" if applied else "old\n"
+                    (skill_dir / "SKILL.md").write_text(payload, encoding="utf-8")
+                    metadata = b'{"installedBaseVersion":"bbbbbbbbbbbb"}'
+                    (skill_dir / ".openskills.json").write_bytes(metadata)
+                    signature = updater.directory_signature(skill_dir)
+                    state = {
+                        "version": updater.TRANSACTION_STATE_VERSION,
+                        "transactionType": updater.SNAPSHOT_TRANSACTION_TYPE,
+                        "skillName": "demo",
+                        "skillDir": str(skill_dir.resolve()),
+                        "phase": phase,
+                        "metadataPhase": updater.METADATA_PHASE_PUBLISHED,
+                        "originalSignature": signature,
+                        "expectedSignature": signature,
+                        "originalMetadataPresent": True,
+                        "originalMetadataSha256": hashlib.sha256(metadata).hexdigest(),
+                        "expectedMetadataPresent": True,
+                        "expectedMetadataSha256": hashlib.sha256(metadata).hexdigest(),
+                        "rollbackProven": True,
+                    }
+                    (journal / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+                    with mock.patch(
+                        "scripts.agent_skill_updater._remove_transaction_tree",
+                        side_effect=updater.AgentSkillUpdaterError("cleanup interrupted"),
+                    ):
+                        outcome = updater.recover_updates(skills_root)[0]
+
+                    self.assertEqual(outcome.installed_state, installed_state)
+                    self.assertEqual(outcome.applied, applied)
+                    self.assertEqual(outcome.cleanup_residue, journal)
+                    self.assertIn("cleanup interrupted", outcome.error_message)
+                    self.assertIsNone(outcome.intervention_record)
+                    self.assertTrue(journal.is_dir())
+
     def test_committed_snapshot_preserves_outcome_when_workspace_cleanup_fails(self):
         import scripts.agent_skill_updater as updater
 
