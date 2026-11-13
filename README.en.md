@@ -18,9 +18,11 @@ Install, inspect, transactionally update, and register Skills under `~/.agents/s
 - Python 3.10 or newer.
 - Git.
 - Network access to the GitHub repositories being installed or updated.
-- Node.js and npm only when installing or updating an OpenSpec-generated Skill.
+- Node.js and npm when installing or updating an OpenSpec-generated Skill, or maintaining REA.
 
 The runtime uses only the Python standard library; no `pip install` step is required.
+
+When this Skill handles a check or update, the agent also follows the [REA maintenance workflow](workflows/maintain-rea.md) to inspect the owning npm version and refresh its bundled Skill. The Python CLI's Git registry still reports a REA Skill without Git metadata as `unknown_version`.
 
 ## Install Skills Updater
 

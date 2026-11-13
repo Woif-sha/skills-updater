@@ -13,8 +13,9 @@ python scripts/update_agent_skills.py --skill <name> --check-only --json
 1. Preserve the user's exact selection.
 2. Use `--check-only` only when mutation was not authorized.
 3. Run one command and interpret each structured item.
-4. Report `action`, `applied`, committed version, errors, and any backup or conflict path.
-5. Do not retry an error through another source, branch, or update method.
+4. If the selection includes `reverse-engineer-anything`, also follow [maintain-rea.md](maintain-rea.md), preserving `--check-only` when selected.
+5. Report `action`, `applied`, committed version, errors, and any backup or conflict path.
+6. Do not retry an error through another source, branch, or update method.
 
 Expected actions include `none`, `skipped_local`, `metadata_refreshed`, `fast_forwarded`, and `payload_merged`. A local-only item must be `skipped_local` with `applied: false`.
 

@@ -4,9 +4,10 @@ description: >
   This skill should be used when the user says "skills-updater", "检查 skill 更新",
   "更新已安装的 skill", "从 GitHub 安装 skill", "同步 .skills-list.json",
   "这个 skill 是我自己写的，不要联网更新", "列出或清理 Intervention Record",
-  or "修复 skills-updater".
+  "修复 skills-updater", or "更新 REA 和配套 Skill".
   Activate only for the install, update, and registry lifecycle under
-  ~/.agents/skills, updater-owned Intervention Records, or this updater's implementation.
+  ~/.agents/skills, REA's matching npm installation, updater-owned Intervention Records,
+  or this updater's implementation.
 ---
 
 # Skills Updater
@@ -37,4 +38,4 @@ These are the single normative definitions for every route. Operation workflows 
 
 ## Scope
 
-This Skill owns `~/.agents/skills` and updater-created records under `~/.agents/interventions`. It does not manage Claude marketplaces, recommend third-party Skills, or maintain tool-specific mirror directories.
+This Skill owns `~/.agents/skills` and updater-created records under `~/.agents/interventions`. For `reverse-engineer-anything`, it also maintains the owning REA npm installation and refreshes its bundled Skill through REA setup. It does not manage Claude marketplaces, recommend third-party Skills, or maintain tool-specific mirror directories.

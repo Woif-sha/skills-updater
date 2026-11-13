@@ -18,9 +18,11 @@
 - Python 3.10 或更高版本。
 - Git。
 - 能访问待安装或更新的 GitHub 仓库。
-- 只有安装或更新 OpenSpec 生成型 Skill 时才需要 Node.js 和 npm。
+- 安装或更新 OpenSpec 生成型 Skill，以及维护 REA 时需要 Node.js 和 npm。
 
 运行时代码只使用 Python 标准库，不需要执行 `pip install`。
+
+通过本 Skill 调用检查或更新时，Agent 会按 [REA 维护流程](workflows/maintain-rea.md) 额外核对 REA 的 npm 版本，并从同一安装刷新配套 Skill。Python CLI 的 Git 来源注册表仍将未提供 Git 元数据的 REA Skill 列为 `unknown_version`。
 
 ## 安装 Skills Updater
 

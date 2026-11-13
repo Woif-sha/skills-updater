@@ -6,7 +6,8 @@
     "default-invocation matches only a bare invocation with no requested operation",
     "Normal operation routes are complete with SKILL.md and their workflow; do not load repair/review material unless the request explicitly changes or reviews the updater",
     "Multiple independent explicit operations are processed in the user's stated order",
-    "mark-local-only already includes its same-target sync and check; do not select duplicate sync-registry or check-updates routes unless repetition is explicit"
+    "mark-local-only already includes its same-target sync and check; do not select duplicate sync-registry or check-updates routes unless repetition is explicit",
+    "Select maintain-rea for explicit REA maintenance, and alongside default-invocation, check-updates, or update-skills when their selection includes the installed reverse-engineer-anything Skill; preserve check-only and local-only boundaries"
   ],
   "tasks": [
     {
@@ -34,6 +35,14 @@
       "required_reads": [],
       "workflow": "workflows/update-skills.md",
       "trigger_examples": ["更新所有 skill", "更新这个 skill", "update installed skills"]
+    },
+    {
+      "id": "maintain-rea",
+      "labels": {"en": "Maintain REA and its bundled Skill", "zh": "维护 REA 程序和配套 Skill"},
+      "route": "Follow workflows/maintain-rea.md",
+      "required_reads": [],
+      "workflow": "workflows/maintain-rea.md",
+      "trigger_examples": ["更新 REA 和配套 Skill", "检查 REA 版本", "刷新 reverse-engineer-anything", "maintain REA"]
     },
     {
       "id": "install-skill",

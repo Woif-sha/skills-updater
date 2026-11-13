@@ -12,7 +12,8 @@ python scripts/check_updates.py --skill <name> --json
 1. Match the user's scope exactly.
 2. Run the JSON command once; it already refreshes the registry.
 3. Report `up_to_date`, `update_available`, `local_only`, `unknown_version`, and `error` separately.
-4. Stop after reporting. A check request does not authorize an update.
+4. If the selection includes `reverse-engineer-anything`, also follow the read-only check in [maintain-rea.md](maintain-rea.md).
+5. Stop after reporting. A check request does not authorize an update.
 
 Exit code `1` means at least one update or error exists, or the selection was empty. Classify it from the JSON payload, never from the exit code alone.
 
