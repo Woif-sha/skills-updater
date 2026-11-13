@@ -24,6 +24,8 @@ The runtime uses only the Python standard library; no `pip install` step is requ
 
 When this Skill handles a check or update, the agent also follows the [REA maintenance workflow](workflows/maintain-rea.md) to inspect the owning npm version and refresh its bundled Skill. The Python CLI's Git registry still reports a REA Skill without Git metadata as `unknown_version`.
 
+All-entry checks and updates also include installed or registered [CodeGraph](workflows/maintain-codegraph.md): the agent checks its official release, actual launcher and agent integration, and uses its maintenance commands. The npm installation route needs npm; CodeGraph bundles its analysis runtime rather than relying on the system Node.js major version.
+
 ## Install Skills Updater
 
 The recommended layout is a clone under the canonical Skill directory with explicit metadata for the root Git worktree. The following PowerShell commands are for a new installation:

@@ -24,6 +24,8 @@
 
 通过本 Skill 调用检查或更新时，Agent 会按 [REA 维护流程](workflows/maintain-rea.md) 额外核对 REA 的 npm 版本，并从同一安装刷新配套 Skill。Python CLI 的 Git 来源注册表仍将未提供 Git 元数据的 REA Skill 列为 `unknown_version`。
 
+全部检查或更新也包含已安装或已注册的 [CodeGraph](workflows/maintain-codegraph.md)：Agent 核对官方发布版本、实际命令入口及代理接入状态，通过官方命令维护。npm 安装途径需要 npm；CodeGraph 自带分析运行时，不依赖系统 Node.js 的主版本。
+
 ## 安装 Skills Updater
 
 推荐把仓库直接克隆到统一 Skill 目录，并为这个根 Git 工作树写入完整来源元数据。以下 PowerShell 命令适用于全新安装：

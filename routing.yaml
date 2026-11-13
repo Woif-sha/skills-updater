@@ -7,7 +7,8 @@
     "Normal operation routes are complete with SKILL.md and their workflow; do not load repair/review material unless the request explicitly changes or reviews the updater",
     "Multiple independent explicit operations are processed in the user's stated order",
     "mark-local-only already includes its same-target sync and check; do not select duplicate sync-registry or check-updates routes unless repetition is explicit",
-    "Select maintain-rea for explicit REA maintenance, and alongside default-invocation, check-updates, or update-skills when their selection includes the installed reverse-engineer-anything Skill; preserve check-only and local-only boundaries"
+    "Select maintain-rea for explicit REA maintenance, and alongside default-invocation, check-updates, or update-skills when their selection includes the installed reverse-engineer-anything Skill; preserve check-only and local-only boundaries",
+    "CodeGraph-only requests select maintain-codegraph instead of the Git Skill check/update routes; also select maintain-codegraph for default-invocation or all-entry checks/updates when CodeGraph is installed or registered, preserving check-only scope"
   ],
   "tasks": [
     {
@@ -43,6 +44,14 @@
       "required_reads": [],
       "workflow": "workflows/maintain-rea.md",
       "trigger_examples": ["更新 REA 和配套 Skill", "检查 REA 版本", "刷新 reverse-engineer-anything", "maintain REA"]
+    },
+    {
+      "id": "maintain-codegraph",
+      "labels": {"en": "Maintain CodeGraph and agent integration", "zh": "维护 CodeGraph 程序和代理接入"},
+      "route": "Follow workflows/maintain-codegraph.md",
+      "required_reads": [],
+      "workflow": "workflows/maintain-codegraph.md",
+      "trigger_examples": ["检查 CodeGraph 有无更新", "维护 CodeGraph", "更新 codegraph", "refresh CodeGraph integration"]
     },
     {
       "id": "install-skill",
